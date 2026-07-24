@@ -24,6 +24,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.oauth_client.json
+.oauth_token.json
 
 # 빌드 산출물
 /public/build/

@@ -247,6 +247,36 @@ def test_on_message_drops_disallowed_enqueues_allowed():
     assert ev.kind == "text" and ev.user_id == 777
 
 
+def test_on_message_playlist_channel_lets_unauth_through():
+    # 인가 확대: 비인가라도 플레이리스트 role 채널은 드롭 안 하고 코어로 전달(코어가 최종 판정).
+    a = _adapter()
+    a._channel_map = {500: ("role", "playlist")}
+    asyncio.run(a._on_message(_msg(999, "ㅁ노래", channel_id=500)))
+    assert a._queue.qsize() == 1
+    ev = a._queue.get_nowait()
+    assert ev.channel_role == "playlist" and ev.user_id == 999
+    asyncio.run(a._on_message(_msg(999, "hax", channel_id=100)))  # 다른 채널 비인가 → 여전히 드롭
+    assert a._queue.qsize() == 0
+
+
+def test_on_message_guest_channel_lets_unauth_through():
+    # M-1: 비인가 게스트의 텍스트 질문이 선필터를 통과해 코어(_guest_bypass)까지 도달해야 동작.
+    a = _adapter()
+    a._channel_map = {600: ("role", "게스트질문")}
+    asyncio.run(a._on_message(_msg(999, "파이썬이 뭐야", channel_id=600)))
+    assert a._queue.qsize() == 1
+    ev = a._queue.get_nowait()
+    assert ev.channel_role == "게스트질문" and ev.user_id == 999
+
+
+def test_on_interaction_guest_channel_button_still_dropped():
+    # M-1: 게스트 채널 버튼은 선필터 그대로 드롭(코어 _guest_bypass 도 button 제외 — 대칭).
+    a = _adapter()
+    a._channel_map = {600: ("role", "게스트질문")}
+    asyncio.run(a._on_interaction(_interaction(999, "clean:ok", channel_id=600)))
+    assert a._queue.qsize() == 0
+
+
 # ---------------------------------------------------------------------------
 # _on_interaction: defer 선행(§2.3) + custom_id 파싱 + 비허용 드롭
 # ---------------------------------------------------------------------------
@@ -292,6 +322,19 @@ def test_on_interaction_parses_choice_custom_id():
     asyncio.run(a._on_interaction(_interaction(777, "c:42:1")))
     ev = a._queue.get_nowait()
     assert ev.action == "c" and ev.action_arg == "42:1"
+
+
+def test_on_interaction_playlist_channel_lets_unauth_through():
+    # 인가 확대: 비인가라도 플레이리스트 채널 버튼은 통과(코어가 clean:ok/x 만 우회 허용).
+    a = _adapter()
+    a._channel_map = {500: ("role", "playlist")}
+    asyncio.run(a._on_interaction(_interaction(999, "clean:ok", channel_id=500)))
+    assert a._queue.qsize() == 1
+    ev = a._queue.get_nowait()
+    assert ev.action == "clean:ok" and ev.channel_role == "playlist" and ev.user_id == 999
+    a2 = _adapter()  # 다른 채널 비인가 → 드롭(defer 도 안 함)
+    asyncio.run(a2._on_interaction(_interaction(999, "clean:ok", channel_id=100)))
+    assert a2._queue.qsize() == 0
 
 
 def test_on_interaction_unknown_custom_id_becomes_empty_action():
@@ -675,6 +718,60 @@ def test_purge_coro_partial_failure_returns_deleted_count():
     assert asyncio.run(a._purge_coro(100)) == 100  # 부분 성공: 삭제된 만큼만
 
 
+def test_enqueue_coro_fifo_after_current_index():
+    # 재생 중 연속 추가 = FIFO — 현재 곡 뒤에 추가순서대로 쌓인다(A→B→C).
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True)
+    a._music_entries = [{"id": f"cur{i}"} for i in range(5)]
+    a._music_index = 2
+    assert asyncio.run(a._enqueue_coro("A", "가")) == 6  # 편입 후 큐 곡수
+    assert asyncio.run(a._enqueue_coro("B", "나")) == 7
+    assert asyncio.run(a._enqueue_coro("C", "다")) == 8
+    # 현재곡(idx2) 뒤에 A,B,C 순 — index+1 고정 아님(그건 LIFO), queued 블록 뒤로 이어붙임.
+    assert [e["id"] for e in a._music_entries[3:6]] == ["A", "B", "C"]
+    assert all(a._music_entries[i].get("queued") for i in (3, 4, 5))
+    assert a._music_entries[3] == {"id": "A", "title": "가", "queued": True}  # 소비 형식
+
+
+def test_reshuffle_clears_queued_markers():
+    # 재셔플은 이미 재생된 추가곡의 queued 마커를 지워, 다음 바퀴 삽입 스캔이 스테일에 안 걸린다.
+    a = _adapter()
+    a._music_entries = [{"id": "x", "queued": True}, {"id": "y"}, {"id": "z", "queued": True}]
+    a._reshuffle_entries()
+    assert all("queued" not in e for e in a._music_entries)  # 전부 제거
+    assert {e["id"] for e in a._music_entries} == {"x", "y", "z"}  # 곡은 보존(개수·구성 불변)
+
+
+def test_enqueue_coro_fifo_after_playback_progressed():
+    # 재생이 진행돼 index 가 대기 블록을 지나가면, 새 추가는 남은 큐 뒤(현재 index+1)에 붙는다.
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True)
+    a._music_entries = [{"id": "cur"}, {"id": "A", "queued": True}, {"id": "orig"}]
+    a._music_index = 1  # A 재생 중(지나감) — 뒤의 orig 는 queued 아님
+    assert asyncio.run(a._enqueue_coro("D", "라")) == 4
+    assert [e["id"] for e in a._music_entries] == ["cur", "A", "D", "orig"]  # index+1 에 삽입
+
+
+def test_enqueue_coro_noop_when_not_playing():
+    a = _adapter()
+    a._voice = None  # 재생 중 아님
+    a._music_entries = []
+    assert asyncio.run(a._enqueue_coro("newvid", "새곡")) == 0
+    assert a._music_entries == []
+    # voice 있어도 큐 비었으면(재생 준비 전) no-op.
+    a._voice = SimpleNamespace(is_connected=lambda: True)
+    assert asyncio.run(a._enqueue_coro("newvid", "새곡")) == 0
+
+
+def test_enqueue_coro_noop_when_stopping():
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True)
+    a._music_entries = [{"id": "cur0"}]
+    a._music_stopping = True  # 정지 진행 중 — 편입 안 함
+    assert asyncio.run(a._enqueue_coro("newvid", "새곡")) == 0
+    assert len(a._music_entries) == 1
+
+
 def test_message_event_channel_map_project_and_role():
     a = _adapter()
     a._channel_map = {100: ("project", "etf_info"), 200: ("role", "간단처리")}
@@ -812,8 +909,8 @@ def test_concurrent_on_ready_no_duplicate(monkeypatch):
         await asyncio.gather(a._ensure_channels(), a._ensure_channels())
 
     asyncio.run(two_on_ready())
-    # 카테고리 6개(중복 X), etf_info 채널 1회만 생성.
-    assert len(guild.categories) == 6
+    # 카테고리 7개(간단처리·프로젝트·데이터분석·스케쥴러·시스템·질문·PlayList, 중복 X).
+    assert len(guild.categories) == 7
     assert [n for n, _ in guild.created].count("etf_info") == 1
 
 
@@ -1003,6 +1100,30 @@ def test_voice_playlist_renames_default_general(monkeypatch):
     assert a._channel_map[900] == ("role", "playlist")
 
 
+def test_special_registers_guest_role_in_question_category(monkeypatch):
+    # 게스트질문 role 은 ❓ 질문 카테고리, 간단처리 role 은 🗂️ 간단처리(게스트 뺌·무손상).
+    assert ("게스트질문", "role", "게스트질문") in discord_adapter._SPECIAL[
+        discord_adapter._CAT_QUESTION
+    ]
+    assert discord_adapter._SPECIAL[discord_adapter._CAT_SIMPLE] == [
+        ("간단처리", "role", "간단처리")
+    ]
+    # 카테고리 순서: 시스템 < 질문 < PlayList.
+    order = discord_adapter._CAT_ORDER
+    assert (
+        order.index(discord_adapter._CAT_SYSTEM)
+        < order.index(discord_adapter._CAT_QUESTION)
+        < order.index(discord_adapter._CAT_VOICE)
+    )
+    # 봇 재기동(_ensure_channels) 시 채널 자동 생성·매핑되는지(role tag 불변).
+    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    a.setup_channels([])
+    _guild_for(a)
+    asyncio.run(a._ensure_channels())
+    assert ("role", "게스트질문") in set(a._channel_map.values())
+
+
 def test_voice_playlist_created_when_no_default(monkeypatch):
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
@@ -1037,7 +1158,8 @@ def test_categories_ordered(monkeypatch):
     assert order["데이터분석"] == 2
     assert order["스케쥴러"] == 3  # 🗓️ 스케쥴러 (데이터분석 아래·시스템 위)
     assert order["시스템"] == 4
-    assert order["playlist"] == 5  # 🎵 PlayList
+    assert order["질문"] == 5  # ❓ 질문 (시스템 아래·PlayList 위)
+    assert order["playlist"] == 6  # 🎵 PlayList
 
 
 def test_scheduler_category_in_order_between_data_and_system():

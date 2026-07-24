@@ -136,6 +136,18 @@ class Adapter(Protocol):
         """현재 곡을 건너뛰고 다음 곡 재생(디스코드 전용). 회신 문자열 반환. 타 어댑터 미지원."""
         ...
 
+    def search_video(self, query: str) -> tuple[str, str] | None:
+        """'ㅁ추가 <검색어>' 용 유튜브 검색(yt-dlp ytsearch1) — 첫 결과 (videoId, 제목). 무결과·
+        실패는 None. yt-dlp 는 어댑터에만 격리되므로 코어는 이 capability 로 위임한다(음악과 동일).
+        """
+        ...
+
+    def enqueue_video(self, video_id: str, title: str) -> int:
+        """'ㅁ추가' 로 새로 넣은 곡을 재생 중인 큐의 현재 곡 바로 뒤에 편입(디스코드 전용). 편입 후
+        큐 곡수를 반환, 재생 중이 아니면 no-op 0. 코어는 >0 일 때만 "▶️ Play - N곡"을 회신에 붙인다.
+        """
+        ...
+
 
 # ── 플랫폼 무관 공유 유틸 ──────────────────────────────────────────────────
 # 코어·어댑터가 공유하므로 순환 import 를 피해 이 shared base 에 둔다(bridge 는 재-import 해

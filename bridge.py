@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -36,6 +37,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import youtube
 from adapter import Adapter, Button, Event, _valid_id, mask_secrets
 
 # ── 경로 상수 ──────────────────────────────────────────────────────────────
@@ -103,6 +105,8 @@ ORACLE_WORDS = frozenset(
 MUSIC_PLAY_WORDS = frozenset({"ㅁ노래"})
 MUSIC_SKIP_WORDS = frozenset({"ㅁ다음"})
 MUSIC_STOP_WORDS = frozenset({"ㅁ정지"})
+# 'ㅁ추가 <링크|검색어>' — 유튜브 재생목록 추가. 접두 매칭(뒤에 인자를 받음, 위 3종은 단독매칭).
+MUSIC_ADD_WORDS = frozenset({"ㅁ추가"})
 
 
 def music_action(text: str) -> str | None:
@@ -115,6 +119,28 @@ def music_action(text: str) -> str | None:
     if key in MUSIC_PLAY_WORDS:
         return "play"
     return None
+
+
+# 유튜브 URL 판정·videoId 추출(순수). 재생목록 전용 링크(v= 없음)는 extract 가 None → 개별 실패.
+_YT_HOST_RE = re.compile(r"(?:youtube\.com|youtu\.be|music\.youtube\.com)", re.IGNORECASE)
+_YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/|/v/)([0-9A-Za-z_-]{11})")
+
+
+def is_youtube_url(token: str) -> bool:
+    """공백 구분 토큰이 유튜브 URL 인지(호스트 매칭)."""
+    return bool(_YT_HOST_RE.search(token))
+
+
+def extract_video_id(url: str) -> str | None:
+    """유튜브 URL → 11자 videoId. watch?v=·youtu.be/·shorts·embed 지원. 재생목록만이면 None."""
+    m = _YT_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def is_music_add(text: str) -> bool:
+    """'ㅁ추가' 명령 여부(접두 매칭 — 인자는 뒤에 붙는다). 'ㅁ추가곡' 등 붙여쓰기는 미발동."""
+    parts = text.strip().split(maxsplit=1)
+    return bool(parts) and parts[0] in MUSIC_ADD_WORDS
 
 
 # 명령 접두 'ㅁ' 통일(개인용 — 한글 자판 1키). 슬래시('/help'·'/프로젝트')·접두 없는 평문
@@ -134,6 +160,30 @@ COMMANDS = (
 )
 # 특수 채널 역할 중 "프로젝트 무관 일반 실행" 대상(§4.4). 데이터분석 한계 안내는 채널 토픽에 1회.
 _GENERAL_ROLES = frozenset({"간단처리", "데이터분석"})
+# 플레이리스트 전용 채널(🎵 PlayList) — 사람끼리 대화하는 공간이라 화이트리스트(음악 재생·청소·
+# ㅁ추가)만 처리하고 그 외는 반응·안내 없이 조용히 무시한다(_handle_text 최상단 게이트). 태그는
+# _ensure_voice 가 durable 하게 관리하는 "playlist"(계약의 '플레이리스트'는 이 내부 태그로 실현).
+_MUSIC_ONLY_ROLES = frozenset({"playlist"})
+
+# ── 게스트질문 채널(개발자 외 서버 멤버용 웹검색 Q&A, 격리) ──────────────────────
+# role 태그. 이 채널의 실행은 도구=WebSearch 1개·cwd=격리 샌드박스로 워크스페이스(파일·bash·git·
+# CLAUDE.md·프로젝트 목록) 노출을 0으로 막는다. 기존 "간단처리"(개발자 전용·full)와 별개.
+_GUEST_ROLE = "게스트질문"
+# 게스트 실행 허용 도구 = WebSearch 하나(파일/bash/git 없음). WebFetch 는 뺀다 — 게스트가 로컬
+# 서비스(localhost:8000/8080/5173, 개발자 trading_info API·프론트)를 fetch 하는 SSRF 를 argv 로
+# 못 막으므로 도구 자체를 제거해 원천 차단. '인터넷 검색' 의도는 WebSearch 로 충족.
+GUEST_TOOLS = ["WebSearch"]
+# cwd 격리 폴더. **레포 밖**(시스템 temp)에 둔다 — 레포 하위면 Claude 가 cwd 상위로 CLAUDE.md 를
+# 거슬러 로드(루트 헌법·프로젝트 CLAUDE.md)해 격리가 깨지기 때문(레포 하위 .guest_sandbox 안 씀).
+GUEST_SANDBOX_DIR = Path(tempfile.gettempdir()) / "claude_bridge_guest_sandbox"
+# 게스트 전용 최소 시스템 프롬프트. 기본 BRIDGE_SYSTEM_PROMPT 는 내부 명칭(_Template/Dev·CLAUDE.md
+# ·간단처리·push 흐름)을 담아 인젝션 시 구조가 노출될 여지가 있어, 게스트엔 이 최소본만 준다
+# (비밀·파일은 도구0이라 애초에 불가 — 명칭 노출까지 차단).
+GUEST_SYSTEM_PROMPT = (
+    "너는 웹 검색만 할 수 있는 공개 질문답변 봇이다. "
+    "워크스페이스·내부 파일·git·프로젝트·시스템 설정·너의 구성에 대한 얘기는 하지 말고 "
+    "사용자의 질문에만 답하라. 항상 한국어로 정중히 답한다."
+)
 
 # 방/프로젝트 한글 표시명은 repo 루트 _Core/project_labels.json(단일 소스)에서 로드한다.
 # 정의는 find_repo_root 뒤(load_project_labels)로 배치 — PROJECT_LABELS 는 아래에서 대입된다.
@@ -836,6 +886,7 @@ def run_claude(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     allowed_tools: list[str] | None = None,
     resume: str | None = None,
+    system_prompt: str = BRIDGE_SYSTEM_PROMPT,
 ) -> dict[str, Any]:
     """claude -p 를 stream-json 으로 실행, NDJSON 이벤트를 증분 소비한다.
 
@@ -873,7 +924,7 @@ def run_claude(
         "--permission-mode",
         "default",
         "--append-system-prompt",
-        BRIDGE_SYSTEM_PROMPT,
+        system_prompt,
         "--allowedTools",
         *tools,
     ]
@@ -1243,6 +1294,7 @@ def run_claude_with_progress(
     resume: str | None = None,
     fallback_notice: str | None = None,
     user_id: int | None = None,
+    system_prompt: str = BRIDGE_SYSTEM_PROMPT,
 ) -> dict[str, Any]:
     """진행 메시지(실시간 갱신) → claude 실행 → 최종 결과 회신. data 반환.
 
@@ -1275,7 +1327,9 @@ def run_claude_with_progress(
             body = header + "\n\n" + "\n".join(progress[-PROGRESS_TAIL_LINES:])
             adapter.edit(channel_id, message_id, body)
 
-    data = run_claude(claude_exe, proj_path, task, timeout, on_event, allowed_tools, resume)
+    data = run_claude(
+        claude_exe, proj_path, task, timeout, on_event, allowed_tools, resume, system_prompt
+    )
     finished = True  # 이후 on_event 는 즉시 return → 최종 결과 edit 가 스테일 진행에 안 덮인다.
     reply = format_reply(data)
     # ⑤ 세션 재개가 기계적으로 실패(is_error·session_id 없음 → 호출측이 새 세션으로 곧 재실행)하면
@@ -1417,6 +1471,8 @@ def _run_with_session(
     task: str,
     timeout: int,
     user_id: int | None = None,
+    allowed_tools: list[str] | None = None,
+    system_prompt: str = BRIDGE_SYSTEM_PROMPT,
 ) -> dict[str, Any]:
     """채널 대화 세션 연속성 래퍼(⑤) — 직전 세션 resume 실행 후 새 session_id 를 영속한다.
 
@@ -1436,10 +1492,12 @@ def _run_with_session(
         proj_path,
         task,
         timeout,
+        allowed_tools=allowed_tools,
         resume=resume,
         # 기계적 재개 실패(아래 폴백) 시 "❌처리실패" 대신 이 1줄로 대체 → ❌→✅ 이중회신 완화.
         fallback_notice=("🔄 이전 대화가 만료돼 새로 시작합니다" if resume is not None else None),
         user_id=user_id,
+        system_prompt=system_prompt,
     )
     # 재개 실패 폴백은 **세션이 서지 못한 기계적 실패**(resume 실패 → synthetic 반환, session_id
     # 없음)만 새 세션으로 1회 재실행. resume 성공 뒤의 task 오류(max-turns·툴 실패)는 결과 이벤트에
@@ -1456,7 +1514,9 @@ def _run_with_session(
             proj_path,
             task,
             timeout,
+            allowed_tools=allowed_tools,
             user_id=user_id,
+            system_prompt=system_prompt,
         )
     _remember_session(exec_channel_id, data.get("session_id"))
     return data
@@ -1590,6 +1650,9 @@ def _handle_photo(
     보안: 호출 전 handle_event 가 허용목록 게이트를 통과시킨 뒤에만 진입한다.
     """
     channel_id = event.channel_id
+    # 플레이리스트 채널: 사진(캡션·보류 불문)은 화이트리스트가 아니므로 반응·안내 없이 조용히 무시.
+    if event.channel_role in _MUSIC_ONLY_ROLES:
+        return
     if event.photo_ref is None:  # 캡션 유무와 무관 — 사진 자체를 못 읽으면 여기서 끝(가드 단일화).
         adapter.send(channel_id, "사진을 읽지 못했습니다.")
         return
@@ -1818,6 +1881,107 @@ def _find_awaiting(channel_id: int, user_id: int) -> tuple[int, dict[str, Any]] 
     return max(waiting, key=lambda kv: kv[0]) if waiting else None
 
 
+def _is_playlist_command(text: str) -> bool:
+    """플레이리스트 채널 화이트리스트 판정: ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가만 True(순수).
+
+    실제 처리 분기(music_action·'ㅁ청소'·is_music_add)와 정확히 같은 조건이어야 한다 —
+    게이트만 통과하고 아래 분기에 안 걸리면 HELP 폴백이 새어 채널에 안내가 뜬다(§ 무반응 계약).
+    """
+    stripped = text.strip()
+    return music_action(stripped) is not None or stripped == "ㅁ청소" or is_music_add(stripped)
+
+
+def _playlist_bypass(event: Event) -> bool:
+    """★ user 인가 우회 지점(보안 감사 대상) — 플레이리스트 채널의 화이트리스트 음악 명령만.
+
+    True 를 반환할 때만 handle_event 가 비인가 user_id 를 통과시킨다(서버 멤버 누구나 음악 제어,
+    개발자 결정). 조건을 의도적으로 좁게 유지한다:
+      · (channel_role == "playlist")  AND
+      · text  → 화이트리스트 명령(_is_playlist_command: ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가)
+        button → clean:ok/x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
+    그 외(다른 채널·비화이트리스트 텍스트·사진·위험명령 ㅁ프로젝트/ㅁ푸시/ㅁ재시작/일반 실행)는
+    False → 기존 is_allowed 인가 그대로. 위험명령은 플레이리스트 게이트가 이미 무시하므로 비인가
+    user 에게 도달 불가(이중 방어). channel_role 은 어댑터가 channel_map 으로 채운 신뢰값.
+    """
+    if event.channel_role not in _MUSIC_ONLY_ROLES:
+        return False
+    if event.kind == "text":
+        return _is_playlist_command(event.text)
+    if event.kind == "button":
+        return event.action in ("clean:ok", "x")
+    return False
+
+
+def _guest_bypass(event: Event) -> bool:
+    """★ user 인가 우회 지점(보안 감사 대상) — 게스트질문 채널의 순수 질문 텍스트만.
+
+    True 일 때만 handle_event 가 비인가 user_id 를 통과시킨다(개발자 외 서버 멤버 웹검색 Q&A).
+    조건을 좁게 유지: (channel_role == _GUEST_ROLE) AND kind=="text" AND 비어있지 않고 'ㅁ' 접두가
+    아닌 텍스트. ㅁ명령(전부)·사진·버튼은 우회 제외 — 이 채널은 순수 텍스트 질문만. 통과해도 실행은
+    _handle_text 게스트 분기가 도구=WebSearch 1개·cwd=격리 샌드박스로 제한(파일·bash·git 도달 불가).
+    """
+    if event.channel_role != _GUEST_ROLE or event.kind != "text":
+        return False
+    text = event.text.strip()
+    return bool(text) and not text.startswith("ㅁ")
+
+
+def _format_add_result(result: tuple[str, str]) -> str:
+    """youtube.add_video 결과(status, detail) → 회신 한 줄."""
+    status, detail = result
+    if status == "added":
+        return f"✅ 추가됨: {detail}"
+    if status == "dup":
+        return f"이미 있어요: {detail}"
+    return f"추가 실패: {detail}"
+
+
+def _add_one_line(adapter: Adapter, video_id: str) -> str:
+    """영상 1건 추가 + (신규추가 & 재생 중이면) 재생 큐 실시간 편입. 회신 한 줄.
+
+    중복(dup)은 이미 재생목록에 있어 큐에도 있으므로 편입 안 함. 재생 중 아니면 enqueue_video 가
+    no-op(False) → 문구 변화 없음(다음 ㅁ노래에 자연 포함).
+    """
+    result = youtube.add_video(video_id)
+    line = _format_add_result(result)
+    if result[0] == "added":
+        queued = adapter.enqueue_video(video_id, result[1])  # 편입 후 큐 곡수(재생 중 아니면 0)
+        if queued > 0:
+            line += f"\n▶️ Play - {queued}곡"
+    return line
+
+
+def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
+    """'ㅁ추가' 처리. 링크(들)면 videoId 추출해 각각 추가, 아니면 검색어로 ytsearch1 첫 결과 추가.
+
+    링크+캡션 = 링크만 처리(캡션 무시). 다중 링크 = 각각 처리(중복은 add_video 가 개별 스킵).
+    재생목록 전용 링크(videoId 없음)는 개별 실패. 네트워크는 위임 — list/insert 는 youtube 모듈
+    (stdlib urllib), 검색은 adapter.search_video(yt-dlp). 여기선 파싱·라우팅·회신만 한다.
+    """
+    parts = text.strip().split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not arg:
+        adapter.send(channel_id, "추가 실패: 유튜브 링크나 검색어를 주세요.")
+        return
+    url_tokens = [t for t in arg.split() if is_youtube_url(t)]
+    if url_tokens:  # 링크 우선(캡션 무시) — 각 링크를 개별 처리
+        lines = []
+        for t in url_tokens:
+            vid = extract_video_id(t)
+            if vid is None:  # 재생목록 전용 링크 등 videoId 없음
+                lines.append("추가 실패: 개별 영상 링크를 주세요")
+            else:
+                lines.append(_add_one_line(adapter, vid))
+        adapter.send(channel_id, "\n".join(lines))
+        return
+    found = adapter.search_video(arg)  # (videoId, 제목) | None
+    if found is None:
+        adapter.send(channel_id, f"추가 실패: '{arg}' 검색 결과가 없습니다.")
+        return
+    video_id, _title = found
+    adapter.send(channel_id, _add_one_line(adapter, video_id))
+
+
 def _handle_text(
     adapter: Adapter,
     event: Event,
@@ -1830,11 +1994,36 @@ def _handle_text(
     """텍스트 메시지 처리(구 handle_update 텍스트 분기). 명령·push·프로젝트 실행·직접입력 라우팅."""
     channel_id = event.channel_id
     text = event.text
+    # 플레이리스트 채널 게이트(최상단): 화이트리스트(ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가)만 통과.
+    # 그 외(잡담·사진 캡션·다른 ㅁ명령·순수 링크·빈 메시지)는 반응·안내 없이 조용히 무시한다.
+    if event.channel_role in _MUSIC_ONLY_ROLES and not _is_playlist_command(text):
+        return
     if text == "":
         # 어댑터가 비지원 메시지(스티커 등, text 키 없음)를 text="" 로 정규화 → 안내.
         adapter.send(channel_id, "텍스트 메시지만 처리합니다.")
         return
     stripped = text.strip()
+
+    # 게스트질문 채널(개발자 외 서버 멤버): 모든 텍스트를 순수 웹검색 Q&A 로 실행한다 — 도구=
+    # WebSearch 1개·cwd=레포 밖 격리 샌드박스로 워크스페이스(파일·bash·git·CLAUDE.md) 노출 0.
+    # 최상단(ㅁ명령·프로젝트 분기 이전)에 둬서 이 채널에선 ㅁ명령·프로젝트 이동이 발동하지 않는다
+    # (순수 질문 전용). 인가 우회(_guest_bypass)는 사진·버튼·ㅁ명령을 이미 제외해 여기 도달 못 한다.
+    if event.channel_role == _GUEST_ROLE:
+        GUEST_SANDBOX_DIR.mkdir(parents=True, exist_ok=True)  # 멱등(temp 청소 대비)
+        log.info("chat=%s 게스트질문 실행", channel_id)
+        _run_with_session(
+            adapter,
+            channel_id,
+            f"{LEAD_RUN} 작업 중",
+            claude_exe,
+            str(GUEST_SANDBOX_DIR),
+            text,
+            timeout,
+            user_id=event.user_id,
+            allowed_tools=GUEST_TOOLS,
+            system_prompt=GUEST_SYSTEM_PROMPT,
+        )
+        return
 
     # ③ 직접입력 대기: '✏️직접입력' 후 다음 텍스트는 그 세션 resume 입력으로 라우팅.
     # ㅁ 명령(ㅁ취소·ㅁ도움말·ㅁ프로젝트 등)은 예외 — 아래 분기로 폴백해 정상 처리한다
@@ -1875,6 +2064,13 @@ def _handle_text(
     if act == "skip":
         log.info("chat=%s cmd=music skip", channel_id)
         adapter.send(channel_id, adapter.skip_music(channel_id))
+        return
+
+    # 'ㅁ추가 <링크|검색어>' — 유튜브 재생목록("코딩")에 추가. 접두 매칭이라 별칭 해석·help 폴백
+    # (아래 `cmd.startswith("ㅁ") and cmd not in COMMANDS → HELP`)보다 앞에 둔다.
+    if is_music_add(stripped):
+        log.info("chat=%s cmd=music add", channel_id)
+        _handle_music_add(adapter, channel_id, stripped)
         return
 
     # push('ㅁ푸시해줘'). 별칭 해석 이전에 둔다 — 공백접기 매칭('ㅁ 푸시 해줘')이 아래 help
@@ -2083,10 +2279,16 @@ def handle_event(
 ) -> None:
     """정규화 Event 통합 디스패처(구 handle_update/handle_callback/handle_photo).
 
-    인가 게이트(최우선): event.user_id 허용목록 대조 — 미허용은 무회신·로그만(§3.1). 이후 kind
-    분기. 코어는 adapter.send/edit/ack/fetch_file 만 호출(플랫폼 API 직접 호출 없음).
+    인가 게이트(최우선): event.user_id 허용목록 대조 — 미허용은 무회신·로그만(§3.1). 단, 두 좁은
+    예외로 서버 멤버 누구나 쓰게 인가를 우회한다: 플레이리스트 채널의 화이트리스트 음악 명령
+    (_playlist_bypass) · 게스트질문 채널의 순수 질문 텍스트(_guest_bypass, 도구=Web·cwd 격리). 이후
+    kind 분기. 코어는 adapter.send/edit/ack/fetch_file 만 호출(플랫폼 API 직접 호출 없음).
     """
-    if not is_allowed(event.user_id, allowed):
+    if (
+        not is_allowed(event.user_id, allowed)
+        and not _playlist_bypass(event)
+        and not _guest_bypass(event)
+    ):
         log.warning("미허용 user_id=%s %s 무시", event.user_id, event.kind)
         return
     if event.kind == "button":
@@ -2356,6 +2558,32 @@ def _selftest() -> None:
     assert music_action("ㅁ노래") == "play" and music_action("ㅁ정지") == "stop"
     assert music_action("ㅁ다음") == "skip" and music_action("노래 추천해줘") is None
     assert music_action("/노래") is None and music_action("노래") is None  # 슬래시·평문 폐기
+    # 'ㅁ추가' 파싱(순수) — 접두 매칭·videoId 추출·재생목록 전용 링크 거부.
+    assert is_music_add("ㅁ추가 https://youtu.be/dQw4w9WgXcQ") and is_music_add("ㅁ추가")
+    assert not is_music_add("ㅁ추가곡") and not is_music_add("추가 노래")  # 붙여쓰기·평문 미발동
+    assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert extract_video_id("https://youtu.be/dQw4w9WgXcQ?list=PLx") == "dQw4w9WgXcQ"
+    assert extract_video_id("https://www.youtube.com/playlist?list=PLfYAqOSmXQFQ") is None
+    assert is_youtube_url("https://youtu.be/x") and not is_youtube_url("가수 제목")
+    # 플레이리스트 채널 화이트리스트 = 실제 처리 분기와 동형(HELP 누출 방지).
+    assert _is_playlist_command("ㅁ노래") and _is_playlist_command("ㅁ청소")
+    assert _is_playlist_command("ㅁ추가 노래 제목") and not _is_playlist_command("잡담")
+    assert not _is_playlist_command("ㅁ도움말")  # 다른 ㅁ명령은 무시 대상
+    assert _format_add_result(("added", "곡")) == "✅ 추가됨: 곡"
+    assert _format_add_result(("dup", "곡")) == "이미 있어요: 곡"
+
+    # 게스트질문 인가 우회(순수 질문만)·격리 불변식.
+    def _ge(text: str, kind: str = "text", role: str = _GUEST_ROLE) -> Event:
+        return Event(kind=kind, channel_id=1, user_id=9, text=text, channel_role=role)
+
+    assert _guest_bypass(_ge("질문"))
+    assert not _guest_bypass(_ge("ㅁ노래"))  # ㅁ명령 제외
+    assert not _guest_bypass(_ge("질문", kind="photo"))  # 사진 제외
+    assert not _guest_bypass(_ge("질문", role="간단처리"))  # 다른 채널
+    assert GUEST_TOOLS == ["WebSearch"]  # WebSearch 만(WebFetch SSRF 차단·파일·bash·git 없음)
+    assert "chiikawa_dev" not in str(
+        GUEST_SANDBOX_DIR
+    )  # cwd 격리 = 레포 밖(CLAUDE.md 상위로드 차단)
     # ⑥ 사진 보류 소비 — TTL 안이면 ref, 만료·없음이면 None(+정리·pop).
     pending_photos.clear()
     pending_photos[1] = ("ref", time.monotonic())

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import bridge
 import pytest
+import youtube
 from adapter import (
     Button,
     Event,
@@ -58,9 +59,21 @@ class FakeAdapter:
     """Adapter 계약(secrets·poll·send·edit·ack·fetch_file·close) 구현 — 호출 기록용 테스트 더블."""
 
     def __init__(
-        self, secrets=None, send_ids=None, fetch=None, roles=None, projects=None, clear_count=0
+        self,
+        secrets=None,
+        send_ids=None,
+        fetch=None,
+        roles=None,
+        projects=None,
+        clear_count=0,
+        search=None,
+        enqueue=0,
     ):
         self.secrets = secrets if secrets is not None else []
+        self.searches = []  # search_video 로 넘어온 query 기록(yt-dlp 검색 스파이)
+        self._search = search  # search_video 반환값((videoId, 제목) | None) — 테스트 지정
+        self.enqueued = []  # enqueue_video 로 넘어온 (videoId, 제목) 기록(재생 큐 편입 스파이)
+        self._enqueue = enqueue  # enqueue_video 반환값(편입 후 큐 곡수 int / no-op 0) — 테스트 지정
         self.cleared = []  # clear_channel 로 넘어온 channel_id 기록(파괴적 청소 스파이)
         self._clear_count = clear_count  # clear_channel 반환할 삭제 건수(테스트가 지정)
         self.sent = []  # (channel_id, text, buttons)
@@ -127,8 +140,18 @@ class FakeAdapter:
         self.music.append(("skip", channel_id))
         return "⏭️ 다음"
 
+    def search_video(self, query):
+        self.searches.append(query)
+        return self._search
 
-def _btn(user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_id=None):
+    def enqueue_video(self, video_id, title):
+        self.enqueued.append((video_id, title))
+        return self._enqueue
+
+
+def _btn(
+    user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_id=None, channel_role=None
+):
     """정규화 버튼 Event(어댑터가 parse_callback 로 만든 것과 동형)."""
     return Event(
         kind="button",
@@ -138,16 +161,19 @@ def _btn(user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_i
         action_arg=arg,
         message_id=message_id,
         callback_id=callback_id,
+        channel_role=channel_role,
     )
 
 
-def _txt(user_id, text, *, message_id=None, channel_id=None):
+def _txt(user_id, text, *, message_id=None, channel_id=None, channel_role=None, project=None):
     return Event(
         kind="text",
         channel_id=channel_id if channel_id is not None else user_id,
         user_id=user_id,
         text=text,
         message_id=message_id,
+        channel_role=channel_role,
+        project=project,
     )
 
 
@@ -1308,6 +1334,388 @@ def test_music_command_not_help_fallthrough():
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ노래"), target_root="root")
     assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
+
+
+# ---------------------------------------------------------------------------
+# 플레이리스트 채널 게이트 + 'ㅁ추가'(유튜브 재생목록 추가)
+# ---------------------------------------------------------------------------
+
+_PL = "playlist"  # _MUSIC_ONLY_ROLES 태그(= _ensure_voice 가 관리하는 durable 내부 태그)
+
+
+def _add_env(monkeypatch, result=("added", "곡")):
+    """youtube.add_video 를 목으로 대체하고 넘어온 videoId 리스트를 반환한다(네트워크 차단)."""
+    called = []
+
+    def fake_add(video_id):
+        called.append(video_id)
+        return result
+
+    monkeypatch.setattr(bridge.youtube, "add_video", fake_add)
+    return called
+
+
+def test_playlist_gate_blocks_chatter(monkeypatch):
+    # 플레이리스트 채널의 잡담·다른 ㅁ명령·순수 링크는 반응·안내 없이 조용히 무시.
+    _add_env(monkeypatch)
+    for msg in ("안녕", "ㅁ도움말", "https://youtu.be/dQw4w9WgXcQ", "", "ㅁ프로젝트"):
+        a = FakeAdapter()
+        _fire(a, _txt(777, msg, channel_role=_PL), target_root="root")
+        assert a.sent == [], f"무시돼야 함: {msg!r}"
+
+
+def test_playlist_gate_ignores_photo():
+    # 사진(캡션 유무 불문)도 플레이리스트 채널에선 무시 — 다운로드·보류·안내 없음.
+    bridge.pending_photos.clear()
+    a = FakeAdapter()
+    _fire(a, _photo(777, caption="추가해줘", channel_role=_PL, project=None), target_root="root")
+    _fire(a, _photo(777, caption=None, channel_role=_PL, project=None), target_root="root")
+    assert a.sent == [] and a.fetched == [] and bridge.pending_photos == {}
+
+
+def test_playlist_gate_allows_music_and_clean(monkeypatch):
+    # 화이트리스트(ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소)는 통과.
+    _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ노래", channel_role=_PL), target_root="root")
+    assert a.music == [("play", 777, 777)]
+    a2 = FakeAdapter()
+    _fire(a2, _txt(777, "ㅁ청소", channel_role=_PL), target_root="root")
+    assert a2.sent and [b.action for b in a2.sent[0][2]] == ["clean:ok", "x"]
+
+
+def test_music_add_url_extracts_and_adds(monkeypatch):
+    called = _add_env(monkeypatch, ("added", "Never Gonna Give You Up"))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ추가 https://youtu.be/dQw4w9WgXcQ", channel_role=_PL), target_root="root")
+    assert called == ["dQw4w9WgXcQ"]
+    assert a.sent == [(777, "✅ 추가됨: Never Gonna Give You Up", None)]
+    assert a.searches == []  # 링크는 yt-dlp 검색 안 함
+
+
+def test_music_add_url_with_caption_ignores_caption(monkeypatch):
+    # 링크+캡션 = 링크만(캡션 무시).
+    called = _add_env(monkeypatch)
+    a = FakeAdapter()
+    ev = _txt(777, "ㅁ추가 이거 좋아 https://www.youtube.com/watch?v=abcdefghijk")
+    _fire(a, ev, target_root="r")
+    assert called == ["abcdefghijk"] and a.searches == []
+
+
+def test_music_add_multiple_links_each(monkeypatch):
+    called = _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(
+        a,
+        _txt(777, "ㅁ추가 https://youtu.be/aaaaaaaaaaa https://youtu.be/bbbbbbbbbbb"),
+        target_root="root",
+    )
+    assert called == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
+    assert a.sent[0][1].count("✅ 추가됨") == 2
+
+
+def test_music_add_playlist_link_rejected(monkeypatch):
+    # 재생목록 전용 링크(영상 아님)는 추가 안 하고 개별 실패.
+    called = _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ추가 https://www.youtube.com/playlist?list=PLx"), target_root="root")
+    assert called == []  # insert 시도 안 함
+    assert "개별 영상 링크" in a.sent[0][1]
+
+
+def test_music_add_search_query(monkeypatch):
+    # URL 이 아니면 yt-dlp ytsearch1 첫 결과 videoId 를 추가.
+    called = _add_env(monkeypatch, ("added", "아이유 좋은날"))
+    a = FakeAdapter(search=("vidsearch01", "아이유 좋은날"))
+    _fire(a, _txt(777, "ㅁ추가 아이유 좋은날", channel_role=_PL), target_root="root")
+    assert a.searches == ["아이유 좋은날"]
+    assert called == ["vidsearch01"]
+    assert a.sent == [(777, "✅ 추가됨: 아이유 좋은날", None)]
+
+
+def test_music_add_search_no_result(monkeypatch):
+    _add_env(monkeypatch)
+    a = FakeAdapter(search=None)  # 무결과
+    _fire(a, _txt(777, "ㅁ추가 없는곡xyz"), target_root="root")
+    assert any("검색 결과가 없" in t for _c, t, _b in a.sent)
+
+
+def test_music_add_empty_arg(monkeypatch):
+    _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ추가", channel_role=_PL), target_root="root")
+    assert any("링크나 검색어" in t for _c, t, _b in a.sent)
+
+
+def test_music_add_dedup_passthrough(monkeypatch):
+    # add_video 가 dup 을 주면 "이미 있어요" 회신.
+    _add_env(monkeypatch, ("dup", "이미있는곡"))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ추가 https://youtu.be/ccccccccccc"), target_root="root")
+    assert a.sent == [(777, "이미 있어요: 이미있는곡", None)]
+
+
+def test_music_add_enqueues_when_playing(monkeypatch):
+    # 재생 중(enqueue_video>0) + 신규추가 → 유튜브 저장 + 큐 편입 + "▶️ Play - N곡"(N=큐 곡수).
+    called = _add_env(monkeypatch, ("added", "새곡"))
+    a = FakeAdapter(enqueue=30)
+    _fire(a, _txt(777, "ㅁ추가 https://youtu.be/eeeeeeeeeee", channel_role=_PL), target_root="root")
+    assert called == ["eeeeeeeeeee"]
+    assert a.enqueued == [("eeeeeeeeeee", "새곡")]
+    assert a.sent == [(777, "✅ 추가됨: 새곡\n▶️ Play - 30곡", None)]
+
+
+def test_music_add_no_enqueue_suffix_when_not_playing(monkeypatch):
+    # 재생 꺼짐(enqueue no-op 0) → enqueue 호출은 하되 문구는 기존 "✅ 추가됨"만.
+    _add_env(monkeypatch, ("added", "새곡"))
+    a = FakeAdapter(enqueue=0)
+    _fire(a, _txt(777, "ㅁ추가 https://youtu.be/fffffffffff"), target_root="root")
+    assert a.enqueued == [("fffffffffff", "새곡")]
+    assert a.sent == [(777, "✅ 추가됨: 새곡", None)]
+
+
+def test_music_add_dup_does_not_enqueue(monkeypatch):
+    # 중복(이미 있음)은 큐 편입 안 함(이미 목록에 있음) — enqueue_video 미호출.
+    _add_env(monkeypatch, ("dup", "이미있는곡"))
+    a = FakeAdapter(enqueue=30)
+    _fire(a, _txt(777, "ㅁ추가 https://youtu.be/ggggggggggg"), target_root="root")
+    assert a.enqueued == []  # dup → 편입 시도 안 함
+    assert a.sent == [(777, "이미 있어요: 이미있는곡", None)]
+
+
+def test_music_add_disallowed_user_blocked(monkeypatch):
+    # 인가 게이트: 비허용 user 의 'ㅁ추가'는 무회신·add_video 미호출.
+    called = _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(999, "ㅁ추가 https://youtu.be/ddddddddddd"), allowed=_ALLOWED, target_root="root")
+    assert called == [] and a.sent == []
+
+
+def test_youtube_add_video_dedup_skips_insert(monkeypatch):
+    # youtube.add_video 중복 로직: list 에 이미 있으면 insert 안 하고 ('dup', 제목).
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(youtube, "_list_video_ids", lambda _a: {"vid1": "제목1"})
+    inserted = []
+    monkeypatch.setattr(youtube, "_insert", lambda _a, v: inserted.append(v) or "새제목")
+    assert youtube.add_video("vid1") == ("dup", "제목1")
+    assert inserted == []  # insert 미호출
+    assert youtube.add_video("vid2") == ("added", "새제목")
+    assert inserted == ["vid2"]
+
+
+def test_youtube_add_video_network_failure(monkeypatch):
+    # 인증·네트워크 오류는 삼켜 ('fail', 사유)로 — 비밀값 미포함.
+    def boom():
+        raise OSError("refresh failed")
+
+    monkeypatch.setattr(youtube, "_get_access", boom)
+    status, detail = youtube.add_video("vidx")
+    assert status == "fail" and "refresh failed" not in detail
+
+
+def test_youtube_add_video_http_exception_caught(monkeypatch):
+    # 응답 잘림(http.client.HTTPException — OSError 아님)도 포집해 ('fail', 사유) 반환.
+    import http.client
+
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+
+    def truncated(_access):
+        raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr(youtube, "_list_video_ids", truncated)
+    assert youtube.add_video("vidx")[0] == "fail"
+    # insert 경로도 동일 포집.
+    monkeypatch.setattr(youtube, "_list_video_ids", lambda _a: {})
+    monkeypatch.setattr(
+        youtube, "_insert", lambda _a, _v: (_ for _ in ()).throw(http.client.BadStatusLine("x"))
+    )
+    assert youtube.add_video("vidx")[0] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# 인가 우회 — 플레이리스트 채널 화이트리스트만 (서버 멤버 누구나 음악, 보안 회귀 필수)
+# ---------------------------------------------------------------------------
+
+
+def test_playlist_bypass_pure():
+    # ★ 우회 조건: (channel_role=="playlist") AND 화이트리스트. 그 외 전부 False.
+    assert bridge._playlist_bypass(_txt(999, "ㅁ노래", channel_role=_PL))
+    assert bridge._playlist_bypass(_txt(999, "ㅁ추가 x", channel_role=_PL))
+    assert bridge._playlist_bypass(_btn(999, "clean:ok", channel_role=_PL))
+    assert bridge._playlist_bypass(_btn(999, "x", channel_role=_PL))
+    assert not bridge._playlist_bypass(_txt(999, "잡담", channel_role=_PL))  # 비화이트리스트
+    assert not bridge._playlist_bypass(_txt(999, "ㅁ프로젝트", channel_role=_PL))  # 위험명령
+    assert not bridge._playlist_bypass(_txt(999, "ㅁ노래", channel_role="간단처리"))  # 다른 채널
+    assert not bridge._playlist_bypass(_btn(999, "push", channel_role=_PL))  # clean 외 버튼
+    assert not bridge._playlist_bypass(_photo(999, channel_role=_PL, project=None))  # 사진
+
+
+def test_bypass_unauth_playlist_music_passes(monkeypatch):
+    _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(999, "ㅁ노래", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert a.music == [("play", 999, 999)]  # 비인가라도 플레이리스트 음악 통과
+
+
+def test_bypass_unauth_playlist_add_passes(monkeypatch):
+    called = _add_env(monkeypatch)
+    a = FakeAdapter()
+    ev = _txt(999, "ㅁ추가 https://youtu.be/hhhhhhhhhhh", channel_role=_PL)
+    _fire(a, ev, allowed=_ALLOWED, target_root="root")
+    assert called == ["hhhhhhhhhhh"] and a.sent  # 추가 실행됨
+
+
+def test_bypass_unauth_playlist_clean_confirm_and_ok(tmp_path):
+    a = FakeAdapter()
+    _fire(a, _txt(999, "ㅁ청소", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert [b.action for b in a.sent[0][2]] == ["clean:ok", "x"]  # 확인 버튼
+    a2 = FakeAdapter(clear_count=5)
+    _fire(
+        a2,
+        _btn(999, "clean:ok", channel_role=_PL),
+        allowed=_ALLOWED,
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert a2.cleared == [999]  # 비인가라도 청소 완결(clean:ok 버튼 우회)
+
+
+def test_bypass_denied_unauth_playlist_non_whitelist(monkeypatch):
+    # 플레이리스트라도 잡담·위험명령·순수링크는 비인가 무시(우회가 게이트를 못 뚫음).
+    _add_env(monkeypatch)
+    for msg in ("안녕", "ㅁ프로젝트", "ㅁ푸시해줘", "https://youtu.be/dQw4w9WgXcQ"):
+        a = FakeAdapter()
+        _fire(a, _txt(999, msg, channel_role=_PL), allowed=_ALLOWED, target_root="root")
+        assert a.sent == [] and a.music == [], msg
+
+
+def test_bypass_denied_unauth_playlist_photo():
+    a = FakeAdapter()
+    _fire(
+        a,
+        _photo(999, caption="추가해줘", channel_role=_PL, project=None),
+        allowed=_ALLOWED,
+        target_root="root",
+    )
+    assert a.sent == [] and a.fetched == []
+
+
+def test_bypass_denied_unauth_other_channel(monkeypatch):
+    # 회귀: 다른 채널(role None·간단처리)의 비인가 user 는 어떤 명령도 무회신(기존 인가 유지).
+    _add_env(monkeypatch)
+    for role in (None, "간단처리"):
+        a = FakeAdapter()
+        _fire(a, _txt(999, "ㅁ노래", channel_role=role), allowed=_ALLOWED, target_root="root")
+        assert a.sent == [] and a.music == []
+    a2 = FakeAdapter(clear_count=5)  # clean:ok 도 다른 채널 비인가는 차단
+    _fire(a2, _btn(999, "clean:ok"), allowed=_ALLOWED, repo_root=Path(), target_root="root")
+    assert a2.cleared == []
+
+
+def test_bypass_denied_unauth_playlist_nonclean_button():
+    # 플레이리스트 채널이라도 clean:ok/x 외 버튼(push 등)은 비인가 우회 안 함.
+    a = FakeAdapter()
+    _fire(
+        a, _btn(999, "push", channel_role=_PL), allowed=_ALLOWED, repo_root=Path(), target_root="r"
+    )
+    assert a.sent == [] and a.cleared == []
+
+
+def test_auth_user_unaffected_in_playlist(monkeypatch):
+    # 인가 user 는 우회와 무관하게 기존대로(플레이리스트 음악 정상).
+    _add_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ노래", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert a.music == [("play", 777, 777)]
+
+
+# ---------------------------------------------------------------------------
+# 게스트질문 채널 — 개발자 외 서버 멤버 웹검색 Q&A(도구=Web·cwd 격리, 보안 회귀 필수)
+# ---------------------------------------------------------------------------
+
+_GUEST = "게스트질문"
+
+
+def _guest_ev(user_id, text, kind="text", **kw):
+    return Event(kind=kind, channel_id=100, user_id=user_id, text=text, channel_role=_GUEST, **kw)
+
+
+def _spy_rcwp_full(monkeypatch):
+    # (proj, task, allowed_tools, system_prompt) 기록 — 셋 다 키워드로 전달됨.
+    runs = []
+    monkeypatch.setattr(
+        bridge,
+        "run_claude_with_progress",
+        lambda *a, **k: (
+            runs.append((a[4], a[5], k.get("allowed_tools"), k.get("system_prompt")))
+            or {"is_error": False, "result": "ok"}
+        ),
+    )
+    return runs
+
+
+def test_guest_bypass_pure():
+    # ★ 우회 조건: 게스트질문 채널 + 비어있지 않은 비-ㅁ 텍스트. 그 외 전부 False.
+    assert bridge._guest_bypass(_guest_ev(9, "파이썬이 뭐야"))
+    assert not bridge._guest_bypass(_guest_ev(9, "ㅁ노래"))  # ㅁ명령 제외
+    assert not bridge._guest_bypass(_guest_ev(9, "ㅁ푸시해줘"))
+    assert not bridge._guest_bypass(_guest_ev(9, "   "))  # 빈 텍스트
+    assert not bridge._guest_bypass(_guest_ev(9, "질문", kind="photo", photo_ref="f"))  # 사진 제외
+    assert not bridge._guest_bypass(_btn(9, "push", channel_role=_GUEST))  # 버튼 제외
+    assert not bridge._guest_bypass(_txt(9, "질문", channel_role="간단처리"))  # 다른 채널
+
+
+def test_guest_channel_web_only_and_isolated_cwd(monkeypatch):
+    # 인가 user 라도 게스트 채널은 웹 2개 도구·격리 샌드박스 cwd(레포 밖)로 실행.
+    runs = _spy_rcwp_full(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _guest_ev(777, "리액트란"), target_root="root")
+    proj, task, tools, sysprompt = runs[0]
+    assert tools == ["WebSearch"]  # WebFetch 제거(SSRF 차단)·파일·bash·git 없음
+    assert task == "리액트란"
+    assert proj == str(bridge.GUEST_SANDBOX_DIR)
+    assert "chiikawa_dev" not in proj  # 워크스페이스(레포) 밖 — CLAUDE.md 상위 로드 차단
+    # L-1: 게스트 전용 최소 프롬프트 — 내부 명칭 미포함(인젝션 노출 차단).
+    assert sysprompt == bridge.GUEST_SYSTEM_PROMPT
+    assert (
+        "_Template/Dev" not in sysprompt and "간단처리" not in sysprompt and "push" not in sysprompt
+    )
+
+
+def test_guest_unauth_question_passes(monkeypatch):
+    # 비인가 user 의 순수 질문 → 통과(웹만).
+    runs = _spy_rcwp_full(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _guest_ev(999, "날씨 알려줘"), allowed=_ALLOWED, target_root="root")
+    assert len(runs) == 1 and runs[0][2] == ["WebSearch"]
+
+
+def test_guest_unauth_command_and_photo_ignored(monkeypatch):
+    # 비인가 게스트의 ㅁ명령·사진은 우회 제외 → 무시(실행·회신·다운로드 없음).
+    runs = _spy_rcwp_full(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _guest_ev(999, "ㅁ푸시해줘"), allowed=_ALLOWED, target_root="root")
+    _fire(
+        a, _guest_ev(999, "봐줘", kind="photo", photo_ref="f"), allowed=_ALLOWED, target_root="root"
+    )
+    assert runs == [] and a.sent == [] and a.fetched == []
+
+
+def test_guest_channel_command_not_special(monkeypatch):
+    # 게스트 채널에선 ㅁ명령(인가 user)도 순수 질문으로 실행 — push/음악 등 특수 분기 미발동.
+    runs = _spy_rcwp_full(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _guest_ev(777, "ㅁ푸시해줘"), target_root="root")
+    assert runs and runs[0][1] == "ㅁ푸시해줘" and a.music == []  # 웹 질문으로 흐름(push 아님)
+
+
+def test_nonguest_keeps_full_system_prompt(monkeypatch):
+    # 회귀: 게스트 외 경로(간단처리 일반 실행)는 기존 BRIDGE_SYSTEM_PROMPT 유지.
+    runs = _spy_rcwp_full(monkeypatch)
+    a = FakeAdapter()
+    ev = Event(kind="text", channel_id=100, user_id=777, text="2+2", channel_role="간단처리")
+    _fire(a, ev, target_root="root")
+    assert runs[0][3] == bridge.BRIDGE_SYSTEM_PROMPT  # 기본 프롬프트(게스트 최소본 아님)
 
 
 def test_restart_helper_writes_marker_closes_exits(monkeypatch, tmp_path):

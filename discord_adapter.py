@@ -96,9 +96,18 @@ _CAT_PROJECT = "📁 프로젝트"
 _CAT_DATA = "📊 데이터분석"
 _CAT_SCHED = "🗓️ 스케쥴러"
 _CAT_SYSTEM = "⚙️ 시스템"
+_CAT_QUESTION = "❓ 질문"  # 게스트질문(개발자 외 서버 멤버 Q&A) 전용 — 시스템↔PlayList 사이.
 _CAT_VOICE = "🎵 PlayList"
-# 위치 순서(0..5): 데이터분석 아래·시스템 위에 스케쥴러 삽입.
-_CAT_ORDER = [_CAT_SIMPLE, _CAT_PROJECT, _CAT_DATA, _CAT_SCHED, _CAT_SYSTEM, _CAT_VOICE]
+# 위치 순서(0..6): 데이터분석 아래·시스템 위에 스케쥴러, 시스템 아래·PlayList 위에 질문.
+_CAT_ORDER = [
+    _CAT_SIMPLE,
+    _CAT_PROJECT,
+    _CAT_DATA,
+    _CAT_SCHED,
+    _CAT_SYSTEM,
+    _CAT_QUESTION,
+    _CAT_VOICE,
+]
 # 카테고리별 코어 별칭(기존 탐색) — 대부분 코어명 1개, 음성은 이전 이름 '음성' 포함.
 _CAT_ALIASES: dict[str, list[str]] = {
     _CAT_SIMPLE: ["간단처리"],
@@ -106,6 +115,7 @@ _CAT_ALIASES: dict[str, list[str]] = {
     _CAT_DATA: ["데이터분석"],
     _CAT_SCHED: ["스케쥴러"],
     _CAT_SYSTEM: ["시스템"],
+    _CAT_QUESTION: ["질문"],
     _CAT_VOICE: ["PlayList", "음성"],
 }
 _VOICE_NAME = "PlayList"  # 음성 채널(재생 기능은 후속 — 자리만). 기본 음성 '일반'을 리네임/생성.
@@ -116,7 +126,10 @@ _DATA_TOPIC = "HTML 리포트는 디스코드에 안 뜸 — 파일/요약만." 
 # ponytail: 빈이름 targeting 폐기 — 디스코드가 U+3164·U+2800 둘 다 400 거부(라이브 실측). 두 채널
 # (간단처리 텍스트·PlayList 음성)은 정상 표시명을 갖고 일반 리네임 경로(정확명 비교·멱등)를 탄다.
 _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
-    _CAT_SIMPLE: [("간단처리", "role", "간단처리")],
+    _CAT_SIMPLE: [("간단처리", "role", "간단처리")],  # 개발자 전용·full 도구
+    # 게스트질문(개발자 외 서버 멤버·웹검색 Q&A·cwd 격리·코어 bridge._GUEST_ROLE 와 태그 일치)은
+    # 별도 '질문' 카테고리. role tag/채널명 불변(격리 매칭 유지) — 카테고리 배치만 분리.
+    _CAT_QUESTION: [("게스트질문", "role", "게스트질문")],
     _CAT_DATA: [("데이터분석", "role", "데이터분석")],  # 하이픈 원천 제거
     _CAT_SCHED: [("미국주식", "role", "미국주식"), ("오픈소스", "role", "오픈소스")],
     _CAT_SYSTEM: [("알림", "role", "알림"), ("봇상태", "role", "봇상태")],  # 하이픈 원천 제거
@@ -387,6 +400,53 @@ class DiscordAdapter:
         r = self._run(self._music_skip_coro(), timeout=60)
         return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
 
+    def search_video(self, query: str) -> tuple[str, str] | None:
+        """'ㅁ추가 <검색어>' → yt-dlp ytsearch1 첫 결과 (videoId, 제목). 무결과·실패는 None.
+
+        음성 재생(_run 경유 이벤트루프)과 달리 순수 메타 추출이라 워커 스레드에서 직접(블로킹)
+        실행한다 — voice client·on_ready 무관. 익명·무료(YouTube Data API search.list 미사용).
+        """
+        try:
+            opts = {"quiet": True, "skip_download": True, "extract_flat": "in_playlist"}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+        except Exception as e:  # yt-dlp 추출 실패(네트워크·차단·무결과 파싱 등) — None 폴백
+            log.warning("유튜브 검색 실패: %s", type(e).__name__)
+            return None
+        entries = (info or {}).get("entries") or []
+        if not entries or not isinstance(entries[0], dict):
+            return None
+        vid = entries[0].get("id")
+        if not vid:
+            return None
+        return (str(vid), str(entries[0].get("title") or vid))
+
+    def enqueue_video(self, video_id: str, title: str) -> int:
+        """재생 중이면 새 곡을 현재 곡 바로 뒤에 실시간 편입하고 편입 후 큐 곡수를 반환.
+
+        재생 중이 아니면 no-op 0 — 다음 ㅁ노래에 자연 포함된다. _run 으로 이벤트루프에 직렬화해
+        _advance/_play_current 의 _music_entries 접근과 경쟁 없이 삽입한다(기존 음악 패턴). _run 이
+        실패(루프 미준비 등)로 None 을 주면 편입 실패로 보고 0.
+        """
+        r = self._run(self._enqueue_coro(video_id, title))
+        return r if isinstance(r, int) else 0
+
+    async def _enqueue_coro(self, video_id: str, title: str) -> int:
+        if self._voice is None or not self._voice.is_connected() or not self._music_entries:
+            return 0
+        if self._music_stopping:
+            return 0
+        # FIFO: 현재 곡 뒤에 이미 쌓인 대기곡("queued" 표시)들을 건너뛴 첫 위치에 삽입 → 추가곡이
+        # 추가순서대로 현재 곡 뒤에 이어진다(현재곡 → A → B → C → 기존 셔플). 재생돼서 _music_index
+        # 가 지나가면 대기 블록에서 자연히 빠져(스캔은 index+1 부터라) _advance·재셔플 수정 불필요.
+        # queued 키는 표식일 뿐 — _extract_stream/_play_current 은 id/title 만 써서 무영향.
+        pos = self._music_index + 1
+        while pos < len(self._music_entries) and self._music_entries[pos].get("queued"):
+            pos += 1
+        self._music_entries.insert(pos, {"id": video_id, "title": title, "queued": True})
+        log.info("재생 큐 편입: id=%s pos=%d/%d", video_id, pos, len(self._music_entries))
+        return len(self._music_entries)
+
     def _caller_voice_channel(self, user_id: int) -> Any:
         """호출자(user_id)가 접속해 있는 음성채널을 첫 길드에서 찾는다(없으면 None).
 
@@ -475,7 +535,7 @@ class DiscordAdapter:
                 log.warning("곡 스트림 해석 실패(skip): %s", type(e).__name__)
                 self._music_index += 1
                 if self._music_index >= len(self._music_entries):
-                    random.shuffle(self._music_entries)
+                    self._reshuffle_entries()
                     self._music_index = 0
                 continue
             src = discord.FFmpegPCMAudio(
@@ -506,13 +566,22 @@ class DiscordAdapter:
             return
         asyncio.run_coroutine_threadsafe(self._advance(), self._loop)
 
+    def _reshuffle_entries(self) -> None:
+        """한 바퀴 다 돈 뒤 재셔플. 이미 재생된 추가곡의 'queued' 마커를 먼저 지운다 —
+        안 지우면 다음 바퀴 _enqueue_coro 스캔이 스테일 마커를 건너뛰어 삽입 위치가 미세하게
+        어긋난다(무해하나 정확성). 무-await(원자성 불변 유지) — 재셔플 경로 전용.
+        """
+        for e in self._music_entries:
+            e.pop("queued", None)
+        random.shuffle(self._music_entries)
+
     async def _advance(self) -> None:
         """다음 곡으로(끝이면 재셔플·처음부터 = 무한 반복)."""
         if self._music_stopping:
             return
         self._music_index += 1
         if self._music_index >= len(self._music_entries):
-            random.shuffle(self._music_entries)
+            self._reshuffle_entries()
             self._music_index = 0
         await self._play_current()
 
@@ -588,6 +657,7 @@ class DiscordAdapter:
             (_CAT_DATA, _SPECIAL[_CAT_DATA]),
             (_CAT_SCHED, _SPECIAL[_CAT_SCHED]),
             (_CAT_SYSTEM, _SPECIAL[_CAT_SYSTEM]),
+            (_CAT_QUESTION, _SPECIAL[_CAT_QUESTION]),
         ]
         old_by_keytag = {(k, t): cid for cid, (k, t) in self._channel_map.items()}
         by_id = {c.id: c for c in guild.channels}
@@ -771,13 +841,26 @@ class DiscordAdapter:
         async def on_interaction(interaction: discord.Interaction) -> None:
             await self._on_interaction(interaction)
 
+    def _is_playlist_channel(self, channel_id: int) -> bool:
+        """channel_map 상 ("role","playlist") 채널인지 — 인가 우회 선필터용(코어가 최종 판정)."""
+        return self._channel_map.get(channel_id) == ("role", "playlist")
+
+    def _is_guest_channel(self, channel_id: int) -> bool:
+        """channel_map 상 ("role","게스트질문") 채널인지 — 인가 우회 선필터용(코어가 최종 판정)."""
+        return self._channel_map.get(channel_id) == ("role", "게스트질문")
+
     async def _on_message(self, message: discord.Message) -> None:
         """텍스트/사진 메시지 → 정규화 Event 큐 적재. 자기 메시지·비허용은 드롭."""
         me = self._client.user
         if me is not None and message.author.id == me.id:
             return  # 자기 메시지 무시(에코 루프 방지)
-        if message.author.id not in self._allowed:
-            return  # 선-필터(코어도 재검증) — 스팸 유입 차단
+        # 선-필터(코어도 재검증). 단 플레이리스트·게스트질문 채널은 비인가라도 통과 — 코어가
+        # 화이트리스트 음악 명령(_playlist_bypass)·순수 질문 텍스트(_guest_bypass)만 우회 허용한다.
+        # 그 외 채널의 비인가는 여기서 드롭(스팸 유입 차단). 게스트 버튼/사진은 코어가 최종 배제.
+        cid = message.channel.id
+        bypass = self._is_playlist_channel(cid) or self._is_guest_channel(cid)
+        if message.author.id not in self._allowed and not bypass:
+            return
         self._queue.put(self._message_event(message))
 
     def _message_event(self, message: discord.Message) -> Event:
@@ -831,8 +914,11 @@ class DiscordAdapter:
         """
         if interaction.type != discord.InteractionType.component:
             return  # 컴포넌트 외(슬래시 명령 등)는 0단계 미사용
-        if interaction.user.id not in self._allowed:
-            return  # 선-필터: defer 도 하지 않음(코어 게이트가 최종 무회신 처리)
+        ch_id = interaction.channel_id or 0
+        # 선-필터: 비인가는 드롭(defer 도 안 함). 단 플레이리스트 채널 버튼은 통과 — 코어가
+        # clean:ok/x(ㅁ청소 확인·취소)만 우회 허용(_playlist_bypass), 그 외는 코어 게이트가 무시.
+        if interaction.user.id not in self._allowed and not self._is_playlist_channel(ch_id):
+            return
         try:
             await interaction.response.defer()  # §2.3 3초 규약 — 큐 적재보다 반드시 선행
         except discord.HTTPException as e:
@@ -844,15 +930,17 @@ class DiscordAdapter:
         callback_id = str(interaction.id)
         self._interactions[callback_id] = interaction  # ack(followup)로 잇기
         msg = interaction.message
+        entry = self._channel_map.get(ch_id)  # 코어 _playlist_bypass 가 channel_role 로 우회 판정
         self._queue.put(
             Event(
                 kind="button",
-                channel_id=interaction.channel_id or 0,
+                channel_id=ch_id,
                 user_id=interaction.user.id,
                 message_id=msg.id if msg is not None else None,
                 action=action,
                 action_arg=arg,
                 callback_id=callback_id,
+                channel_role=entry[1] if entry is not None and entry[0] == "role" else None,
             )
         )
 

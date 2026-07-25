@@ -1,4 +1,4 @@
-# claude_bridge 런타임 의존성.
+# claude-bridge 런타임 의존성.
 # 코어(bridge.py)·계약(adapter.py)은 표준 라이브러리 전용(의존성 0).
 # 디스코드 어댑터(discord_adapter.py)만 discord.py 를 쓰며 bridge.main 이 지연 import 하지만,
 # 디스코드 전용이라 구동에 필수다(미설치 시 기동 불가).

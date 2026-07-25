@@ -1,4 +1,4 @@
-# claude_bridge restart launcher (local / laptop -- PowerShell)
+# claude-bridge restart launcher (local / laptop -- PowerShell)
 # ASCII-only on purpose: Windows PowerShell 5.1 misreads UTF-8-no-BOM Korean as cp949
 # and breaks brace matching (parse error). Keep this file ASCII.
 #
@@ -11,7 +11,7 @@
 $ErrorActionPreference = 'Continue'
 Set-Location -Path $PSScriptRoot
 if (-not $env:BRIDGE_PLATFORM) { $env:BRIDGE_PLATFORM = 'discord' }
-# trading_info backend needs PHP 8.4 (XAMPP 7.4 on PATH breaks vendor/tests). Prepend C:\php84 so
+# trading-info backend needs PHP 8.4 (XAMPP 7.4 on PATH breaks vendor/tests). Prepend C:\php84 so
 # the bot's `php` = 8.4; inherited by python and its `claude` subprocess. Bot itself is python (unaffected).
 if (Test-Path 'C:\php84\php.exe') { $env:PATH = 'C:\php84;' + $env:PATH }
 $fails = 0

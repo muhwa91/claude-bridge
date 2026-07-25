@@ -1,0 +1,2 @@
+logs/ 폴더에는 hook 이 질문 로그(prompts.jsonl)와 세션 기록(sessions/)을 자동으로 남깁니다.
+이 .gitkeep 은 빈 폴더를 유지하기 위한 파일입니다.

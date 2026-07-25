@@ -1,4 +1,4 @@
-# claude_bridge
+# claude-bridge
 
 **디스코드에서 보낸 한 줄로 Claude Code 를 원격 실행하는 디스코드 실행비서.**
 PC 앞에 없어도 디스코드에 지시를 보내면 상시 호스트가 대신 작업하고,
@@ -46,7 +46,7 @@ asyncio(이벤트루프 스레드) ↔ 동기 코어(워커 스레드)를 큐 + 
 
 | 기능 | 설명 |
 |---|---|
-| **채널 = 프로젝트** | 봇이 프로젝트별 채널을 자동 생성. `#etf_info` 채널에서 프로젝트명 없이 지시만 보내면 그 프로젝트에서 실행 |
+| **채널 = 프로젝트** | 봇이 프로젝트별 채널을 자동 생성. `#etf-info` 채널에서 프로젝트명 없이 지시만 보내면 그 프로젝트에서 실행 |
 | **상태색 임베드** | 완료 초록 · 실패 빨강 · 진행 노랑 · 확인대기 블러플. 진행→완료는 같은 메시지를 편집(채널이 안 쌓임) |
 | **버튼 UI** | 프로젝트 선택·`push` 승인·예약알림 확인을 탭 버튼으로 — 폰 타이핑 최소화 |
 | **한글·평문 명령** | `프로젝트`·`도움말`·`취소`·`재시작` 을 단독 단어로(슬래시 `/프로젝트`·영어 별칭도) |
@@ -83,7 +83,7 @@ asyncio(이벤트루프 스레드) ↔ 동기 코어(워커 스레드)를 큐 + 
 ## Quick Start
 
 ```bash
-git clone <repo> && cd claude_bridge
+git clone <repo> && cd claude-bridge
 python -m pip install -r requirements.txt   # discord.py
 cp .env.example .env                        # 봇 토큰·인가키 채우기
 python bridge.py                            # 또는 run_loop.ps1(재기동 루프)

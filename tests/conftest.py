@@ -3,4 +3,28 @@
 import pathlib
 import sys
 
+import pytest
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+import bridge  # sys.path 주입 뒤에만 임포트 가능
+
+# 다이제스트가 **실제로 쓰는** 상태 파일. 모듈 상수를 직접 읽는 함수(mark_seen·append_rejected·
+# append_backlog·collect_awesome)를 부르는 테스트가 monkeypatch 를 빠뜨리면 라이브가 오염된다.
+_STATE_ATTRS = ("SEEN_FILE", "REJECTED_FILE", "BACKLOG_FILE", "AWESOME_SNAPSHOT_FILE")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_state_files(monkeypatch, tmp_path_factory):
+    """상태 파일 4종을 **모든 테스트에서** tmp 로 돌린다(라이브 오염 방지 가드).
+
+    2026-07-27 실제 사고: `_post_digest_cards` 를 직접 부르는 테스트가 SEEN_FILE 을 monkeypatch
+    하지 않아 라이브 `logs/opensource_seen.json` 에 테스트 고정 날짜(`owner/repo-plus`:
+    2026-07-15)가 기록됐다 — 그 이름이 쿨다운에 걸려 실제 후보 풀에서 빠진다.
+    개별 테스트가 자기 경로로 다시 덮는 것은 자유(이 fixture 가 먼저 깔린다).
+    tmp_path **밖**에 둔다 — tmp_path 를 프로젝트 루트로 쓰는 테스트(list_projects)가 있어
+    거기에 폴더를 만들면 가짜 프로젝트로 잡힌다.
+    """
+    state = tmp_path_factory.mktemp("digest_state")
+    for attr in _STATE_ATTRS:
+        monkeypatch.setattr(bridge, attr, state / getattr(bridge, attr).name)

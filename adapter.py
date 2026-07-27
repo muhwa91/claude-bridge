@@ -22,7 +22,7 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|nb:ok|nb:later|nb:done|od:add|od:skip + §4.7 델타3(r|rec|fav|…).
+    # 정규화 액션: push|x|p|c|nb:ok|nb:later|nb:done|od:add + §4.7 델타3(r|rec|fav|…).
     action: str
     arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
@@ -256,11 +256,12 @@ def parse_callback(data: str) -> tuple[str, str] | None:
             return (f"fav:{parts[1]}", parts[2])
         return None
     if data.startswith("od:"):
-        # od:add:<seq> | od:skip:<seq> — 🧩 오픈소스 다이제스트 카드 버튼. seq = 코어 보류맵 키
-        # (정수). 레포명이 아니라 seq 를 싣는 이유 = custom_id 100자 한도(레포명은 길 수 있다).
+        # od:add:<seq> — 🧩 오픈소스 다이제스트 [📌N] 버튼. seq = 코어 보류맵 키(정수).
+        # 레포명이 아니라 seq 를 싣는 이유 = custom_id 100자 한도(레포명은 길 수 있다).
+        # `od:skip`(🚫 다시 안 봄)은 v2 에서 폐기 — 30일 쿨다운이 그 역할을 대신한다.
         parts = data.split(":")
-        if len(parts) == 3 and parts[1] in ("add", "skip") and _dig(parts[2]):
-            return (f"od:{parts[1]}", parts[2])
+        if len(parts) == 3 and parts[1] == "add" and _dig(parts[2]):
+            return ("od:add", parts[2])
         return None
     if data.startswith("rec:"):
         # rec:<idx> — 최근 실행. idx 정수.
@@ -291,7 +292,6 @@ def encode_callback(action: str, arg: str) -> str:
         "fav:add",
         "fav:del",
         "od:add",
-        "od:skip",
     )
     if action in _joined:
         return f"{action}:{arg}"

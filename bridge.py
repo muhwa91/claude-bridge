@@ -62,6 +62,7 @@ SESSION_PING_FILE = LOG_DIR / "session_ping"
 SEEN_FILE = LOG_DIR / "opensource_seen.json"
 REJECTED_FILE = LOG_DIR / "opensource_rejected.jsonl"
 AWESOME_SNAPSHOT_FILE = LOG_DIR / "awesome_snapshot.md"  # awesome-claude-code README 직전 스냅샷
+DIGEST_DRYRUN_FILE = LOG_DIR / "digest_dryrun.txt"  # --digest-dry-run 출력(매번 덮어씀, gitignore)
 # 오라클 재고 잡이 = GitHub Actions(oci_arm_grabber) 로 이관됨(데스크탑 런처 폐기).
 # `오라클` 명령은 gh 로 이 레포의 실행 목록을 라이브 조회한다(호스트에 gh authed 전제).
 # ponytail: 오라클 VM 확보 후 이 상수·`오라클` 명령·gh 조회 통째로 삭제.
@@ -324,7 +325,9 @@ channel_sessions: dict[int, str] = {}
 # (재시작 시 유실 수용).
 pending_photos: dict[int, tuple[str, float]] = {}
 
-# ⑦ 🧩 다이제스트 카드 보류맵 — seq -> 카드 entry(이름·URL·판정·적용·채널·본문·버튼 상태).
+# ⑦ 🧩 다이제스트 항목 보류맵 — seq -> 항목 dict(제목·판정·값 + 정규 레포명·URL·적용·등재 여부).
+# v2 는 항목 여러 건이 메시지 하나에 실리므로 각 항목이 `group`(채널·형제 항목·평문·footer)을
+# 역참조한다 — 버튼 처리 때 형제까지 함께 다시 그리기 위해서다.
 # 버튼 arg 에 이 seq 를 담는다(레포명은 길어 custom_id 100자를 넘길 수 있다). 카운터는
 # itertools.count 라 증가가 원자적(전역 재바인딩·락 불필요). 버튼 처리는 직렬 워커 스레드에서만
 # 일어나므로 entry 변이에도 락이 필요 없다(pending 과 동형).
@@ -488,18 +491,20 @@ def notify_buttons(item_id: str) -> list[Button]:
     ]
 
 
-def digest_buttons(seq: int, *, added: bool = False, skipped: bool = False) -> list[Button]:
-    """[📌 백로그][🚫 다시 안 봄] — 🧩 다이제스트 카드(카드 1장당 1묶음).
+def digest_buttons(items: list[dict[str, Any]]) -> list[Button]:
+    """[📌1]…[📌5] — 🧩 다이제스트 메시지 1개에 항목 수만큼(한 줄). 누르면 그 항목이 백로그로.
 
-    arg 는 레포명이 아니라 보류맵 seq(정수) — custom_id 100자 한도 안에 항상 들어간다(레포명은
-    길 수 있다). 이미 누른 버튼은 빼서 렌더하므로 중복 적재(백로그 두 줄)가 구조적으로 불가능.
+    번호는 **Embed 필드 번호와 같다** — 후보 역매칭에 실패했거나 이미 누른 항목은 버튼만 빠지고
+    나머지 번호는 그대로다(눌러도 아무것도 못 거르는 버튼은 애초에 달지 않는다, L-4).
+    arg 는 레포명이 아니라 보류맵 seq(정수) — custom_id 100자 한도 안에 항상 들어간다.
+    `🚫 다시 안 봄` 은 v2 에서 제거했다: 30일 쿨다운(mark_seen)이 그 역할을 대신하고, 항목이
+    5건이면 버튼 10개가 화면만 복잡하게 만든다.
     """
-    btns: list[Button] = []
-    if not added:
-        btns.append(Button("📌 백로그", "od:add", str(seq), style="primary"))
-    if not skipped:
-        btns.append(Button("🚫 다시 안 봄", "od:skip", str(seq), style="secondary"))
-    return btns
+    return [
+        Button(f"📌{i}", "od:add", str(it["seq"]), style="primary")
+        for i, it in enumerate(items, start=1)
+        if it.get("seq") is not None and not it.get("added")
+    ]
 
 
 def choice_buttons(msg_id: int, choices: list[tuple[str, str]]) -> list[Button]:
@@ -948,11 +953,20 @@ def dispatch_notifications(
 DIGEST_NOTIFY_ID = "os-digest"  # notify.json 의 이 id 만 다이제스트 파이프라인으로 간다.
 # ponytail: 다이제스트는 1종뿐이라 id 상수로 분기 — 종류가 늘면 item 에 "kind" 필드를 도입한다.
 DIGEST_MIN_STARS = 300  # 1차 거르기 하한(⭐) — 이 밑은 하네스에 붙일 만큼 안 익었다고 본다
-DIGEST_MAX_CANDIDATES = 15  # 프롬프트에 싣는 후보 상한(토큰·판정 품질) — 넘치면 스타순으로 자름
-DIGEST_README_TOP = 4  # README 를 실제로 받아올 상위 후보 수(= raw 요청 수)
+# 후보를 **좁고 깊게** 판정한다(v2): 8건만 싣되 8건 **전량**의 README 를 받는다. 채택 기준이
+# "롤백 가능한가"인데 README 없이는 판정이 불가능해, v1(후보 15 · README 4)에서는 11건이 사실상
+# 한 줄 설명만 보고 버려졌다. 발췌를 3,000→2,000자로 줄여 총 프롬프트량은 종전과 비슷하다.
+DIGEST_MAX_CANDIDATES = 8  # 프롬프트에 싣는 후보 상한(토큰·판정 품질) — 넘치면 정렬 상위만
+DIGEST_README_TOP = 8  # README 를 실제로 받아올 상위 후보 수(= raw 요청 수)
 DIGEST_HN_TOP = 5  # HN 스토리 상한(포인트순)
-DIGEST_MAX_CARDS = 2  # 게시 카드 상한(출력 계약)
-DIGEST_CARD_MAXLEN = 1500  # 카드 1장 길이 상한 — 계약 이탈(수십 KB)이 채널을 청크 도배하지 않게
+DIGEST_MAX_CARDS = 5  # 한 메시지에 담는 항목 상한(출력 계약) — **상한이지 목표가 아니다**
+# 카드 1장 길이 상한 — 계약 이탈(수십 KB)이 채널을 도배하지 않게. **DIGEST_MAX_CARDS 와 곱이
+# 디스코드 임베드 총합 6,000자를 넘지 않아야 한다**(5개 x 1000자 + 제목·footer ≈ 5.1KB).
+DIGEST_CARD_MAXLEN = 1000
+DIGEST_NEW_DAYS = 90  # 신흥 축 조회 창(일) — `created:>` 에 들어간다
+DIGEST_NEW_MIN_STARS = 200  # 신흥 축 쿼리 하한(⭐). 로컬 1차 거르기는 DIGEST_MIN_STARS 가 따로 건다
+DIGEST_COOLDOWN_DAYS = 30  # 발송·기각 후 다시 후보로 올리지 않는 기간(일). 📌 등재분은 영구 제외
+_SEEN_FOREVER = ""  # seen 값이 빈 문자열 = 날짜 없는 **영구 제외**(📌 등재분 · v1 리스트 형식)
 _BACKLOG_FIELD_MAXLEN = 200  # 백로그 한 줄에 싣는 외부 유래 필드(이름·적용·URL) 각각의 상한
 # ── 하네스 주입 상한(로컬·신뢰 소스라 인젝션 가드는 불필요하되 토큰·비용 상한은 건다) ──
 HARNESS_MAX_NAMES = 60  # 목록(MCP·플러그인·스킬·에이전트) 1개당 이름 수 상한
@@ -977,6 +991,7 @@ _HARNESS_MODEL_TMPL = (
 _HARNESS_MODEL_FALLBACK = _HARNESS_MODEL_TMPL.format("opus")  # 읽기 실패 시 현행 문구 유지
 # 백로그의 "열린/미결 항목" 절만 — 다음 `## ` 제목 직전까지(문서 끝이면 끝까지).
 _BACKLOG_OPEN_RE = re.compile(r"^## 열린/미결.*?(?=^## |\Z)", re.M | re.S)
+_BACKLOG_SUBHEAD = "### 다이제스트 편입 후보"  # 📌 줄이 모이는 소제목(그 절 안에 없으면 만든다)
 DIGEST_TIMEOUT_SEC = 300  # 판정 claude 데드라인
 DIGEST_MAX_ATTEMPTS = 3  # 하루 실패-되돌림 상한(종일 실패 시 25초마다 재시도하지 않게)
 # 판정 도구 = **0개**. cwd 가 워크스페이스 루트라 Read 사정거리 안에 실제 자격증명이 있다
@@ -1024,25 +1039,24 @@ DIGEST_SYSTEM_PROMPT = (
 _DIGEST_HOSTS = frozenset({"api.github.com", "raw.githubusercontent.com", "hn.algolia.com"})
 _DIGEST_TIMEOUT = 8  # 초
 _DIGEST_MAXBYTES = 300_000  # 응답 읽기 상한(거대 README·검색결과 방어)
-_DIGEST_README_MAXLEN = 3000  # README 발췌 상한(프롬프트 비대 방지 — _REST_PROBE_MAXLEN 사상)
+_DIGEST_README_MAXLEN = 2000  # README 발췌 상한(프롬프트 비대 방지 — _REST_PROBE_MAXLEN 사상)
 _DIGEST_GH_INTERVAL = 6.0  # GitHub 검색 호출 간격(초) — 무인증 10회/분(초과 시 403 실측)
 _DIGEST_UA = "claude-bridge-digest"  # GitHub API 는 User-Agent 없으면 403
 # owner/repo 만. 끝은 `\Z` — `$` 는 끝 개행을 통과시켜(`"o/r\n"` 매칭) 경로 조립 계약이 깨진다.
 # `..` 는 이 정규식만으론 못 막으므로(`.` 가 문자군에 있다) fetch_readme 가 별도로 거른다.
 _FULL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._-]{1,64}\Z")
 _DIGEST_NONE_MARK = "오늘 적용할 것 없음"  # 이 문구가 든 카드엔 버튼을 달지 않는다
-# ── 카드 렌더 스펙(B안 · Embed fields) ──────────────────────────────────────
-# 시각 정본 = `_Temp_files/2026/0727/doc/digest_card_v2.html` 의 **방식① · 배치A · 색(c)**
-# (2026-07-27 확정). 코어는 평문 카드를 파싱해 **플랫폼 무관 dict** 로 만들고, 어댑터가 그걸
-# Embed 로 그린다(코어는 discord 를 모른다 — 경계 유지). 판정 프롬프트(build_digest_prompt)의
-# 출력 계약은 **손대지 않는다** — 바꾸면 판정 품질이 흔들리고 회귀 위험만 커진다.
+# ── 카드 렌더 스펙(v2 · 메시지 1개 · 항목 = Embed field 1개) ────────────────
+# 코어는 평문 카드를 파싱해 **플랫폼 무관 dict** 로 만들고, 어댑터가 그걸 Embed 로 그린다
+# (코어는 discord 를 모른다 — 경계 유지). v1 은 카드 1건 = 메시지 1개라 알림이 여러 번 울렸다 →
+# v2 는 **한 메시지에 최대 DIGEST_MAX_CARDS 건**을 필드로 담는다(digest_embed).
 # 이 키 집합이 **판정 낱말의 유일한 정본**이다 — 여기 없는 낱말이면 제목 슬롯이 어긋난 것으로
 # 보고 카드를 만들지 않는다(평문 폴백). `기각` 은 계약상 카드가 되지 않으므로 여기에도 없다.
 DIGEST_COLORS = {"즉시적용": 0x3ECF85, "차용": 0x5865F2, "참조": 0x5865F2, "보류": 0xEEBB4D}
 DIGEST_COLOR_DEFAULT = 0x5865F2  # 0건 안내(판정 없는 2층 카드) 전용 색
-# 본문 라벨 → (필드명, inline). 장·단은 좌우 2열, 적용은 전폭 1열.
-_DIGEST_FIELDS = (("장점", "👍 장점", True), ("단점", "👎 단점", True), ("적용", "🔧 적용", False))
-_DIGEST_SEQ_RE = re.compile(r"\d{1,2}/\d{1,2}")  # 카드 순번 표기(`1/2`) — 2건일 때만 붙는다
+# 본문 라벨 → 필드 값 한 줄의 머리표. 항목 하나가 필드 하나라 네 줄이 **한 값 안에** 들어간다.
+_DIGEST_VALUE_LINES = (("내용", ""), ("장점", "👍 "), ("단점", "👎 "), ("적용", "🔧 "))
+_DIGEST_SEQ_RE = re.compile(r"\d{1,2}/\d{1,2}")  # v1 카드 순번 표기(`1/2`) — 와도 흡수해 떼어낸다
 # 마지막 카드 꼬리 `검토 N건 · 기각 M건`(계약 형식 고정 — `건` 은 있어도 없어도 받는다).
 # **fullmatch 로만 쓴다**: 뒤를 안 묶으면 "검토 12건 중 기각 9건이 중복이었다" 같은 본문 줄까지
 # footer 로 훔쳐 ① 그 줄이 본문에서 사라지고 ② 마지막이 아닌 카드에 footer 가 붙는다(계약 위반).
@@ -1171,6 +1185,8 @@ def _gh_candidate(item: Any) -> dict[str, Any] | None:
         "key": name.split("/")[1].lower(),
         "url": f"https://github.com/{name}",
         "stars": stars if isinstance(stars, int) else 0,
+        # 레포 생성일(ISO) — 상승 속도 표기(`3개월 만에`)의 재료. 형식 검증은 age_label 이 한다.
+        "created": str(item.get("created_at") or "")[:10],
         "points": 0,
         "desc": strip_control_line(str(item.get("description") or ""))[:300],
         "topics": [
@@ -1182,30 +1198,36 @@ def _gh_candidate(item: Any) -> dict[str, Any] | None:
 
 
 def collect_github(
-    topics: tuple[str, ...], since_iso: str, *, interval: float = _DIGEST_GH_INTERVAL
+    topics: tuple[str, ...],
+    since_iso: str,
+    new_since_iso: str,
+    *,
+    interval: float = _DIGEST_GH_INTERVAL,
 ) -> list[dict[str, Any]]:
-    """topic 별 GitHub 검색(스타순·최근 push) → 후보 dict 목록. 실패·403/429 는 조용히 스킵.
+    """topic 별 **2축** GitHub 검색 → 후보 dict 목록. 실패·403/429 는 조용히 스킵.
 
-    무인증 Search API 는 10회/분이라 호출 사이에 간격을 둔다(실측 403). 정렬·기간 필터는 API 에
-    맡기고 여기선 필드 정규화만 한다(_gh_candidate).
+    · **신흥** `topic:X created:>{new_since_iso} stars:>{DIGEST_NEW_MIN_STARS}` — 먼저 조회해
+      목록 앞에 쌓고 `fresh=True` 로 표시한다(filter_digest 가 이 표시를 정렬에 쓴다).
+    · **대형** `topic:X pushed:>{since_iso}` — v1 의 축. 그대로 유지한다.
+
+    v1 은 대형 축뿐이라 매일 **오래된 거물만** 올라왔다(n8n 198k·langchain 등 전량 기각). 문턱을
+    낮추는 대신 소스를 고친 것 — "신흥으로 떠오르는 것"이 개발자가 받고 싶어 한 축이다.
+    무인증 Search API 는 10회/분이라 호출 사이에 간격을 둔다(실측 403 — 6쿼리 = interval 5회).
+    정렬·기간 필터는 API 에 맡기고 여기선 필드 정규화만 한다(_gh_candidate).
     """
+    queries = [
+        (True, f"topic:{t} created:>{new_since_iso} stars:>{DIGEST_NEW_MIN_STARS}") for t in topics
+    ] + [(False, f"topic:{t} pushed:>{since_iso}") for t in topics]
     out: list[dict[str, Any]] = []
-    for i, topic in enumerate(topics):
+    for i, (fresh, q) in enumerate(queries):
         if i:
             time.sleep(interval)  # 데몬 스레드라 블로킹 무해(타이머 스레드와 별개)
-        query = urllib.parse.urlencode(
-            {
-                "q": f"topic:{topic} pushed:>{since_iso}",
-                "sort": "stars",
-                "order": "desc",
-                "per_page": "15",
-            }
-        )
+        query = urllib.parse.urlencode({"q": q, "sort": "stars", "order": "desc", "per_page": "15"})
         data = fetch_digest_json("api.github.com", f"/search/repositories?{query}")
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list):
             continue
-        out.extend(c for it in items if (c := _gh_candidate(it)) is not None)
+        out.extend({**c, "fresh": fresh} for it in items if (c := _gh_candidate(it)) is not None)
     return out
 
 
@@ -1484,7 +1506,9 @@ def filter_digest(
     """1차 거르기(브리지 코드 몫, 순수): 중복·seen·⭐하한·설명없음·이미 설치된 것 제외 + 정렬.
 
     ⭐·설명 조건은 GitHub 후보에만 건다(HN 스토리엔 스타가 없고, 포인트순 상위만 이미 추려왔다).
-    정렬 = GitHub(스타 내림차순) 먼저, 그 뒤 HN(포인트 내림차순) — 상위 N 건만 README 를 받는다.
+    정렬 = GitHub **신흥(fresh)** → GitHub 대형 → HN, 각 그룹 안에서 스타·포인트 내림차순.
+    신흥을 앞에 두지 않으면 DIGEST_MAX_CANDIDATES 절단에서 오래된 거물이 자리를 다 먹어 신흥
+    축이 프롬프트에 **한 건도 도달하지 못한다**(같은 레포가 양축에 걸리면 앞의 신흥 쪽만 남는다).
     **상한 절단은 여기서 하지 않는다** — 잘라낸 수를 로그로 남기려면 호출측이 통과 전량을 봐야
     한다(조용한 절단 금지). 절단은 run_opensource_digest 가 DIGEST_MAX_CANDIDATES 로 건다.
     """
@@ -1500,8 +1524,39 @@ def filter_digest(
             continue
         dedup.add(name)
         out.append(c)
-    out.sort(key=lambda c: (c.get("source") != "gh", -int(c.get("stars") or 0), -int(c["points"])))
+    out.sort(
+        key=lambda c: (
+            c.get("source") != "gh",
+            not c.get("fresh"),
+            -int(c.get("stars") or 0),
+            -int(c["points"]),
+        )
+    )
     return out
+
+
+def star_label(stars: int) -> str:
+    """⭐ 표기(순수) — 1,000 이상은 `12.4k`, 그 밑은 그대로. 판정 카드 제목에도 그대로 복사된다."""
+    return f"{stars / 1000:.1f}k" if stars >= 1000 else str(stars)
+
+
+def age_label(created: str, today: date) -> str:
+    """레포 생성일 → 나이 한 마디(`12일`·`3개월`·`5년`). 형식 이탈·미래 날짜는 ""(표기 생략). 순수.
+
+    "얼마 만에 이만큼 모았나"가 신흥 판단의 핵심이라 별 수 옆에 붙인다(`⭐12.4k · 3개월 만에`).
+    출력은 **코드가 만든 문자열뿐**이라 외부 값이 표기로 새지 않는다(created 는 파싱만 된다).
+    """
+    try:
+        born = date.fromisoformat(created[:10])
+    except ValueError:
+        return ""
+    days = (today - born).days
+    if days < 0:
+        return ""
+    if days < 60:
+        return f"{days}일"
+    months = days // 30
+    return f"{days // 365}년" if days >= 730 else f"{months}개월"
 
 
 def digest_excerpt(text: str, limit: int = _DIGEST_README_MAXLEN) -> str:
@@ -1565,9 +1620,9 @@ def build_digest_prompt(
             lines.append(f"{i}. {c['name']} (HN {c['points']}p) — {c['desc']} · {c['url']}")
         else:
             topics = ", ".join(c.get("topics") or []) or "-"
-            lines.append(
-                f"{i}. {c['name']} (⭐{c['stars']}) — {c['desc']} [topics: {topics}] · {c['url']}"
-            )
+            age = str(c.get("age") or "")  # run_opensource_digest 가 age_label 로 실어 준다
+            meta = f"⭐{star_label(int(c.get('stars') or 0))}" + (f" · {age} 만에" if age else "")
+            lines.append(f"{i}. {c['name']} ({meta}) — {c['desc']} [topics: {topics}] · {c['url']}")
     readme_block = "\n\n".join(
         f"── README: {name} ──\n{body}" for name, body in readmes.items() if body.strip()
     )
@@ -1588,18 +1643,19 @@ def build_digest_prompt(
         + (f"[README 발췌]\n{readme_block}\n\n" if readme_block else "")
         + f"───── 외부 데이터 끝 [{nonce}] ─────\n\n"
         + "[출력 계약 — 정확히 지켜라]\n"
-        "· 적용 가치가 있는 것만 **순위순 최대 2건**. 카드 1건 형식은 다음과 정확히 같다:\n\n"
-        f"{LEAD_DIGEST} <영역>축 · <이름> (⭐<스타수>) — <판정>\n\n"
-        "내용 : <2줄 이내>\n"
-        "장점 : <2줄 이내>\n"
-        "단점 : <2줄 이내>\n"
-        "적용 : <어디에 붙는지 + 소요시간>\n\n"
+        f"· 적용 가치가 있는 것만 **순위순 최대 {DIGEST_MAX_CARDS}건**"
+        "(상한이지 목표가 아니다 — 통과한 만큼만 써라). 카드 1건 형식은 다음과 정확히 같다:\n\n"
+        f"{LEAD_DIGEST} <영역>축 · <이름> (<괄호 표기>) — <판정>\n\n"
+        "내용 : <1줄>\n"
+        "장점 : <1줄>\n"
+        "단점 : <1줄>\n"
+        "적용 : <어디에 붙는지 + 소요시간, 1줄>\n\n"
         "· <영역> 자리엔 그 후보가 하네스의 **어느 부분에 붙는지**를 네가 직접 골라 쓴다 — "
         f"{' / '.join(DIGEST_AREAS)} 중 하나(애매하면 가장 가까운 것 하나만).\n"
-        "· HN 발 항목은 `(⭐N)` 대신 `(HN <포인트>p)`.\n"
+        "· <괄호 표기> 는 위 후보 줄의 괄호 안 내용을 **그대로 옮겨 적는다** — "
+        "`(⭐12.4k · 3개월 만에)` · `(⭐900)` · `(HN 90p)`. 숫자를 고쳐 쓰거나 지어내지 마라.\n"
         "· 판정은 `즉시적용` `차용` `참조` `보류` `기각` 중 하나.\n"
         "· **`기각` 은 카드로 만들지 마라**(아래 기각 줄로만 보고).\n"
-        "· 카드가 2건이면 제목 끝에 ` 1/2`·` 2/2` 를 붙인다.\n"
         "· 마지막 카드 끝에 `검토 N건 · 기각 M건` 한 줄.\n"
         f"· 적용 가치가 0건이면 카드 없이 한 줄만(영역 없이): "
         f"`{LEAD_DIGEST} {_DIGEST_NONE_MARK} (검토 N · 기각 N)`\n"
@@ -1663,7 +1719,11 @@ def _digest_verdict(head: str) -> str:
 
 
 def parse_digest_card(card: str) -> tuple[str, str]:
-    """카드 → (판정, 적용 한 줄). 형식이 어긋나면 ("참조", "") 폴백(백로그 줄에만 쓰임). 순수."""
+    """카드 → (판정, 적용 한 줄). 형식이 어긋나면 ("참조", "") 폴백(백로그 줄에만 쓰임). 순수.
+
+    제목의 괄호 표기(`(⭐900)` · `(⭐12.4k · 3개월 만에)` · `(HN 90p)`)는 읽지 않으므로 세 형태를
+    모두 그대로 통과시킨다 — 판정은 `—` 뒤 낱말, 적용은 `적용 :` 줄에서만 온다.
+    """
     lines = card.splitlines()
     verdict = _digest_verdict(lines[0] if lines else "")
     apply_line = ""
@@ -1684,7 +1744,7 @@ def _digest_sections(lines: list[str]) -> dict[str, str] | None:
     줄이 채널에서 조용히 사라진다(평문 폴백의 취지 = 정보 손실 0). 첫 라벨 앞의 줄, 구분자를
     아예 못 찾은 본문 전체가 여기 걸린다.
     """
-    labels = {"내용", *(k for k, _n, _i in _DIGEST_FIELDS)}
+    labels = {k for k, _prefix in _DIGEST_VALUE_LINES}
     out: dict[str, list[str]] = {}
     cur = ""
     for line in lines:
@@ -1703,18 +1763,23 @@ def _digest_sections(lines: list[str]) -> dict[str, str] | None:
 
 
 def digest_card(card: str) -> dict[str, Any] | None:
-    """카드 평문 → 어댑터 렌더용 카드 dict. **형식 이탈은 None**(호출측이 평문으로 폴백). 순수.
+    """카드 평문 1건 → **항목 dict**. 형식 이탈은 None(호출측이 평문으로 폴백). 순수.
 
-    dict = `author`(🧩 영역 · 1/2) · `title`(이름 (⭐N)) · `description`(**판정** · 내용) ·
-    `fields`[(이름, 값, inline)] · `footer`(검토 N · 기각 M) · `color`(판정별). 플랫폼 한도 절단은
-    어댑터 몫(디스코드 field 1024·author/title 256·footer 2048) — 여기선 의미만 만든다.
-    0건 안내(`🧩 오늘 적용할 것 없음 (검토 N · 기각 N)`)는 본문·필드 없는 2층 카드가 된다.
+    dict = `area`(영역) · `title`(`owner/repo (⭐12.4k · 3개월 만에)`) · `verdict` ·
+    `value`(내용/👍/👎/🔧 각 1줄) · `footer`(마지막 카드의 `검토 N · 기각 M`).
+    항목 여러 건을 **메시지 1개**로 접는 것은 digest_embed 의 몫이고, 0건 안내는 항목이 아니라
+    digest_none_card 가 따로 그린다.
+
+    제목 괄호 표기는 **의미를 보지 않고 통째로 title 에 싣는다** — `(⭐900)`(v1) ·
+    `(⭐12.4k · 3개월 만에)`(v2) · `(HN 90p)` 세 형태가 그대로 통과한다(하위호환).
     """
     lines = card.splitlines()
     head = lines[0].strip() if lines else ""
     if not head.startswith(LEAD_DIGEST):
         return None
     head = head[len(LEAD_DIGEST) :].strip()
+    if _DIGEST_NONE_MARK in head:
+        return None  # 0건 안내는 판정 항목이 아니다(digest_none_card 경로)
     footer = ""
     body: list[str] = []
     for line in lines[1:]:
@@ -1724,41 +1789,67 @@ def digest_card(card: str) -> dict[str, Any] | None:
             footer = stripped
         else:
             body.append(line)
-    if _DIGEST_NONE_MARK in head:
-        # 축 순회 폐기 후 0건 계약 = `🧩 오늘 적용할 것 없음 (검토 N · 기각 M)`(영역 없음).
-        # 판정이 옛 형식(`🧩 <영역>축 — 오늘…`)을 내도 흡수한다 — `—` 가 있으면 앞을 author 로.
-        area, dash, tail = head.partition("—")
-        note, _, stat = (tail if dash else head).strip().partition("(")
-        return {
-            "author": f"{LEAD_DIGEST} {area.strip()}" if dash else LEAD_DIGEST,
-            "title": note.strip() or _DIGEST_NONE_MARK,
-            "footer": stat.strip().rstrip(")") or footer,
-            "color": DIGEST_COLOR_DEFAULT,
-        }
     area, sep, tail = head.partition(" · ")  # 영역 구분자는 **공백 낀** ` · `(영역명 안의 `·` 보호)
-    name, dash, verdict_part = tail.rpartition("—")
-    tokens = verdict_part.split()
+    name, dash, _verdict_part = tail.rpartition("—")
     verdict = _digest_verdict(head)  # 미등록 낱말 = 제목 슬롯이 어긋난 것 → 카드 포기(평문 폴백)
     name = name.strip()
     if not (sep and dash and verdict and name):
         return None
-    # 순번(`1/2`)은 계약상 제목 끝 — 판정 뒤가 정석이지만 이름 뒤에 붙어 와도 흡수한다.
-    seq = next((t for t in tokens[1:] if _DIGEST_SEQ_RE.fullmatch(t)), "")
+    # v1 순번(`1/2`)은 v2 계약에 없지만 판정이 관성으로 붙여 와도 제목에 남기지 않는다.
     name_tokens = name.split()
-    if not seq and name_tokens and _DIGEST_SEQ_RE.fullmatch(name_tokens[-1]):
-        seq = name_tokens[-1]
+    if name_tokens and _DIGEST_SEQ_RE.fullmatch(name_tokens[-1]):
         name = " ".join(name_tokens[:-1])
     sections = _digest_sections(body)
     if sections is None:  # 본문 한 줄이라도 못 담았다 → 반쪽 카드 대신 평문(정보 손실 0)
         return None
-    desc = " · ".join(x for x in (f"**{verdict}**", sections.get("내용", "")) if x)
+    value = "\n".join(
+        f"{prefix}{sections[k]}" for k, prefix in _DIGEST_VALUE_LINES if sections.get(k)
+    )
     return {
-        "author": f"{LEAD_DIGEST} {area.strip()}" + (f" · {seq}" if seq else ""),
+        "area": area.strip(),
         "title": name,
-        "description": desc,
-        "fields": [(n, sections[k], i) for k, n, i in _DIGEST_FIELDS if sections.get(k)],
+        "verdict": verdict,
+        "value": value,
         "footer": footer,
-        "color": DIGEST_COLORS[verdict],  # 위 검증으로 키 존재 보장
+    }
+
+
+def digest_embed(items: list[dict[str, Any]], footer: str = "") -> dict[str, Any]:
+    """항목 dict 목록 → **메시지 1개**짜리 카드 스펙(항목마다 Embed field 1개). 순수.
+
+    v1 은 카드 1건 = 메시지 1개라 알림이 하루에 여러 번 울렸다. 필드명이 `1. <이름> — <판정>`
+    이라 [📌1]~[📌5] 버튼 번호와 눈으로 바로 이어진다(📌 를 누른 항목은 필드명에 📌 가 붙는다).
+    색은 1순위 항목의 판정색 — 한 메시지에 색은 하나뿐이라 대표를 맨 앞으로 둔다.
+    플랫폼 한도 절단은 어댑터 몫(디스코드 field 1024·title 256·footer 2048).
+    """
+    fields = [
+        (
+            f"{i}. {it.get('title', '')} — {it.get('verdict', '')}"
+            + (" 📌" if it.get("added") else ""),
+            str(it.get("value") or "—"),
+            False,
+        )
+        for i, it in enumerate(items, start=1)
+    ]
+    head = str(items[0].get("verdict", "")) if items else ""
+    return {
+        "title": f"{LEAD_DIGEST} 오늘의 신흥 {len(items)}건",
+        "fields": fields,
+        "footer": footer,
+        "color": DIGEST_COLORS.get(head, DIGEST_COLOR_DEFAULT),
+    }
+
+
+def digest_none_card(line: str) -> dict[str, Any]:
+    """`🧩 오늘 적용할 것 없음 (검토 N · 기각 M)` 한 줄 → 본문·필드·버튼 없는 2층 카드. 순수.
+
+    옛 형식(`🧩 <영역>축 — 오늘 적용할 것 없음 (…)`)이 와도 괄호 앞을 통째로 버려 흡수한다.
+    """
+    _head, _, stat = line.partition("(")
+    return {
+        "title": f"{LEAD_DIGEST} {_DIGEST_NONE_MARK}",
+        "footer": stat.strip().rstrip(")"),
+        "color": DIGEST_COLOR_DEFAULT,
     }
 
 
@@ -1784,40 +1875,110 @@ def backlog_line(day: str, entry: dict[str, Any]) -> str:
     return f"- [{day}] {name} ({entry.get('verdict', '')}) — {apply_line} · {url}"
 
 
+def _backlog_insert(text: str, line: str) -> str | None:
+    """`## 열린/미결 …` 절의 `### 다이제스트 편입 후보` 아래에 한 줄 끼운 문서. 절 없으면 None.
+
+    파일 끝에 append 하면 마지막 절(`## 진단·개편 이력`) 아래로 떨어져 ① 사람이 "열린/미결"을
+    볼 때 안 보이고 ② harness_backlog 가 **그 절만** 주입하므로 다음 날 판정이 못 봐서 같은
+    후보를 재추천한다(v1 실측). 소제목이 없으면 절 끝에 만들고, 있으면 그 소제목 블록 끝에 붙인다.
+    """
+    m = _BACKLOG_OPEN_RE.search(text)
+    if m is None:
+        return None
+    section = m.group(0)
+    at = section.find(_BACKLOG_SUBHEAD)
+    if at < 0:
+        block = f"{section.rstrip()}\n\n{_BACKLOG_SUBHEAD}\n{line}\n\n"
+    else:  # 다음 `### ` 직전(없으면 절 끝)까지가 이 소제목의 블록
+        nxt = section.find("\n### ", at + 1)
+        end = len(section) if nxt < 0 else nxt + 1
+        block = f"{section[:end].rstrip()}\n{line}\n\n{section[end:]}"
+    return text[: m.start()] + block + text[m.end() :]
+
+
 def append_backlog(path: Path, line: str) -> bool:
-    """개편 백로그(_Core/OPTIMIZE_BACKLOG.md)에 한 줄 append. 성공 여부 반환.
+    """개편 백로그(_Core/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입. 성공 여부 반환.
 
     브리지가 직접 쓴다(claude 무관 — graduate_notify 와 같은 사상). 저장은 원자적(tmp→replace).
     파일이 없으면 만들지 않고 False — 워크스페이스 정본을 브리지가 창조하지 않는다(오탐 방지).
+    같은 이유로 **절 제목을 못 찾으면 절을 새로 만들지 않고** 파일 끝에 붙인 뒤 로그를 남긴다.
     """
     try:
         old = path.read_text(encoding="utf-8")
     except OSError:
         return False
+    body = _backlog_insert(old, line)
+    if body is None:
+        log.info("백로그 '열린/미결' 절을 못 찾음 — 파일 끝에 추가")
+        body = (old if old.endswith("\n") else old + "\n") + line + "\n"
     tmp = path.with_suffix(".tmp")
     try:
-        body = old if old.endswith("\n") else old + "\n"
-        tmp.write_text(body + line + "\n", encoding="utf-8")
+        tmp.write_text(body, encoding="utf-8")
         tmp.replace(path)
     except OSError:
         return False
     return True
 
 
-def load_seen(path: Path) -> set[str]:
-    """opensource_seen.json → 다시 안 볼 후보 이름 집합. 없음·손상은 빈 집합(방어적 로더)."""
+def load_seen(path: Path) -> dict[str, str]:
+    """opensource_seen.json → `{이름: "YYYY-MM-DD"(기록일) | ""(영구)}`. 없음·손상은 빈 dict.
+
+    v1 형식(이름 **리스트** — [🚫 다시 안 봄] 시절)은 **영구 제외**로 승격해 읽는다: 그 버튼의
+    뜻이 "다시 보지 않겠다"였다. 손상·타입 이탈은 빈 값 폴백(방어적 로더 — 거르기만 느슨해진다).
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return set()
-    return {n for n in raw if isinstance(n, str)} if isinstance(raw, list) else set()
+        return {}
+    if isinstance(raw, list):
+        return {n: _SEEN_FOREVER for n in raw if isinstance(n, str)}
+    if isinstance(raw, dict):
+        return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+    return {}
 
 
-def save_seen(path: Path, names: set[str]) -> None:
-    """seen 목록을 원자적으로 영속(tmp write→replace, save_notify_state 패턴)."""
+def save_seen(path: Path, seen: dict[str, str]) -> None:
+    """seen 맵을 원자적으로 영속(tmp write→replace, save_notify_state 패턴)."""
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(names), ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(dict(sorted(seen.items())), ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
+
+def active_seen(
+    seen: dict[str, str], today: date, cooldown: int = DIGEST_COOLDOWN_DAYS
+) -> set[str]:
+    """아직 유효한 제외 목록(= 오늘 후보에서 뺄 이름). 영구·손상 값은 계속 제외. 순수.
+
+    기각을 **영구가 아니라 쿨다운**으로 둔 이유: `claude-mem` 처럼 "uninstall 미확인"으로 보류된
+    후보는 문서가 생기면 판정이 바뀌어야 한다. 영구 제외하면 조건이 해소돼도 영영 안 온다.
+    """
+    return {name for name, value in seen.items() if _seen_blocks(value, today, cooldown)}
+
+
+def _seen_blocks(value: str, today: date, cooldown: int) -> bool:
+    """seen 값 하나가 아직 후보를 막는가. `""`(영구)·형식 이탈은 True(보수적으로 계속 제외)."""
+    try:
+        return (today - date.fromisoformat(value)).days < cooldown
+    except ValueError:
+        return True
+
+
+def mark_seen(path: Path, names: list[str], value: str) -> None:
+    """seen 기록 — 발송·기각은 오늘 날짜(쿨다운), 📌 등재는 `_SEEN_FOREVER`(영구).
+
+    **영구는 날짜로 덮지 않는다**(📌 누른 것이 나중 회차 기록에 밀려 다시 올라오지 않게).
+    쓰기 실패는 조용히 무시(부수 기록 — append_rejected 와 같은 사상).
+    """
+    kept = [n for n in (strip_control_line(str(x))[:_BACKLOG_FIELD_MAXLEN] for x in names) if n]
+    if not kept:
+        return
+    seen = load_seen(path)
+    for name in kept:
+        if seen.get(name) == _SEEN_FOREVER and value != _SEEN_FOREVER:
+            continue
+        seen[name] = value
+    with contextlib.suppress(OSError):
+        save_seen(path, seen)
 
 
 def append_rejected(path: Path, day: str, rejects: list[tuple[str, str]]) -> None:
@@ -1838,69 +1999,143 @@ def _post_digest_cards(
     cards: list[str],
     candidates: list[dict[str, Any]],
 ) -> int:
-    """카드 1장 = 메시지 1개(버튼이 카드 단위여야 하므로) + 보류맵 등재. 반환 = 게시 성공 장수.
+    """파싱된 항목 전부를 **메시지 1개**로 묶어 게시 + 보류맵 등재. 반환 = 게시 성공 메시지 수.
 
-    **버튼을 다는 조건 = 후보 역매칭 성공한 카드만.** 0건 안내(누를 대상 없음)와 제목이 어떤
-    후보와도 안 맞는 카드는 버튼 없이 게시한다 — 후자에 버튼을 달면 [🚫 다시 안 봄]이 축·판정이
-    섞인 제목 문자열을 seen 에 영구 등재하는데, 그 값은 어떤 후보와도 매칭되지 않아 아무것도
-    거르지 못한다(조용한 무효 클릭 + 파일 오염, L-4).
-    L-5: 중간 send 예외는 로그만 남기고 다음 카드로 간다. 실패로 되돌리면 다음 틱이 처음부터
-    재실행해 이미 나간 카드가 **중복 게시**되고 append_rejected 도 같은 줄을 다시 쌓기 때문 —
-    호출측은 1장이라도 나갔으면 성공으로 본다(게시분을 파일에 기록해 건너뛰는 방식보다 상태가
-    늘지 않는다).
+    v1 은 카드 1건 = 메시지 1개라 알림이 여러 번 울렸다 → v2 는 Embed 필드로 접는다(digest_embed).
+    **형식 이탈 카드·0건 안내는 종전대로 각자 평문/2층 카드 1장**으로 따로 나간다 — 접을 수 없는
+    것을 억지로 접으면 그날치 정보가 사라진다(정보 손실 0 원칙).
+
+    **버튼을 다는 조건 = 후보 역매칭 성공한 항목만.** 제목이 어떤 후보와도 안 맞으면 seq 를 주지
+    않는다 — 그런 항목에 📌 를 달면 축·판정이 섞인 제목 문자열이 백로그·seen 에 들어가는데 그
+    값은 어떤 후보와도 매칭되지 않아 아무것도 거르지 못한다(조용한 무효 클릭 + 파일 오염, L-4).
+    L-5: 중간 send 예외는 로그만 남기고 다음 메시지로 간다. 실패로 되돌리면 다음 틱이 처음부터
+    재실행해 이미 나간 것이 **중복 게시**되기 때문 — 호출측은 1장이라도 나갔으면 성공으로 본다.
     """
     # 긴 이름부터 훑는다(L-3): `owner/repo` 는 `owner/repo-plus` 카드 제목에도 부분 일치하므로
     # 리스트 순서대로 보면 짧은 쪽이 먼저 잡혀 엉뚱한 이름·URL 이 백로그·seen 에 들어간다
     # (GitHub 검색은 유사명을 흔히 같이 물어온다).
-    # 빈 이름은 뺀다 — `"" in head` 는 항상 참이라 아무 카드나 잡아버린다(filter_digest 가 이미
-    # 거르지만 역매칭 쪽에서도 막아 둔다).
+    # 빈 이름은 뺀다 — `"" in title` 은 항상 참이라 아무 항목이나 잡아버린다.
     by_len = sorted(
         (c for c in candidates if str(c.get("name", ""))),
         key=lambda c: -len(str(c.get("name", ""))),
     )
-    posted = 0
+    items: list[dict[str, Any]] = []
+    loners: list[tuple[str, dict[str, Any] | None]] = []  # (평문, 카드 or None) — 따로 나가는 것
+    footer = ""
     for raw in cards:
-        # plain = 판정이 낸 평문 원문(어댑터 폴백용), spec = 렌더 dict — 이름을 갈라 둔다(둘 다
-        # `card` 로 부르면 `adapter.send(..., plain, card=spec)` 이 뭘 보내는지 읽히지 않는다).
-        plain = raw[:DIGEST_CARD_MAXLEN]  # M-3: 계약 이탈로 수십 KB 가 청크 분할 게시되지 않게
-        head = plain.splitlines()[0] if plain else ""
-        # 카드 렌더 dict(B안). 판정이 형식을 어기면 None → 지금처럼 평문 1장으로 나간다(그날치를
-        # 통째로 날리지 않는다). 절단 뒤 파싱이라 M-3 상한이 파서에도 그대로 걸린다.
-        spec = digest_card(plain)
-        if spec is None:
+        # plain = 판정이 낸 평문 원문(어댑터 폴백용). M-3: 계약 이탈로 수십 KB 가 나가지 않게
+        # **파싱 전에** 자른다 → 상한이 카드 슬롯에도 그대로 걸린다.
+        plain = raw[:DIGEST_CARD_MAXLEN]
+        if _DIGEST_NONE_MARK in plain:
+            loners.append((plain, digest_none_card(plain)))
+            continue
+        item = digest_card(plain)
+        if item is None:  # 형식 이탈 → 평문 1장(그날치를 통째로 날리지 않는다)
             log.info("다이제스트 카드 형식 이탈 — 평문 폴백")
-        cand = (
-            None
-            if _DIGEST_NONE_MARK in plain
-            else next((c for c in by_len if str(c.get("name", "")) in head), None)
+            loners.append((plain, None))
+            continue
+        footer = str(item.get("footer") or "") or footer  # 계약상 마지막 카드에만 붙는다
+        cand = next((c for c in by_len if str(c.get("name", "")) in str(item["title"])), None)
+        item.update(
+            {"plain": plain, "day": today, "added": False, "seq": None, "url": "", "apply": ""}
         )
-        seq: int | None = None
         if cand is not None:
-            verdict, apply_line = parse_digest_card(plain)
-            seq = next(_digest_seq)
-            digest_pending[seq] = {
-                "channel_id": channel_id,
-                "name": str(cand["name"]),
-                "url": str(cand["url"]),
-                "verdict": verdict,
-                "apply": apply_line,
-                "day": today,
-                "text": plain,
-                "card": spec,  # 버튼 처리 후 edit 때 같은 카드로 다시 그리기 위해 보관
-                "added": False,
-                "skipped": False,
-            }
+            item["seq"] = seq = next(_digest_seq)
+            item["name"] = str(cand["name"])  # 백로그·seen 이 쓰는 **정규 레포명**(제목과 별개)
+            item["url"] = str(cand["url"])
+            item["apply"] = parse_digest_card(plain)[1]
+            digest_pending[seq] = item
+        items.append(item)
+    posted = 0
+    if items:
+        group = {
+            "channel_id": channel_id,
+            "items": items,
+            "footer": footer,
+            "text": "\n\n".join(str(it["plain"]) for it in items),
+        }
+        for it in items:
+            it["group"] = group  # 버튼 처리 때 형제 항목까지 다시 그리기 위한 역참조
         try:
             adapter.send(
-                channel_id, plain, digest_buttons(seq) if seq is not None else None, card=spec
+                channel_id,
+                str(group["text"]),
+                digest_buttons(items) or None,
+                card=digest_embed(items, footer),
             )
-        except Exception as e:  # 한 장 실패로 나머지·그날치를 통째로 되돌리지 않는다(위 L-5)
-            log.warning("다이제스트 카드 게시 실패(%s) — 나머지 카드는 계속", type(e).__name__)
-            if seq is not None:
-                digest_pending.pop(seq, None)  # 게시 안 된 카드의 보류 항목은 남기지 않는다
+            posted += 1
+            # 발송분은 쿨다운 등재 — v1 은 카드로 나간 것을 기록하지 않아 같은 게 매일 다시 왔다.
+            mark_seen(SEEN_FILE, [str(it["name"]) for it in items if it.get("name")], today)
+        except Exception as e:  # 한 통 실패로 그날치를 통째로 되돌리지 않는다(위 L-5)
+            log.warning("다이제스트 게시 실패(%s) — 나머지는 계속", type(e).__name__)
+            for it in items:
+                if it["seq"] is not None:
+                    digest_pending.pop(int(it["seq"]), None)  # 게시 안 된 보류 항목은 남기지 않는다
+    for plain, spec in loners:
+        try:
+            adapter.send(channel_id, plain, None, card=spec)
+        except Exception as e:
+            log.warning("다이제스트 평문 게시 실패(%s) — 나머지는 계속", type(e).__name__)
             continue
         posted += 1
     return posted
+
+
+def _digest_gather(
+    day: date, seen: set[str], snapshot: Path
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """수집 → 1차 거르기 → 상한 절단 → 나이 라벨. 반환 (수집 전량, 통과 전량, 판정 대상).
+
+    **라이브와 드라이런이 공유하는 유일한 수집 경로**다(둘이 갈라지면 드라이런으로 테스트한
+    의미가 없다). 쓰기는 `snapshot` 하나뿐 — collect_awesome 이 diff 후 스냅샷을 갱신하므로
+    드라이런은 **라이브 스냅샷의 사본** 경로를 넘겨 후보 풀을 소모하지 않는다.
+    """
+    # 매 실행마다 생산적인 소스를 전부 훑는다(축 순회 없음 — 중복은 seen 쿨다운이 막는다).
+    cands = collect_github(
+        DIGEST_TOPICS,
+        (day - timedelta(days=30)).isoformat(),
+        (day - timedelta(days=DIGEST_NEW_DAYS)).isoformat(),
+    )
+    cands += collect_hn(DIGEST_TOPICS, int(time.time()) - 14 * 86400)
+    cands += collect_awesome(snapshot)
+    passed = filter_digest(cands, seen, installed_names())
+    kept = passed[:DIGEST_MAX_CANDIDATES]  # 절단은 조용히 하지 않는다(아래 로그)
+    if len(passed) > len(kept):
+        log.info("다이제스트 후보 절단 %d→%d(신흥·스타순 상위만 판정)", len(passed), len(kept))
+    log.info("다이제스트 수집=%d 통과=%d 판정=%d", len(cands), len(passed), len(kept))
+    for c in kept:
+        c["age"] = age_label(str(c.get("created") or ""), day)  # `(⭐12.4k · 3개월 만에)` 재료
+    return cands, passed, kept
+
+
+def _digest_judge(
+    claude_exe: str, kept: list[dict[str, Any]]
+) -> tuple[dict[str, Any], str, str, dict[str, str]]:
+    """README 조회 → 프롬프트 조립 → 판정 claude **1회**. 반환 (결과, 프롬프트, 하네스, README맵).
+
+    보안 인자(cwd 샌드박스·도구 0개·전용 시스템 프롬프트)를 **한 곳에서만** 조립한다 —
+    라이브·드라이런이 각자 run_claude 를 부르면 한쪽만 완화돼도 아무도 모른다.
+    """
+    readmes = {
+        str(c["name"]): fetch_readme(str(c["name"]))
+        for c in kept[:DIGEST_README_TOP]
+        if c.get("source") == "gh"
+    }
+    harness = collect_harness()
+    log.info("다이제스트 하네스 주입 %d자", len(harness))
+    prompt = build_digest_prompt(kept, readmes, harness)
+    DIGEST_SANDBOX_DIR.mkdir(parents=True, exist_ok=True)  # 멱등(temp 청소 대비)
+    data = run_claude(
+        claude_exe,
+        # cwd = 레포 밖 격리 폴더(H-1·M-2). 루트 CLAUDE.md 자동 로드(2차 인증 해시 유출)와
+        # SessionStart 훅 발동(잠금해제 마커 삭제)을 둘 다 끊는다. 판정 재료는 위 harness.
+        str(DIGEST_SANDBOX_DIR),
+        prompt,
+        DIGEST_TIMEOUT_SEC,
+        allowed_tools=DIGEST_TOOLS,
+        system_prompt=DIGEST_SYSTEM_PROMPT,
+    )
+    return data, prompt, harness, readmes
 
 
 def run_opensource_digest(adapter: Adapter, channel_id: int, today: str) -> bool:
@@ -1916,45 +2151,24 @@ def run_opensource_digest(adapter: Adapter, channel_id: int, today: str) -> bool
         log.warning("다이제스트 스킵 — claude CLI 를 찾지 못함")
         return False
     day = date.fromisoformat(today)
-    # 매 실행마다 생산적인 소스를 전부 훑는다(축 순회 없음 — 중복은 seen 이 막는다).
-    cands = collect_github(DIGEST_TOPICS, (day - timedelta(days=30)).isoformat())
-    cands += collect_hn(DIGEST_TOPICS, int(time.time()) - 14 * 86400)
-    cands += collect_awesome(AWESOME_SNAPSHOT_FILE)
+    seen = active_seen(load_seen(SEEN_FILE), day)
+    cands, _passed, kept = _digest_gather(day, seen, AWESOME_SNAPSHOT_FILE)
     if not cands:
         log.warning("다이제스트 수집 0건 — 조회 실패로 보고 되돌림")
         return False
-    passed = filter_digest(cands, load_seen(SEEN_FILE), installed_names())
-    kept = passed[:DIGEST_MAX_CANDIDATES]  # 절단은 조용히 하지 않는다(아래 로그)
-    if len(passed) > len(kept):
-        log.info("다이제스트 후보 절단 %d→%d(스타순 상위만 판정)", len(passed), len(kept))
-    log.info("다이제스트 수집=%d 통과=%d 판정=%d", len(cands), len(passed), len(kept))
     if not kept:
         none_line = f"{LEAD_DIGEST} {_DIGEST_NONE_MARK} (검토 0 · 기각 0)"
-        adapter.send(channel_id, none_line, None, card=digest_card(none_line))
+        adapter.send(channel_id, none_line, None, card=digest_none_card(none_line))
         return True
-    readmes = {
-        str(c["name"]): fetch_readme(str(c["name"]))
-        for c in kept[:DIGEST_README_TOP]
-        if c.get("source") == "gh"
-    }
-    harness = collect_harness()
-    log.info("다이제스트 하네스 주입 %d자", len(harness))
-    DIGEST_SANDBOX_DIR.mkdir(parents=True, exist_ok=True)  # 멱등(temp 청소 대비)
-    data = run_claude(
-        claude_exe,
-        # cwd = 레포 밖 격리 폴더(H-1·M-2). 루트 CLAUDE.md 자동 로드(2차 인증 해시 유출)와
-        # SessionStart 훅 발동(잠금해제 마커 삭제)을 둘 다 끊는다. 판정 재료는 위 harness.
-        str(DIGEST_SANDBOX_DIR),
-        build_digest_prompt(kept, readmes, harness),
-        DIGEST_TIMEOUT_SEC,
-        allowed_tools=DIGEST_TOOLS,
-        system_prompt=DIGEST_SYSTEM_PROMPT,
-    )
+    data, _prompt, _harness, _readmes = _digest_judge(claude_exe, kept)
     if data.get("is_error"):
         log.warning("다이제스트 판정 실패 — 되돌림")
         return False
     body, rejects = parse_digest_rejects(str(data.get("result", "")))
     append_rejected(REJECTED_FILE, today, rejects)
+    # 기각도 30일 쿨다운 — v1 은 매일 같은 후보를 다시 판정하느라 토큰을 태웠다(영구가 아닌 이유는
+    # active_seen 참조: 보류 사유가 해소되면 다시 올라와야 한다).
+    mark_seen(SEEN_FILE, [name for name, _reason in rejects], today)
     cards = split_digest_cards(body)
     if not cards:
         log.warning("다이제스트 카드 0건(형식 이탈) — 되돌림")
@@ -2008,6 +2222,133 @@ def _run_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -> 
         posted = False
     if not posted:
         _revert_digest_fired(item_id, today, "실패")
+
+
+# ── 🧪 드라이런(`python bridge.py --digest-dry-run [--ignore-seen]`) ────────────
+# 라이브 다이제스트는 봇 재기동 + notify_state 의 fired 삭제 + 틱 대기가 있어야 한 번 도는데,
+# 한 번 돌 때마다 seen·rejected 에 실기록이 쌓여 **후보 풀이 소모된다**(하루 4회 = 8건 소진 실측).
+# 드라이런은 같은 파이프라인(_digest_gather → _digest_judge)을 그대로 돌리되 **쓰기만 뺀다**.
+_DRYRUN_SNAPSHOT = Path(tempfile.gettempdir()) / "claude_bridge_digest_dryrun_snapshot.md"
+# 표시 폭 11칸 정렬(한글 2칸) — 라벨이 5개뿐이라 폭 계산 대신 그대로 적는다.
+_DRYRUN_PREFIX = {
+    "funnel": "[깔때기]   ",
+    "prompt": "[프롬프트] ",
+    "card": "[카드]     ",
+    "reject": "[기각]     ",
+    "time": "[소요]     ",
+}
+_DRYRUN_INDENT = " " * 11  # 라벨 뒤 이어지는 줄(카드 본문)의 들여쓰기
+
+
+def _dryrun_card_text(spec: dict[str, Any] | None, plain: str) -> str:
+    """카드 스펙 → **임베드에 실제로 그려질 텍스트**. 스펙이 없으면(형식 이탈) 평문 원문 그대로.
+
+    어댑터가 Embed 로 그리는 것과 같은 재료(title·fields·footer)를 사람이 읽는 순서로만 편다.
+    """
+    if spec is None:
+        return plain
+    out = [str(spec.get("title") or "")]
+    for name, value, _inline in spec.get("fields") or []:
+        out.append(f"  {name}\n    " + str(value).replace("\n", "\n    "))
+    if spec.get("footer"):
+        out.append(f"  — {spec['footer']}")
+    return "\n".join(out)
+
+
+def digest_dry_run(*, ignore_seen: bool = False, out: Path | None = None) -> int:
+    """다이제스트를 **부작용 0** 으로 1회 실행하고 결과를 stdout + `out` 으로 출력. 반환 = 종료코드.
+
+    하는 것: 수집 → 1차 거르기 → 판정(실제 claude 1회) → 카드 렌더. 라이브와 **같은 함수**를 쓴다.
+    안 하는 것: 채널 게시 · seen/rejected/백로그/fired 기록 · 봇 기동. 몇 번을 돌려도 상태 불변 —
+    유일한 쓰기인 awesome 스냅샷은 **라이브 사본**(_DRYRUN_SNAPSHOT)에만 한다.
+    `ignore_seen=True` 는 **쿨다운 필터만** 건너뛴다(설치됨·⭐하한·설명없음은 그대로 — 같은
+    후보로 반복 테스트하기 위한 것이지 필터를 무력화하는 게 아니다).
+    실패(수집 0건·claude 오류)여도 죽지 않고 **무엇이 비었는지** 출력한다(종료코드 1).
+    """
+    lines: list[str] = []
+    rc = 0
+
+    def emit(key: str, text: str) -> None:
+        lines.append(_DRYRUN_PREFIX[key] + text.replace("\n", "\n" + _DRYRUN_INDENT))
+
+    day = datetime.now(_KST).date()
+    seen: set[str] = set() if ignore_seen else active_seen(load_seen(SEEN_FILE), day)
+    # 라이브 스냅샷은 **읽기만** — 사본에 diff·갱신해 다음 라이브 회차의 추가줄을 태우지 않는다.
+    _DRYRUN_SNAPSHOT.unlink(missing_ok=True)  # 지난 드라이런 잔재로 diff 하지 않게
+    with contextlib.suppress(OSError):
+        shutil.copyfile(AWESOME_SNAPSHOT_FILE, _DRYRUN_SNAPSHOT)
+    t0 = time.monotonic()
+    cands, passed, kept = _digest_gather(day, seen, _DRYRUN_SNAPSHOT)
+    gather_sec = time.monotonic() - t0
+    emit("funnel", f"수집 {len(cands)} → 통과 {len(passed)} → 판정 {len(kept)}")
+
+    judge_sec = 0.0
+    claude_exe = shutil.which("claude")
+    if not cands:
+        rc = 1
+        emit("prompt", "(건너뜀 — 수집 0건: GitHub/HN/awesome 조회 실패이거나 rate limit)")
+        emit("card", "(없음)")
+    elif not kept:
+        # 라이브에서 0건 안내 카드가 나가는 자리(판정 claude 를 아예 부르지 않는다).
+        none_line = f"{LEAD_DIGEST} {_DIGEST_NONE_MARK} (검토 0 · 기각 0)"
+        emit(
+            "prompt",
+            f"(건너뜀 — 통과 0건: 수집 {len(cands)}건이 쿨다운·설치됨·⭐하한에 전부 걸림)",
+        )
+        emit("card", _dryrun_card_text(digest_none_card(none_line), none_line))
+    elif claude_exe is None:
+        rc = 1
+        emit("prompt", "(건너뜀 — claude CLI 를 PATH 에서 찾지 못함)")
+        emit("card", "(없음)")
+    else:
+        t1 = time.monotonic()
+        data, prompt, harness, readmes = _digest_judge(claude_exe, kept)
+        judge_sec = time.monotonic() - t1
+        emit(
+            "prompt",
+            f"하네스 {len(harness)}자 · 후보 {len(kept)} · "
+            f"README {sum(1 for b in readmes.values() if b.strip())} · 총 {len(prompt)}자",
+        )
+        if data.get("is_error"):
+            rc = 1
+            emit("card", f"(판정 실패: {str(data.get('result', ''))[:300]})")
+        else:
+            body, rejects = parse_digest_rejects(str(data.get("result", "")))
+            cards = split_digest_cards(body)
+            if not cards:
+                rc = 1
+                emit("card", f"(카드 0건 — 형식 이탈. 판정 원문: {body[:300] or '(빈 응답)'})")
+            # _post_digest_cards 와 같은 갈래: 파싱된 항목은 **임베드 한 통**, 0건 안내·형식
+            # 이탈은 각자 따로 나간다. 버튼·기록만 없을 뿐 채널에 뜰 모양 그대로다.
+            items: list[dict[str, Any]] = []
+            loners: list[tuple[dict[str, Any] | None, str]] = []
+            footer = ""
+            for raw in cards:
+                plain = raw[:DIGEST_CARD_MAXLEN]  # 라이브와 같은 위치에서 자른다(M-3)
+                if _DIGEST_NONE_MARK in plain:
+                    loners.append((digest_none_card(plain), plain))
+                    continue
+                item = digest_card(plain)
+                if item is None:
+                    loners.append((None, plain))
+                    continue
+                footer = str(item.get("footer") or "") or footer
+                items.append(item)
+            if items:
+                emit("card", _dryrun_card_text(digest_embed(items, footer), ""))
+            for spec, plain in loners:
+                emit("card", _dryrun_card_text(spec, plain))
+            for name, reason in rejects:
+                emit("reject", f"{name} | {reason}")
+    emit("time", f"수집 {gather_sec:.1f}초 · 판정 {judge_sec:.1f}초")
+
+    text = "\n".join(lines)
+    print(text)
+    dest = out if out is not None else DIGEST_DRYRUN_FILE
+    with contextlib.suppress(OSError):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text + "\n", encoding="utf-8")
+    return rc
 
 
 def list_projects(target_root: str) -> list[str]:
@@ -3073,8 +3414,8 @@ def _handle_button(
             adapter.edit(channel_id, message_id, done)
         else:
             adapter.send(channel_id, done)
-    elif action in ("od:add", "od:skip"):
-        # 🧩 다이제스트 카드 버튼 — 백로그 append / seen 영구 등재(둘 다 브리지가 직접 처리).
+    elif action == "od:add":
+        # 🧩 다이제스트 [📌N] — 백로그 append + seen 영구 등재(브리지가 직접 처리, claude 무관).
         _handle_digest_button(adapter, channel_id, message_id, action, arg)
     elif action == "c":
         # ③ 선택지 탭 — arg="<msg_id>:<idx|other>". 보류맵에서 세션·프로젝트를 찾아 resume 재실행.
@@ -3127,40 +3468,41 @@ def _handle_button(
 def _handle_digest_button(
     adapter: Adapter, channel_id: int, message_id: int | None, action: str, arg: str
 ) -> None:
-    """🧩 카드 버튼 처리 — [📌 백로그] 한 줄 append · [🚫 다시 안 봄] seen 등재. 각 1회만.
+    """🧩 [📌N] 처리 — 그 항목을 백로그에 한 줄 append + **영구 제외**(seen). 항목당 1회만.
 
-    두 버튼은 독립이라 둘 다 누를 수 있다. 누른 뒤에는 그 버튼을 뺀 채로 메시지를 edit 해 결과를
-    반영하고(중복 적재 구조적 차단), 둘 다 누르면 버튼이 사라진다. 보류맵에 없는 seq(봇 재시작
-    후 옛 카드)는 만료 안내. arg 정수 보장은 parse_callback 계약(od:add:<seq>).
+    한 메시지에 여러 항목이 있으므로 형제 항목까지 함께 다시 그린다(누른 항목만 필드명에 📌 가
+    붙고 그 버튼이 사라진다 → 중복 적재가 구조적으로 불가능). 보류맵에 없는 seq(봇 재시작 후 옛
+    카드)는 만료 안내. arg 정수 보장은 parse_callback 계약(od:add:<seq>).
     """
-    entry = digest_pending.get(int(arg)) if arg.isascii() and arg.isdigit() else None
-    if entry is None or entry.get("channel_id") != channel_id:
+    item = digest_pending.get(int(arg)) if arg.isascii() and arg.isdigit() else None
+    group = item.get("group") if isinstance(item, dict) else None
+    if not isinstance(group, dict) or group.get("channel_id") != channel_id:
         log.info("chat=%s callback %s 만료 seq=%s", channel_id, action, arg)
         if isinstance(message_id, int):
             adapter.edit(channel_id, message_id, "카드가 만료됐습니다(봇 재시작).")
         return
+    assert isinstance(item, dict)  # 위 group 검사가 보장(mypy 좁히기)
     note = ""
-    if action == "od:add" and not entry["added"]:
-        entry["added"] = append_backlog(BACKLOG_FILE, backlog_line(str(entry["day"]), entry))
-        if not entry["added"]:
+    if not item["added"]:
+        item["added"] = append_backlog(BACKLOG_FILE, backlog_line(str(item["day"]), item))
+        if item["added"]:
+            # 📌 = 백로그에 있으니 다시 올릴 이유가 없다 → 쿨다운이 아니라 영구 제외.
+            mark_seen(SEEN_FILE, [str(item["name"])], _SEEN_FOREVER)
+        else:
             note = "\n-# ⚠️ 백로그 파일을 쓰지 못했습니다"
-        log.info("chat=%s od:add %s → %s", channel_id, entry["name"], entry["added"])
-    elif action == "od:skip" and not entry["skipped"]:
-        seen = load_seen(SEEN_FILE)
-        seen.add(str(entry["name"]))
-        save_seen(SEEN_FILE, seen)
-        entry["skipped"] = True
-        log.info("chat=%s od:skip %s", channel_id, entry["name"])
-    done = (("📌 백로그 등재", entry["added"]), ("🚫 다시 안 봄", entry["skipped"]))
-    marks = [mark for mark, on in done if on]
-    body = str(entry["text"]) + ("\n\n-# " + " · ".join(marks) if marks else "") + note
-    # 카드는 마크를 footer 앞에 얹어 다시 그린다(평문은 종전대로 본문 말미 `-#` 줄).
-    spec = digest_card_marks(entry.get("card"), [*marks, *(["⚠️ 백로그 기록 실패"] if note else [])])
-    buttons = digest_buttons(int(arg), added=bool(entry["added"]), skipped=bool(entry["skipped"]))
+        log.info("chat=%s od:add %s → %s", channel_id, item["name"], item["added"])
+    items = list(group["items"])
+    picked = [str(i) for i, it in enumerate(items, start=1) if it.get("added")]
+    body = str(group["text"]) + (f"\n\n-# 📌 백로그 등재: {', '.join(picked)}" if picked else "")
+    # 카드는 필드명에 📌 가 붙어 다시 그려진다(평문은 위 `-#` 줄) — 실패만 footer 마크로 알린다.
+    spec = digest_embed(items, str(group["footer"]))
+    if note:
+        spec = digest_card_marks(spec, ["⚠️ 백로그 기록 실패"]) or spec
+    buttons = digest_buttons(items)
     if isinstance(message_id, int):
-        adapter.edit(channel_id, message_id, body, buttons or None, card=spec)
+        adapter.edit(channel_id, message_id, body + note, buttons or None, card=spec)
     else:
-        adapter.send(channel_id, body, buttons or None, card=spec)
+        adapter.send(channel_id, body + note, buttons or None, card=spec)
 
 
 def _find_awaiting(channel_id: int, user_id: int) -> tuple[int, dict[str, Any]] | None:
@@ -3933,22 +4275,53 @@ def _selftest() -> None:
     )
     _card = digest_card(f"{LEAD_DIGEST} MCP축 · a/b (⭐9) — 보류 1/2\n\n내용 : c\n장점 : p")
     assert _card is not None  # 계약대로면 dict — 이탈은 None(평문 폴백)
-    assert _card["author"] == f"{LEAD_DIGEST} MCP축 · 1/2" and _card["title"] == "a/b (⭐9)"
-    assert _card["description"] == "**보류** · c" and _card["color"] == DIGEST_COLORS["보류"]
-    assert _card["fields"] == [("👍 장점", "p", True)]
+    assert _card["area"] == "MCP축" and _card["title"] == "a/b (⭐9)"  # v1 순번(1/2)은 떼어낸다
+    assert _card["verdict"] == "보류" and _card["value"] == "c\n👍 p"
+    # 제목 괄호 표기 3형태(v1 별수·v2 별수+나이·HN)를 모두 그대로 싣는다(하위호환).
+    for _paren in ("(⭐9)", "(⭐12.4k · 3개월 만에)", "(HN 90p)"):
+        _p = digest_card(f"{LEAD_DIGEST} MCP축 · a/b {_paren} — 차용\n내용 : c")
+        assert _p is not None and _p["title"] == f"a/b {_paren}"
+        assert parse_digest_card(f"{LEAD_DIGEST} MCP축 · a/b {_paren} — 차용")[0] == "차용"
     assert digest_card("인사만 하고 끝") is None  # 형식 이탈 = 폴백 신호
     # 내용을 잃고도 "성공"을 돌려주지 않는다: 못 담은 줄·미등록 판정은 전부 None(평문 폴백).
     assert digest_card(f"{LEAD_DIGEST} MCP축 · a/b (⭐9) — 차용\n라벨 없는 줄\n내용 : c") is None
     assert digest_card(f"{LEAD_DIGEST} MCP축 · 차용 — a/b (⭐9)\n내용 : c") is None  # 슬롯 뒤바뀜
     assert parse_digest_card(f"{LEAD_DIGEST} MCP축 · 차용 — a/b (⭐9)")[0] == "참조"  # 오염 X
-    assert [b.action for b in digest_buttons(3)] == ["od:add", "od:skip"]
-    assert [b.action for b in digest_buttons(3, added=True)] == ["od:skip"]
-    assert digest_buttons(3, added=True, skipped=True) == []  # 둘 다 누르면 버튼 소멸
+    # v2: 항목 N 건 = Embed 필드 N 개 = 메시지 1개. 버튼은 📌1…📌N(누른 것·미매칭은 빠진다).
+    _items: list[dict[str, Any]] = [
+        {"title": "a/b (⭐9)", "verdict": "차용", "value": "c", "seq": 3},
+        {"title": "c/d (⭐8)", "verdict": "보류", "value": "e", "seq": 4, "added": True},
+        {"title": "e/f (⭐7)", "verdict": "참조", "value": "g", "seq": None},
+    ]
+    _emb = digest_embed(_items, "검토 9건 · 기각 6건")
+    assert _emb["title"] == f"{LEAD_DIGEST} 오늘의 신흥 3건" and len(_emb["fields"]) == 3
+    assert _emb["fields"][0][0] == "1. a/b (⭐9) — 차용"
+    assert _emb["fields"][1][0].endswith("📌")  # 등재분은 필드명에 표시
+    assert _emb["color"] == DIGEST_COLORS["차용"] and _emb["footer"] == "검토 9건 · 기각 6건"
+    assert [(b.action, b.label, b.arg) for b in digest_buttons(_items)] == [("od:add", "📌1", "3")]
+    assert digest_none_card(f"{LEAD_DIGEST} {_DIGEST_NONE_MARK} (검토 5 · 기각 5)") == {
+        "title": f"{LEAD_DIGEST} {_DIGEST_NONE_MARK}",
+        "footer": "검토 5 · 기각 5",
+        "color": DIGEST_COLOR_DEFAULT,
+    }  # 본문·필드·버튼 없는 2층
+    assert star_label(999) == "999" and star_label(12_400) == "12.4k"
+    _today = date(2026, 7, 27)
+    assert age_label("2026-07-15", _today) == "12일"
+    assert age_label("2026-04-01", _today) == "3개월"
+    assert age_label("2019-01-01", _today) == "7년"
+    assert age_label("", _today) == "" and age_label("2027-01-01", _today) == ""  # 이탈·미래
     _c = {"name": "o/x", "key": "x", "source": "gh", "stars": 999, "desc": "d", "points": 0}
     assert filter_digest([_c], {"o/x"}, set()) == []  # seen 제외
     assert filter_digest([_c], set(), {"x"}) == []  # 이미 설치 제외
     assert filter_digest([{**_c, "stars": 10}], set(), set()) == []  # ⭐하한 미달
     assert filter_digest([_c], set(), set()) == [_c]
+    # 신흥 축 우선 — 스타가 적어도 fresh 가 앞이라야 후보 절단에서 살아남는다.
+    _big = {**_c, "name": "o/big", "key": "big", "stars": 198_000}
+    _new = {**_c, "name": "o/new", "key": "new", "stars": 900, "fresh": True}
+    assert [c["name"] for c in filter_digest([_big, _new], set(), set())] == ["o/new", "o/big"]
+    # seen 쿨다운: 발송·기각은 30일, 📌(빈 값)은 영구, 손상 값도 계속 제외.
+    assert active_seen({"a": "2026-07-20", "b": "2026-06-01"}, _today) == {"a"}
+    assert active_seen({"a": _SEEN_FOREVER, "b": "쓰레기"}, _today) == {"a", "b"}
     # 선택지 파싱.
     assert parse_choice_prompt("옵션.\n❓선택: [유지|keep]|[교체|swap]") == (
         "옵션.",
@@ -4007,5 +4380,17 @@ def _selftest() -> None:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _selftest()
+    elif "--digest-dry-run" in sys.argv:
+        # Windows 콘솔 기본 코드페이지(cp949)는 `🧩` 를 못 찍어 print 가 죽는다 — 파일은 utf-8
+        # 인데 stdout 때문에 리포트를 통째로 잃지 않게 여기서 콘솔만 utf-8 로 돌린다.
+        _reconfigure = getattr(sys.stdout, "reconfigure", None)
+        if callable(_reconfigure):
+            _reconfigure(encoding="utf-8", errors="replace")
+        # 봇을 띄우지 않는 진단 경로 — 로그는 stdout 으로만(라이브 봇이 쓰는 bridge.log 를
+        # 같은 시각에 두 프로세스가 열지 않게).
+        logging.basicConfig(
+            level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout
+        )
+        sys.exit(digest_dry_run(ignore_seen="--ignore-seen" in sys.argv))
     else:
         sys.exit(main())

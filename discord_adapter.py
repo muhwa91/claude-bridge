@@ -252,8 +252,9 @@ def build_card_embed(card: dict[str, Any], secrets: list[str]) -> Any:
     같은 문을 지난다)하고 디스코드 한도로 자른다. 색은 코어가 판정별로 정해 넘긴다.
 
     ponytail: 슬롯별 한도만 보고 **임베드 총합 6000자는 안 본다** — 유일한 호출자(다이제스트)가
-    DIGEST_CARD_MAXLEN=1500 으로 원문을 먼저 자르므로 합이 6000 에 닿을 수 없다. 다른 기능이 이
-    Card 규약을 쓰기 시작하면 그때 총합 가드를 넣는다.
+    카드마다 `DIGEST_CARD_MAXLEN` 으로 원문을 먼저 자르고 한 메시지에 `DIGEST_MAX_CARDS` 건까지만
+    담으므로 합이 6000 에 닿을 수 없다(5개 x 1000자 + 제목·footer ≈ 5.1KB). **그 두 상수를 키울 때는
+    곱을 다시 재라.** 다른 기능이 이 Card 규약을 쓰기 시작하면 그때 총합 가드를 넣는다.
     """
 
     def m(v: object, limit: int) -> str:

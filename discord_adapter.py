@@ -82,6 +82,12 @@ _COLOR_INFO = 0x5865F2  # 블러플 — 추가 확인사항 / push 승인 대기
 _COLOR_WAIT = 0xEEBB4D  # 노랑 — 진행 중 / 예약 알림
 _EMBED_TITLE_LIMIT = 256  # discord Embed title 한도
 _EMBED_DESC_LIMIT = 4096  # discord Embed description 한도(§4.1 — 초과분은 후속 plain 청크)
+# 카드 렌더(§card 규약) 전용 한도 — 초과분은 자른다(디스코드가 400 으로 거부하므로).
+_EMBED_AUTHOR_LIMIT = 256
+_EMBED_FIELD_NAME_LIMIT = 256
+_EMBED_FIELD_VALUE_LIMIT = 1024
+_EMBED_FOOTER_LIMIT = 2048
+_EMBED_FIELDS_MAX = 25
 
 # ── ①(채널 자동생성 §4.4) — 서버 구조 ───────────────────────────────────────
 # 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag). 프로젝트 카테고리는 setup 시
@@ -236,6 +242,40 @@ def _build_embed(text: str, color: int) -> tuple[Any, str]:
         description=body[:_EMBED_DESC_LIMIT] or None,
     )
     return embed, body[_EMBED_DESC_LIMIT:]
+
+
+def build_card_embed(card: dict[str, Any], secrets: list[str]) -> Any:
+    """카드 스펙(코어 dict, adapter.py 「Card 규약」) → discord.Embed. 다이제스트 카드 렌더 경로.
+
+    **공용 `_build_embed`(진행·완료·실패·확인)와 분리된 별도 경로**다 — 일상 회신 렌더에 카드
+    분기를 섞으면 그쪽이 깨진다. 문자열 슬롯은 전부 마스킹(§2.1 방어심층: 카드도 send/edit 과
+    같은 문을 지난다)하고 디스코드 한도로 자른다. 색은 코어가 판정별로 정해 넘긴다.
+
+    ponytail: 슬롯별 한도만 보고 **임베드 총합 6000자는 안 본다** — 유일한 호출자(다이제스트)가
+    DIGEST_CARD_MAXLEN=1500 으로 원문을 먼저 자르므로 합이 6000 에 닿을 수 없다. 다른 기능이 이
+    Card 규약을 쓰기 시작하면 그때 총합 가드를 넣는다.
+    """
+
+    def m(v: object, limit: int) -> str:
+        return mask_secrets(str(v), secrets)[:limit]
+
+    embed = discord.Embed(
+        color=int(card.get("color") or _COLOR_INFO),
+        title=m(card.get("title") or "", _EMBED_TITLE_LIMIT) or None,
+        description=m(card.get("description") or "", _EMBED_DESC_LIMIT) or None,
+    )
+    author = m(card.get("author") or "", _EMBED_AUTHOR_LIMIT)
+    if author:
+        embed.set_author(name=author)
+    for name, value, inline in list(card.get("fields") or [])[:_EMBED_FIELDS_MAX]:
+        # 이름·값이 빈 필드는 디스코드가 400 으로 거부한다 — 코어가 안 넣지만 여기서도 막는다.
+        fname, fvalue = m(name, _EMBED_FIELD_NAME_LIMIT), m(value, _EMBED_FIELD_VALUE_LIMIT)
+        if fname and fvalue:
+            embed.add_field(name=fname, value=fvalue, inline=bool(inline))
+    footer = m(card.get("footer") or "", _EMBED_FOOTER_LIMIT)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
 
 
 def _send_kwargs(payload: Any, view: Any) -> dict[str, Any]:
@@ -1017,13 +1057,27 @@ class DiscordAdapter:
                 first_id = mid if isinstance(mid, int) else None
         return first_id
 
-    def send(self, channel_id: int, text: str, buttons: list[Button] | None = None) -> int | None:
+    def send(
+        self,
+        channel_id: int,
+        text: str,
+        buttons: list[Button] | None = None,
+        card: dict[str, Any] | None = None,
+    ) -> int | None:
         """마스킹 후 청크 분할 전송. 버튼은 마지막 청크에만. 첫 청크 message_id 반환(실패 None).
 
-        예외: 세로 목록(전부 p:/c: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
+        예외 1: `card` 가 있으면 구조화 Embed 1장으로 렌더한다(다이제스트 전용 경로 —
+        `text` 는 카드를 못 그리는 어댑터용 폴백이라 여기선 쓰지 않는다). 카드는 항상 단일
+        메시지라 청킹·오버플로가 없다(초과분은 build_card_embed 가 슬롯별로 자름).
+        예외 2: 세로 목록(전부 p:/c: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
         V2 flag 는 메시지 생성 시 고정(edit 로 classic 전환 불가)이라, 그 id 를 _v2_messages 에
         기록해 이후 edit 도 V2 로 유지한다(선택지 갱신·버튼 제거 편집이 400 나지 않게).
         """
+        if card is not None:
+            embed = build_card_embed(card, self.secrets)
+            view = render_view(buttons) if buttons else None
+            mid = self._run(self._send_coro(channel_id, embed, view))
+            return mid if isinstance(mid, int) else None
         if _is_vertical_list(buttons):
             assert buttons is not None  # _is_vertical_list 가 보장(mypy 좁히기)
             view = render_project_view(mask_secrets(text, self.secrets), buttons)
@@ -1040,19 +1094,26 @@ class DiscordAdapter:
         message_id: int,
         text: str,
         buttons: list[Button] | None = None,
+        card: dict[str, Any] | None = None,
     ) -> None:
         """진행 메시지 in-place 갱신. 오버플로(§2.2): 첫 파트 편집 + 나머지 후속 발행, 버튼 말미.
 
         상태 헤더면 첫 파트가 Embed 라 진행(노랑)→완료(초록)/실패(빨강) 전이가 같은 message_id
         편집으로 색만 바뀐다(§4.0 상태 전이=같은 메시지 편집).
 
-        예외: send 가 V2(세로 목록)로 만든 메시지는 flag 가 고정이라 classic 으로 못 돌린다 →
+        예외 1: `card` 가 있으면 구조화 Embed 로 교체(다이제스트 버튼 반영 — footer·버튼만 바뀐다).
+        예외 2: send 가 V2(세로 목록)로 만든 메시지는 flag 가 고정이라 classic 으로 못 돌린다 →
         같은 세로 V2 로 편집한다(버튼 갱신·제거·만료 문구 모두 TextDisplay 흡수). buttons 없으면
         빈 목록으로 렌더해 버튼만 사라진다(텍스트는 유지).
         """
         if message_id in self._v2_messages:
             view = render_project_view(mask_secrets(text, self.secrets), buttons or [])
             self._run(self._edit_view_coro(channel_id, message_id, view))
+            return
+        if card is not None:
+            embed = build_card_embed(card, self.secrets)
+            head_view = render_view(buttons) if buttons else None
+            self._run(self._edit_coro(channel_id, message_id, embed, head_view))
             return
         parts = self._render_parts(text)
         last = len(parts) - 1

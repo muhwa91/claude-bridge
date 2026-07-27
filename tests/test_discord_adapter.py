@@ -612,6 +612,114 @@ def test_embed_overflow_sends_followup_plain_chunk():
     assert isinstance(calls[1][2], str) and calls[1][2] == "y" * 104  # 오버플로 = 후속 plain
 
 
+# ---------------------------------------------------------------------------
+# 카드 렌더(🧩 다이제스트 — adapter.py 「Card 규약」). 공용 _build_embed 와 별도 경로.
+# ---------------------------------------------------------------------------
+_CARD_SPEC = {
+    "author": "🧩 MCP축 · 1/2",
+    "title": "claude-mem (⭐88,643)",
+    "description": "**보류** · 세션 메모리 영속화.",
+    "fields": [("👍 장점", "결손 축을 메움", True), ("🔧 적용", "훅 1건 — 20분", False)],
+    "footer": "검토 24 · 기각 22",
+    "color": 0xEEBB4D,
+}
+
+
+def test_build_card_embed_fills_every_slot():
+    embed = discord_adapter.build_card_embed(_CARD_SPEC, [])
+    assert embed.author.name == "🧩 MCP축 · 1/2"  # 축·순번은 author 슬롯(작은 회색 줄)
+    assert embed.title == "claude-mem (⭐88,643)"
+    assert embed.description == "**보류** · 세션 메모리 영속화."
+    assert [(f.name, f.value, f.inline) for f in embed.fields] == _CARD_SPEC["fields"]
+    assert embed.footer.text == "검토 24 · 기각 22"
+    assert embed.color.value == 0xEEBB4D
+
+
+def test_build_card_embed_two_layer_when_slots_missing():
+    none_card = {
+        "author": "🧩 에이전트 정의축",
+        "title": "오늘 적용할 것 없음",
+        "footer": "검토 12 · 기각 12",
+    }
+    embed = discord_adapter.build_card_embed(none_card, [])
+    assert embed.description is None and embed.fields == []  # 본문·필드 없는 2층
+    assert embed.color.value == discord_adapter._COLOR_INFO  # color 미지정 폴백
+
+
+def test_build_card_embed_truncates_to_discord_limits():
+    embed = discord_adapter.build_card_embed(
+        {
+            "author": "가" * 400,
+            "title": "나" * 400,
+            "fields": [("다" * 400, "라" * 2000, True)],
+            "footer": "마" * 3000,
+        },
+        [],
+    )
+    assert len(embed.author.name) == discord_adapter._EMBED_AUTHOR_LIMIT
+    assert len(embed.title) == discord_adapter._EMBED_TITLE_LIMIT
+    assert len(embed.fields[0].name) == discord_adapter._EMBED_FIELD_NAME_LIMIT
+    assert len(embed.fields[0].value) == discord_adapter._EMBED_FIELD_VALUE_LIMIT
+    assert len(embed.footer.text) == discord_adapter._EMBED_FOOTER_LIMIT
+
+
+def test_build_card_embed_masks_secrets_and_drops_empty_fields():
+    embed = discord_adapter.build_card_embed(
+        {"title": "T SECRET", "fields": [("👍 장점", "", True), ("", "값", True)]}, ["SECRET"]
+    )
+    assert embed.title == "T ***"  # 카드도 send/edit 과 같은 마스킹 문을 지난다
+    assert embed.fields == []  # 이름·값이 빈 필드는 디스코드가 400 → 애초에 안 싣는다
+
+
+def test_send_with_card_renders_single_embed_with_buttons():
+    a = _adapter()
+    calls = _stub_calls(a, [777])
+    mid = a.send(100, "🧩 평문 폴백", [Button("📌 백로그", "od:add", "3")], card=_CARD_SPEC)
+    assert mid == 777
+    assert len(calls) == 1  # 카드는 항상 단일 메시지(청킹 없음)
+    payload, view = calls[0][2], calls[0][3]
+    assert isinstance(payload, discord.Embed) and payload.title == _CARD_SPEC["title"]
+    assert [c.custom_id for c in view.children] == ["od:add:3"]
+
+
+def test_edit_with_card_replaces_embed_and_drops_buttons():
+    a = _adapter()
+    calls = _stub_calls(a, [None])
+    a.edit(100, 42, "🧩 평문 폴백", None, card=_CARD_SPEC)
+    assert calls[0][0] == "edit" and calls[0][2] == 42
+    assert isinstance(calls[0][3], discord.Embed)
+    assert calls[0][4] is None  # 버튼 없음 → view=None(컴포넌트 제거)
+
+
+def test_card_absent_keeps_existing_paths_untouched():
+    # 무회귀: card 를 안 주면 상태 임베드·plain 경로가 그대로다(_build_embed 시그니처·판정 불변).
+    a = _adapter()
+    calls = _stub_calls(a, [1, 2])
+    a.send(100, f"{HEADER_DONE}\n\n완료")
+    a.send(100, "대상 프로젝트 2")
+    assert isinstance(calls[0][2], discord.Embed) and calls[0][2].author.name is None
+    assert calls[1][2] == "대상 프로젝트 2"
+    # 🧩 는 상태색 대상이 아니다 — 카드는 card= 로 판정별 색을 싣고, 형식 이탈분은 임베드 없이
+    # 평문 그대로 나간다(노랑은 진행·⏰예약알림 전용이라 폰에서 헷갈리지 않게).
+    assert discord_adapter._status_color("🧩 MCP축 · x") is None
+
+
+def test_digest_plain_fallback_is_plain_text_not_yellow_embed():
+    """카드 파싱 실패분(card 없음)은 임베드 없이 평문 — ⏰ 예약알림 노랑으로 나가지 않는다."""
+    a = _adapter()
+    calls = _stub_calls(a, [1])
+    a.send(100, "🧩 MCP축 owner/repo 차용\n적용 : 훅에 · 30분")
+    assert calls[0][2] == "🧩 MCP축 owner/repo 차용\n적용 : 훅에 · 30분"  # str = plain
+
+
+def test_digest_card_color_comes_from_core_spec():
+    """카드 색은 코어가 판정별로 정해 넘긴 값 그대로(어댑터 상태색이 덮어쓰지 않는다)."""
+    a = _adapter()
+    calls = _stub_calls(a, [1])
+    a.send(100, "🧩 평문 폴백", None, card={**_CARD_SPEC, "color": 0x3ECF85})
+    assert calls[0][2].color.value == 0x3ECF85  # 즉시적용 초록
+
+
 def test_render_view_success_and_secondary_styles():
     view = render_view(push_buttons())
     assert view.children[0].style == discord.ButtonStyle.success  # Push
@@ -1446,3 +1554,227 @@ def test_edit_untracked_message_stays_classic():
     calls = _stub_calls(a, [None])
     a.edit(100, 42, "짧음")  # _v2_messages 에 없음 → classic 경로
     assert calls[0][0] == "edit"  # _edit_coro(classic)
+
+
+# ---------------------------------------------------------------------------
+# 무회귀 골든 — card 미지정(= 카드 도입 전 모든 메시지)의 렌더 결과를 문자 단위로 고정한다.
+# `card` 인자 추가·build_card_embed 신설이 공용 _build_embed/_status_color 경로를 건드리지
+# 않았음을 증명한다(HEAD 실행 결과와 대조해 동일 확인, 2026-07-27 QA). 여기가 깨지면 폰에서
+# 받는 일상 회신(진행·완료·실패·확인·예약알림·목록·선택지)이 전부 바뀐 것이다.
+# ---------------------------------------------------------------------------
+def _stub_all(adapter, ids):
+    """_stub_calls + V2(LayoutView) 코루틴까지 — 목록·선택지가 실코루틴을 만들지 않게."""
+    calls = _stub_calls(adapter, ids)
+    adapter._send_view_coro = lambda cid, view: ("sendv", cid, view)  # type: ignore[assignment]
+    adapter._edit_view_coro = lambda cid, mid, view: ("editv", cid, mid, view)  # type: ignore[assignment]
+    return calls
+
+
+def _payload(call):
+    """스텁 튜플 → ("E", embed dict) | ("P", plain str) | ("V2", [자식 타입…])."""
+    if call[0] in ("sendv", "editv"):
+        return ("V2", [type(i).__name__ for i in call[-1].children])
+    part = call[2] if call[0] == "send" else call[3]
+    return ("E", part.to_dict()) if isinstance(part, discord.Embed) else ("P", part)
+
+
+def _cids(call):
+    view = call[3] if call[0] == "send" else call[4]
+    return None if view is None else [c.custom_id for c in view.children]
+
+
+_BASE = 15645517, 4116357, 15750747, 5793266  # 노랑·초록·빨강·블러플(값까지 고정)
+
+
+def _kinds():
+    from bridge import HEADER_CHOICE, choice_buttons, notify_buttons
+
+    wait, done, fail, info = _BASE
+    return [
+        (
+            "🔄 작업 중\n\n프로젝트: x",
+            push_buttons(),
+            (
+                "E",
+                {
+                    "flags": 0,
+                    "color": wait,
+                    "type": "rich",
+                    "description": "프로젝트: x",
+                    "title": "🔄 작업 중",
+                },
+            ),
+            ["push", "x"],
+        ),
+        (
+            f"{HEADER_DONE}\n\n다 됐습니다 SECRET",
+            None,
+            (
+                "E",
+                {
+                    "flags": 0,
+                    "color": done,
+                    "type": "rich",
+                    "description": "다 됐습니다 ***",
+                    "title": "✅처리완료",
+                },
+            ),
+            None,
+        ),
+        (
+            f"{HEADER_FAIL}\n\n오류",
+            None,
+            (
+                "E",
+                {
+                    "flags": 0,
+                    "color": fail,
+                    "type": "rich",
+                    "description": "오류",
+                    "title": "❌처리실패",
+                },
+            ),
+            None,
+        ),
+        (
+            f"{HEADER_NOTE}\n\n뭐 할까요",
+            None,
+            (
+                "E",
+                {
+                    "flags": 0,
+                    "color": info,
+                    "type": "rich",
+                    "description": "뭐 할까요",
+                    "title": "📌추가 확인사항",
+                },
+            ),
+            None,
+        ),
+        (
+            "⏰ 알림\n\n장 열림",
+            notify_buttons("ti-open"),
+            (
+                "E",
+                {
+                    "flags": 0,
+                    "color": wait,
+                    "type": "rich",
+                    "description": "장 열림",
+                    "title": "⏰ 알림",
+                },
+            ),
+            ["nb:ok:ti-open", "nb:done:ti-open", "nb:later:ti-open"],
+        ),
+        (
+            f"{HEADER_CHOICE}\n\n고르세요",
+            None,
+            (
+                "E",
+                {
+                    "flags": 0,
+                    "color": info,
+                    "type": "rich",
+                    "description": "고르세요",
+                    "title": "❓선택",
+                },
+            ),
+            None,
+        ),
+        ("대상 프로젝트 3", None, ("P", "대상 프로젝트 3"), None),
+        ("", None, ("P", "(빈 응답)"), None),
+        (
+            "대상 프로젝트",
+            project_buttons(["a", "b"]),
+            ("V2", ["TextDisplay", "ActionRow", "ActionRow"]),
+            None,
+        ),
+        (
+            "골라",
+            choice_buttons(55, [("유지", "k"), ("교체", "s")]),
+            ("V2", ["TextDisplay", "ActionRow", "ActionRow", "ActionRow"]),
+            None,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("text", "buttons", "expect", "cids"), _kinds())
+def test_send_without_card_is_byte_identical_baseline(text, buttons, expect, cids):
+    a = _adapter(secrets=["SECRET"])
+    calls = _stub_all(a, [1, 2])
+    a.send(100, text, buttons)
+    assert len(calls) == 1 and _payload(calls[0]) == expect
+    if expect[0] != "V2":
+        assert _cids(calls[0]) == cids
+
+
+@pytest.mark.parametrize(("text", "buttons", "expect", "cids"), _kinds())
+def test_send_with_card_none_equals_omitted(text, buttons, expect, cids):
+    """card=None 은 인자를 아예 안 준 것과 완전히 같아야 한다(기존 호출부 전부 이 경로)."""
+    a = _adapter(secrets=["SECRET"])
+    calls = _stub_all(a, [1, 2])
+    a.send(100, text, buttons, card=None)
+    assert [_payload(c) for c in calls] == [expect]
+    if expect[0] != "V2":
+        assert _cids(calls[0]) == cids
+
+
+@pytest.mark.parametrize(("text", "buttons", "expect", "_cid"), _kinds())
+def test_edit_without_card_is_byte_identical_baseline(text, buttons, expect, _cid):
+    a = _adapter(secrets=["SECRET"])
+    calls = _stub_all(a, [None, None])
+    a.edit(100, 42, text, buttons)
+    got = _payload(calls[0])
+    if expect[0] == "V2":  # 목록·선택지는 send 가 V2 로 만들었을 때만 V2 편집(미추적 → classic)
+        assert got[0] in ("P", "E")
+    else:
+        assert got == expect
+
+
+def test_send_overflow_without_card_still_splits():
+    """4096 초과 본문의 오버플로 후속 청크 = 종전 그대로(카드 경로가 청킹을 건드리지 않았다)."""
+    a = _adapter()
+    calls = _stub_calls(a, [1, 2])
+    a.send(100, f"{HEADER_DONE}\n\n" + "y" * 4200)
+    assert len(calls) == 2
+    assert isinstance(calls[0][2], discord.Embed) and len(calls[0][2].description) == 4096
+    assert calls[1][2] == "y" * 104
+
+
+# ── 카드 한도·마스킹 보강(기존 테스트 미커버분) ─────────────────────────────
+def test_build_card_embed_caps_description_and_field_count():
+    embed = discord_adapter.build_card_embed(
+        {
+            "description": "설" * 5000,
+            "fields": [(f"n{i}", f"v{i}", True) for i in range(40)],
+        },
+        [],
+    )
+    assert len(embed.description) == discord_adapter._EMBED_DESC_LIMIT  # 4096
+    assert len(embed.fields) == discord_adapter._EMBED_FIELDS_MAX  # 25개 초과분 절단
+    assert [f.name for f in embed.fields] == [f"n{i}" for i in range(25)]  # 앞에서부터
+
+
+def test_build_card_embed_masks_every_slot():
+    """author·title·description·field name·field value·footer — 한 슬롯이라도 새면 결함."""
+    embed = discord_adapter.build_card_embed(
+        {
+            "author": "🧩 SECRET축",
+            "title": "SECRET/repo",
+            "description": "**차용** · SECRET 쓴다",
+            "fields": [("👍 SECRET", "값 SECRET 있음", True)],
+            "footer": "검토 SECRET · 기각 1",
+            "color": 0x3ECF85,
+        },
+        ["SECRET"],
+    )
+    dumped = str(embed.to_dict())
+    assert "SECRET" not in dumped
+    assert dumped.count("***") == 6  # 6개 슬롯 전부 마스킹됨
+
+
+def test_build_card_embed_ignores_unknown_keys_and_bad_color():
+    """코어가 키를 더 넣거나 color 를 안 줘도 400 나지 않는다(규약: 없는 키 = 빈 슬롯)."""
+    embed = discord_adapter.build_card_embed({"foo": "bar", "color": 0}, [])
+    assert embed.color.value == discord_adapter._COLOR_INFO  # color=0 → 폴백
+    assert embed.title is None and embed.description is None and embed.fields == []

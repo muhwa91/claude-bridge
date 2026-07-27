@@ -22,7 +22,7 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|nb:ok|nb:later|nb:done + §4.7 델타3(r|rec|fav|fav:add|fav:del).
+    # 정규화 액션: push|x|p|c|nb:ok|nb:later|nb:done|od:add|od:skip + §4.7 델타3(r|rec|fav|…).
     action: str
     arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
@@ -52,6 +52,13 @@ class Event:
     channel_role: str | None = None
 
 
+# ── Card 규약(send/edit 의 선택 인자 `card`) ────────────────────────────────
+# 평범한 dict 다(dataclass·TypedDict 아님 — 코어가 만들고 어댑터가 읽기만 하는 렌더 힌트).
+#   {"author": str, "title": str, "description": str,
+#    "fields": [(name, value, inline)], "footer": str, "color": int}
+# 전부 선택 — 없는 키는 그 슬롯을 비운다. 플랫폼 한도 절단은 **어댑터 책임**(디스코드 기준
+# author/title 256 · description 4096 · field value 1024 · footer 2048). 코어는 의미만 만든다.
+# 현재 유일한 사용처 = 🧩 오픈소스 다이제스트 카드(디스코드 Embed fields 렌더, 2026-07-27).
 class Adapter(Protocol):
     """플랫폼 어댑터 계약(동결). 코어는 이 인터페이스만 호출한다.
 
@@ -69,14 +76,33 @@ class Adapter(Protocol):
         """이벤트 소스(블로킹 제너레이터). 네트워크 오류는 내부 로그·재시도, close() 후 종료."""
         ...
 
-    def send(self, channel_id: int, text: str, buttons: list[Button] | None = None) -> int | None:
-        """전송(마스킹·청킹·버튼렌더는 어댑터 흡수). 첫 청크 message_id | 실패 시 None."""
+    def send(
+        self,
+        channel_id: int,
+        text: str,
+        buttons: list[Button] | None = None,
+        card: dict[str, Any] | None = None,
+    ) -> int | None:
+        """전송(마스킹·청킹·버튼렌더는 어댑터 흡수). 첫 청크 message_id | 실패 시 None.
+
+        `card`(선택, 2026-07-27 추가): 구조화 카드 스펙 — 아래 Card 규약. 리치 렌더가 되는
+        어댑터는 이걸로 그리고, 못 그리는 어댑터는 **무시하고 `text` 를 그대로 보낸다**
+        (텍스트가 항상 폴백이라 정보 손실 0). 기존 호출은 인자를 안 주면 종전과 동일.
+        """
         ...
 
     def edit(
-        self, channel_id: int, message_id: int, text: str, buttons: list[Button] | None = None
+        self,
+        channel_id: int,
+        message_id: int,
+        text: str,
+        buttons: list[Button] | None = None,
+        card: dict[str, Any] | None = None,
     ) -> None:
-        """진행 메시지 in-place 갱신(+오버플로 후속 발행). 실패는 로그만·계속."""
+        """진행 메시지 in-place 갱신(+오버플로 후속 발행). 실패는 로그만·계속.
+
+        `card`: send 와 같은 규약(미지원 어댑터는 무시하고 `text` 로 편집).
+        """
         ...
 
     def ack(self, callback_id: str | None, note: str | None = None) -> None:
@@ -229,6 +255,13 @@ def parse_callback(data: str) -> tuple[str, str] | None:
         if len(parts) == 3 and parts[1] in ("add", "del") and _dig(parts[2]):
             return (f"fav:{parts[1]}", parts[2])
         return None
+    if data.startswith("od:"):
+        # od:add:<seq> | od:skip:<seq> — 🧩 오픈소스 다이제스트 카드 버튼. seq = 코어 보류맵 키
+        # (정수). 레포명이 아니라 seq 를 싣는 이유 = custom_id 100자 한도(레포명은 길 수 있다).
+        parts = data.split(":")
+        if len(parts) == 3 and parts[1] in ("add", "skip") and _dig(parts[2]):
+            return (f"od:{parts[1]}", parts[2])
+        return None
     if data.startswith("rec:"):
         # rec:<idx> — 최근 실행. idx 정수.
         idx = data[len("rec:") :]
@@ -246,7 +279,20 @@ def encode_callback(action: str, arg: str) -> str:
     if action in ("push", "x", "clean:ok"):
         return action
     # 콜론-join 액션(§1.3 + §4.7 델타3): arg(id·mid·idx·"mid:idx"·"mid:go")를 그대로 이어붙인다.
-    _joined = ("p", "nb:ok", "nb:later", "nb:done", "c", "r", "rec", "fav", "fav:add", "fav:del")
+    _joined = (
+        "p",
+        "nb:ok",
+        "nb:later",
+        "nb:done",
+        "c",
+        "r",
+        "rec",
+        "fav",
+        "fav:add",
+        "fav:del",
+        "od:add",
+        "od:skip",
+    )
     if action in _joined:
         return f"{action}:{arg}"
     return action  # 방출측이 유효 액션만 넘기므로 폴백은 그대로

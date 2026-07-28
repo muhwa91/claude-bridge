@@ -73,4 +73,19 @@ if (-not $py) {
 
 $proc = Start-Process -FilePath $py -ArgumentList 'bridge.py' `
     -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
+
+# Do not report STARTED for a process that is already gone. On a rejected token the bot logs
+# LoginFailure and exits in well under a second, but Start-Process has already returned a pid --
+# so every caller, including the session-start routine that prints this line to the user as fact,
+# reported a dead bridge as running. On 2026-07-28 it had been dead for hours across several
+# sessions before anyone looked at the log. Wait, then confirm it is still alive.
+Start-Sleep -Seconds 3
+if ($proc.HasExited) {
+    Write-Output ("EXITED_EARLY pid={0} code={1} - bridge died on startup, see logs\bridge.log" -f $proc.Id, $proc.ExitCode)
+    $log = Join-Path $PSScriptRoot 'logs\bridge.log'
+    # -Encoding UTF8: bridge.log is UTF-8 but PS5.1 reads as ANSI, turning the Korean reason
+    # (the whole point of printing it) into mojibake.
+    if (Test-Path $log) { Get-Content $log -Tail 4 -Encoding UTF8 | ForEach-Object { Write-Output ("  " + $_) } }
+    exit 1
+}
 Write-Output ("STARTED pid={0}" -f $proc.Id)

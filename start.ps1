@@ -44,14 +44,32 @@ if (-not $phpOk) {
 
 # Full path on purpose: `Start-Process python` + -WindowStyle Hidden has failed with exit 255.
 # Built from $env:LOCALAPPDATA so no personal path is hardcoded (this file is mirrored publicly).
-# Highest installed 3.x wins -- machines differ (desktop 3.13, laptop 3.12). Sort on the numeric
-# minor, not the folder name: 'Python39' sorts above 'Python313' as text.
+#
+# Pick the interpreter that actually HAS the deps, not merely the newest one. Setup installs with
+# `python -m pip install -r requirements.txt` (PATH's python), while this launcher used to take the
+# highest-numbered Python3* folder. Those are the same only while one 3.x is installed -- add a
+# second and the bridge starts on an interpreter without discord.py and dies at runtime with
+# ModuleNotFoundError, far from the cause. So: try PATH first, then folders (highest minor first;
+# sort on the number, as 'Python39' sorts above 'Python313' as text), and accept the first one that
+# can import discord. That check also rejects the Microsoft Store alias stub.
 $pyRoot = Join-Path $env:LOCALAPPDATA 'Programs\Python'
-$py = Get-ChildItem $pyRoot -Filter 'Python3*' -Directory -ErrorAction SilentlyContinue |
+$cands = @()
+$onPath = (Get-Command python -ErrorAction SilentlyContinue)
+if ($onPath) { $cands += $onPath.Source }
+$cands += Get-ChildItem $pyRoot -Filter 'Python3*' -Directory -ErrorAction SilentlyContinue |
     Sort-Object { [int]($_.Name -replace '^Python3', '') } -Descending |
-    ForEach-Object { Join-Path $_.FullName 'python.exe' } |
-    Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $py) { Write-Output "NO_PYTHON (no Python3*\python.exe under $pyRoot)"; exit 1 }
+    ForEach-Object { Join-Path $_.FullName 'python.exe' }
+
+$py = $null
+foreach ($cand in $cands) {
+    if (-not $cand -or -not (Test-Path $cand)) { continue }
+    & $cand -c "import discord" 2>$null
+    if ($LASTEXITCODE -eq 0) { $py = $cand; break }
+}
+if (-not $py) {
+    Write-Output "NO_PYTHON_DEPS (no interpreter with discord.py; run: python -m pip install -r requirements.txt)"
+    exit 1
+}
 
 $proc = Start-Process -FilePath $py -ArgumentList 'bridge.py' `
     -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru

@@ -36,8 +36,14 @@ if (Test-Path 'C:\php84\php.exe') { $env:PATH = 'C:\php84;' + $env:PATH }
 
 # Full path on purpose: `Start-Process python` + -WindowStyle Hidden has failed with exit 255.
 # Built from $env:LOCALAPPDATA so no personal path is hardcoded (this file is mirrored publicly).
-$py = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'
-if (-not (Test-Path $py)) { Write-Output "NO_PYTHON $py"; exit 1 }
+# Highest installed 3.x wins -- machines differ (desktop 3.13, laptop 3.12). Sort on the numeric
+# minor, not the folder name: 'Python39' sorts above 'Python313' as text.
+$pyRoot = Join-Path $env:LOCALAPPDATA 'Programs\Python'
+$py = Get-ChildItem $pyRoot -Filter 'Python3*' -Directory -ErrorAction SilentlyContinue |
+    Sort-Object { [int]($_.Name -replace '^Python3', '') } -Descending |
+    ForEach-Object { Join-Path $_.FullName 'python.exe' } |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $py) { Write-Output "NO_PYTHON (no Python3*\python.exe under $pyRoot)"; exit 1 }
 
 $proc = Start-Process -FilePath $py -ArgumentList 'bridge.py' `
     -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru

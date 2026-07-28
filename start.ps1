@@ -1,4 +1,4 @@
-# claude-bridge start (local / laptop -- PowerShell)
+﻿# claude-bridge start (local / laptop -- PowerShell)
 # ASCII-only on purpose: Windows PowerShell 5.1 misreads UTF-8-no-BOM Korean as cp949
 # and breaks brace matching (parse error). Keep this file ASCII.
 #
@@ -30,9 +30,17 @@ if ($running.Count -gt 0 -and -not $Force) {
 foreach ($p in $running) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 
 if (-not $env:BRIDGE_PLATFORM) { $env:BRIDGE_PLATFORM = 'discord' }
-# trading-info backend needs PHP 8.4 (XAMPP 7.4 on PATH breaks vendor/tests); inherited by the
-# bot's `claude` subprocess. Same reason as run_loop.ps1.
-if (Test-Path 'C:\php84\php.exe') { $env:PATH = 'C:\php84;' + $env:PATH }
+# trading-info backend needs PHP 8.4.1+ (Laravel 13 / composer.lock symfony 8.1); inherited by the
+# bot's `claude` subprocess. Since 2026-07-28 the machine PATH has C:\php84 instead of C:\xampp\php
+# (7.4), so usually PATH php is already fine -- only prepend when it is missing or too old (stale
+# process env, or a machine that installed 8.4 elsewhere). Same block as run_loop.ps1.
+$phpCmd = Get-Command php.exe -ErrorAction SilentlyContinue
+$phpOk = $false
+if ($phpCmd -and $phpCmd.Version) { $phpOk = ([version]$phpCmd.Version -ge [version]'8.4.1') }
+if (-not $phpOk) {
+    if (Test-Path 'C:\php84\php.exe') { $env:PATH = 'C:\php84;' + $env:PATH }
+    else { Write-Output 'NO_PHP84 (PATH php missing or < 8.4.1, and no C:\php84\php.exe) - trading-info tasks will fail' }
+}
 
 # Full path on purpose: `Start-Process python` + -WindowStyle Hidden has failed with exit 255.
 # Built from $env:LOCALAPPDATA so no personal path is hardcoded (this file is mirrored publicly).

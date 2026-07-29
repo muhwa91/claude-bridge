@@ -1382,15 +1382,21 @@ def harness_model_policy(home: Path | None = None) -> str:
 def _harness_dir_names(path: Path, suffix: str = "") -> list[str]:
     """디렉터리 하위 **이름만** 수집(내용은 절대 읽지 않는다). 없음·권한오류는 빈 목록.
 
-    suffix 를 주면 그 확장자만 골라 확장자를 뗀다(`agents/*.md` → 에이전트명).
+    suffix 를 주면 **하위 폴더까지** 훑어 그 확장자만 골라 확장자를 뗀 **파일명**을 남긴다
+    (`agents/dev/qa-tester.md` → `qa-tester` — 폴더 경로는 붙이지 않고, 같은 이름은 한 번만).
+    한 겹만 보던 옛 구현은 에이전트를 `dev/`·`doc/` 로 분류한 날 **예외 없이 0개**가 됐다.
+    suffix 가 없으면 바로 아래 한 겹만 본다 — 그쪽 용도는 폴더 이름 수집(`skills/<이름>/`)이라
+    재귀하면 폴더 안 파일까지 딸려 온다.
     """
     try:
-        names = sorted(p.name for p in path.iterdir())
+        if suffix:
+            names = {p.name[: -len(suffix)] for p in path.rglob("*" + suffix) if p.is_file()}
+        else:
+            # is_dir() 필수 — 점 필터만으론 `skills/README.md` 같은 **파일**이 스킬로 세어진다.
+            names = {p.name for p in path.iterdir() if p.is_dir() and not p.name.startswith(".")}
     except OSError:
         return []
-    if suffix:
-        return [n[: -len(suffix)] for n in names if n.endswith(suffix)]
-    return [n for n in names if not n.startswith(".")]
+    return sorted(names)
 
 
 def installed_names(home: Path | None = None) -> set[str]:

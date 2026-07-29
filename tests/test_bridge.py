@@ -4707,7 +4707,7 @@ def harness_home(tmp_path, monkeypatch):
     (home / ".claude" / "plugins").mkdir(parents=True)
     (home / ".claude" / "agents").mkdir()
     (root / ".claude" / "skills" / "design-pro").mkdir(parents=True)
-    (root / ".claude" / "agents").mkdir()
+    (root / ".claude" / "agents" / "doc").mkdir(parents=True)  # 실제 구조: dev/·doc/ 로 분류
     (home / ".claude.json").write_text(
         json.dumps({"mcpServers": {"serena": {}, "context7": {}}}), encoding="utf-8"
     )
@@ -4716,7 +4716,7 @@ def harness_home(tmp_path, monkeypatch):
     )
     (home / ".claude" / "agents" / "backend-engineer.md").write_text("x", encoding="utf-8")
     (home / ".claude" / "agents" / "README.txt").write_text("x", encoding="utf-8")  # .md 만 센다
-    (root / ".claude" / "agents" / "researcher.md").write_text("x", encoding="utf-8")
+    (root / ".claude" / "agents" / "doc" / "researcher.md").write_text("x", encoding="utf-8")
     backlog, rejects = tmp_path / "BACKLOG.md", tmp_path / "rejected.jsonl"
     backlog.write_text(
         "# 백로그\n## 열린/미결 항목\n- claude-mem 보류\n## 지난 이력\n- 옛것\n", "utf-8"
@@ -4735,7 +4735,7 @@ def test_collect_harness_gathers_both_scopes(harness_home):
     assert "· MCP 서버(2): context7, serena" in out
     assert "· 플러그인(1): ponytail@ponytail" in out
     assert "· 스킬(1): design-pro" in out
-    # 사용자·워크스페이스 두 스코프를 합치고 `.md` 만, 확장자는 뗀다.
+    # 사용자·워크스페이스 두 스코프를 합치고 `.md` 만, 확장자는 뗀다(워크스페이스는 `doc/` 안).
     assert "· 에이전트(2): backend-engineer, researcher" in out
     assert "claude-mem 보류" in out and "2026-07-27 o/x — serena 중복" in out
     assert "옛것" not in out  # 열린/미결 절 밖은 안 싣는다
@@ -4749,6 +4749,27 @@ def test_collect_harness_missing_files_is_silent(tmp_path):
 def test_collect_harness_corrupt_json_is_silent(harness_home):
     (harness_home.home / ".claude.json").write_text("{ 손상", encoding="utf-8")
     assert "· MCP 서버(0): (없음)" in bridge.collect_harness(harness_home.home, harness_home.root)
+
+
+def test_harness_dir_names_recurses_only_with_suffix(tmp_path):
+    # 확장자 수집은 하위 폴더까지(에이전트를 dev/·doc/ 로 나눈 날 조용히 0개가 됐다).
+    agents = tmp_path / "agents"
+    (agents / "dev").mkdir(parents=True)
+    (agents / "doc").mkdir()
+    for rel in ("tech-lead.md", "dev/qa-tester.md", "doc/writer.md", "doc/qa-tester.md"):
+        (agents / rel).write_text("x", encoding="utf-8")
+    (agents / "dev" / "README.txt").write_text("x", encoding="utf-8")
+    # 폴더 경로가 붙지 않고(`dev/qa-tester` 아님), 같은 이름은 한 번만, 정렬된 채로.
+    assert bridge._harness_dir_names(agents, ".md") == ["qa-tester", "tech-lead", "writer"]
+
+    # 확장자 없는 호출은 폴더 이름 수집 용도 — 한 겹만 본다(안쪽 파일이 딸려오면 안 된다).
+    skills = tmp_path / "skills"
+    (skills / "design-pro" / "안쪽").mkdir(parents=True)
+    (skills / ".숨김").mkdir()
+    (skills / "kakao").mkdir()
+    assert bridge._harness_dir_names(skills) == ["design-pro", "kakao"]
+
+    assert bridge._harness_dir_names(tmp_path / "없음", ".md") == []
 
 
 def test_harness_line_caps_names(monkeypatch):

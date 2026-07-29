@@ -5933,13 +5933,13 @@ def test_build_secrets_skips_non_secret_config_keys(tmp_path):
     # 비밀 아닌 긴 설정값까지 마스킹하면 회신의 경로·URL 이 *** 로 깨진다(과잉 마스킹 방지).
     env = {
         "TARGET_ROOT": "Hachiware/_Project",
-        "MUSIC_PLAYLIST_URL": "https://youtube.com/playlist?list=abc",
+        "MUSIC_PLAYLIST_ID": "PLabcdefghijklmnop",
         "CLAUDE_TIMEOUT_SEC": "600000000000",
         "DISCORD_BOT_TOKEN": "tok-" + "z" * 40,
     }
     secrets = bridge.build_secrets("tok-" + "z" * 40, tmp_path, env)
     assert "Hachiware/_Project" not in secrets
-    assert "https://youtube.com/playlist?list=abc" not in secrets
+    assert "PLabcdefghijklmnop" not in secrets
     assert "600000000000" not in secrets
     assert "tok-" + "z" * 40 in secrets  # 토큰류는 그대로 마스킹 대상
     reply = "M  Hachiware/_Project/etf-info/app.py"

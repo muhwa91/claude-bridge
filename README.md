@@ -102,6 +102,7 @@ python bridge.py                            # 또는 run_loop.ps1(재기동 루�
 | `DISCORD_ALLOWED_USER_IDS` | 허용 유저 ID(콤마 구분) |
 | `CLAUDE_TIMEOUT_SEC` | claude 작업 1건 최대 실행 시간(초, 기본 900) |
 | `TARGET_ROOT` | 원격 지시 대상 프로젝트 루트(직속 폴더만) |
+| `MUSIC_PLAYLIST_ID` | `ㅁ노래` 재생 · `ㅁ추가` 대상 유튜브 재생목록 **ID**(URL 의 `list=` 뒤). 비우면 `ㅁ노래` 는 미설정 안내 |
 
 ## 호스팅
 
@@ -115,6 +116,7 @@ python bridge.py                            # 또는 run_loop.ps1(재기동 루�
 ## 개발
 
 ```bash
+python -m pip install -r requirements-dev.txt   # pytest·ruff·mypy(런타임과 분리)
 python -m pytest             # 단위·계약 테스트(순수 함수·FakeAdapter, 네트워크 없음)
 ruff check . && ruff format --check .
 mypy .

@@ -359,6 +359,7 @@ class DiscordAdapter:
         # ponytail: ack 가 항상 소비 + 비허용은 선-필터로 미적재라 맵 유계(토큰 15분 만료가 상한).
         self._interactions: dict[str, Any] = {}
         self._closed = False
+        self.bot_failed = False  # 봇 스레드가 로그인·게이트웨이 예외로 죽었는가(종료코드 판정용)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         # Gateway 접속 완료(on_ready) 신호 — 재시작 복귀 통지 등 접속 후 send 를 여기서 기다린다.
@@ -999,6 +1000,7 @@ class DiscordAdapter:
             # 조용히 죽고 poll 이 queue.get() 에서 영구 블록된다. 명시 로그(토큰 미노출) 후 finally
             # 의 종료 센티넬로 poll·main 을 깨워 깨끗이 종료시킨다.
             log.error("디스코드 봇 스레드 종료(%s) — 토큰·권한을 확인하세요", type(e).__name__)
+            self.bot_failed = True  # main 이 종료코드 1 로 올린다(정상 종료와 구분).
         finally:
             with contextlib.suppress(RuntimeError, discord.DiscordException):
                 loop.run_until_complete(self._client.close())

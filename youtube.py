@@ -21,7 +21,8 @@ from typing import Any
 _ROOT = Path(__file__).resolve().parent
 CLIENT_FILE = _ROOT / ".oauth_client.json"  # {"installed":{"client_id","client_secret",...}}
 TOKEN_FILE = _ROOT / ".oauth_token.json"  # {"refresh_token": "..."}
-# 대상 재생목록 "코딩"(개발자 소유·검증됨). ponytail: 재생목록이 바뀌면 이 상수만 교체.
+# 대상 재생목록 "코딩"(개발자 소유·검증됨). 기본값일 뿐 — bridge.py 가 기동 시 .env 의
+# MUSIC_PLAYLIST_ID 로 덮어쓴다(재생·추가가 같은 목록을 보게 하는 단일 출처).
 PLAYLIST_ID = "PLfYAqOSmXQFQ"
 _API = "https://www.googleapis.com/youtube/v3/playlistItems"
 _TOKEN_URI = "https://oauth2.googleapis.com/token"  # client 파일에 없을 때 폴백

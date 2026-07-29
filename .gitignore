@@ -7,6 +7,7 @@ logs/sessions.log
 # telegram_bridge 런타임 상태 (오프셋·pidfile·알림상태·수신사진은 커밋하지 않음)
 logs/offset
 logs/bridge.pid
+logs/bridge.ready
 logs/notify_state.json
 logs/channel_map.json
 logs/channel_sessions.json

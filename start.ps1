@@ -74,12 +74,21 @@ if (-not $py) {
 $proc = Start-Process -FilePath $py -ArgumentList 'bridge.py' `
     -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
 
-# Do not report STARTED for a process that is already gone. On a rejected token the bot logs
-# LoginFailure and exits in well under a second, but Start-Process has already returned a pid --
-# so every caller, including the session-start routine that prints this line to the user as fact,
-# reported a dead bridge as running. On 2026-07-28 it had been dead for hours across several
-# sessions before anyone looked at the log. Wait, then confirm it is still alive.
-Start-Sleep -Seconds 3
+# Do not report STARTED for a process that is merely still alive. A "sleep N then check liveness"
+# test cannot answer "did it log in?", because on a rejected token the failure only surfaces at
+# roughly python startup (~1.5s) + login refusal (~0.4s) + shutdown (~2s) -- about 4s in. The old
+# 3s check therefore sampled the one window where a doomed bridge still looks healthy, and reported
+# STARTED for a bridge that was dead moments later (2026-07-28 and again 07-29). Raising the sleep
+# would just move the race, so wait on the two real outcomes instead and take whichever lands first:
+#   logs\bridge.ready appears -> bridge reached Gateway on_ready (written by bridge.py)
+#   process exits             -> startup failed; exit code and log say why
+$ready = Join-Path $PSScriptRoot 'logs\bridge.ready'
+$deadline = 60   # 200ms ticks; generous because a cold start pulls the project list first
+for ($i = 0; $i -lt $deadline; $i++) {
+    if (Test-Path $ready) { break }
+    if ($proc.HasExited) { break }
+    Start-Sleep -Milliseconds 200
+}
 if ($proc.HasExited) {
     Write-Output ("EXITED_EARLY pid={0} code={1} - bridge died on startup, see logs\bridge.log" -f $proc.Id, $proc.ExitCode)
     $log = Join-Path $PSScriptRoot 'logs\bridge.log'
@@ -87,5 +96,11 @@ if ($proc.HasExited) {
     # (the whole point of printing it) into mojibake.
     if (Test-Path $log) { Get-Content $log -Tail 4 -Encoding UTF8 | ForEach-Object { Write-Output ("  " + $_) } }
     exit 1
+}
+if (-not (Test-Path $ready)) {
+    # Alive but never reached on_ready within the window. Not proof of failure (a slow network can
+    # do this), so do not kill it -- but do not claim success either.
+    Write-Output ("STARTING pid={0} - alive but no Gateway connect yet, check logs\bridge.log" -f $proc.Id)
+    exit 0
 }
 Write-Output ("STARTED pid={0}" -f $proc.Id)

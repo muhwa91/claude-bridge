@@ -48,6 +48,9 @@ PROJECT_DIR = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_DIR / "logs"
 LOG_FILE = LOG_DIR / "bridge.log"
 PID_FILE = LOG_DIR / "bridge.pid"
+# 런처(start.ps1)가 "정말 접속했는가"를 볼 신호. Gateway on_ready 이후에만 생기고 종료 시 지운다.
+# PID 파일로는 대신할 수 없다 — 그건 로그인 **전에** 잡는 락이라, 토큰이 거부돼도 잠깐 존재한다.
+READY_FILE = LOG_DIR / "bridge.ready"
 SCHEDULES_FILE = PROJECT_DIR / "schedules" / "notify.json"
 NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
@@ -711,7 +714,7 @@ _SECRET_MIN_LEN = 12  # 마스킹 대상 .env 값의 최소 길이(짧은 값이
 # 작업 회신의 파일 경로가 깨진다. **제외 목록(블랙리스트가 아닌 예외)** 방식인 이유: 키 화이트
 # 리스트(*TOKEN|SECRET|KEY 만 마스킹)로 뒤집으면 새 비밀 키가 추가될 때 **조용히 마스킹에서
 # 빠진다**. 여기 안 적힌 값은 전부 마스킹되므로 누락 시 최악이 "과잉 마스킹"에 그친다(fail-safe).
-_SECRET_SKIP_KEYS = frozenset({"TARGET_ROOT", "CLAUDE_TIMEOUT_SEC", "MUSIC_PLAYLIST_URL"})
+_SECRET_SKIP_KEYS = frozenset({"TARGET_ROOT", "CLAUDE_TIMEOUT_SEC", "MUSIC_PLAYLIST_ID"})
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -4055,12 +4058,23 @@ def main() -> int:
     # (본체 stdlib 전용 계약 유지 = 플랫폼 교체 seam).
     from discord_adapter import DiscordAdapter
 
+    # 재생목록은 **ID 하나만** .env 에 둔다(MUSIC_PLAYLIST_ID). 종전엔 재생용 URL(.env
+    # MUSIC_PLAYLIST_URL)과 추가용 ID(youtube.PLAYLIST_ID 상수)가 따로 있어, 둘이 어긋나면
+    # 'ㅁ추가'로 넣은 곡이 'ㅁ노래' 재생목록에 안 나왔다 — .env.example 이 "같아야 한다"고
+    # 경고를 달아 사람이 지키게 하던 자리다. ID 에서 URL 을 만들어 어긋날 수 없게 한다.
+    playlist_id = env.get("MUSIC_PLAYLIST_ID", "").strip()
+    playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}" if playlist_id else ""
+    if playlist_id:
+        # ponytail: 모듈 상수 대입. add_video 가 유일한 진입점이고 워커가 단일이라 이걸로 충분 —
+        # 재생목록이 요청마다 달라지면 그때 인자로 넘긴다.
+        youtube.PLAYLIST_ID = playlist_id
+
     adapter: Adapter = DiscordAdapter(
         token,
         secrets,
         allowed,
         channel_map_file=CHANNEL_MAP_FILE,
-        music_playlist_url=env.get("MUSIC_PLAYLIST_URL", "").strip(),
+        music_playlist_url=playlist_url,
     )
     # ①(채널 자동생성 §4.4): 프로젝트 채널 목록 주입 — on_ready 에서 생성.
     adapter.setup_channels(list_projects(target_root))
@@ -4082,6 +4096,20 @@ def main() -> int:
             name="restart-notice",
             daemon=True,
         ).start()
+
+    # 접속 성공 신호: on_ready 를 기다렸다 READY_FILE 을 만든다. 런처는 "3초 뒤에도 살아 있으면
+    # 성공"이라는 타이머로 판정했는데, 토큰이 거부되면 파이썬 기동(~1.5s)+로그인 거부(~0.4s)+
+    # 종료(~2s) 라 실패가 드러나는 시점이 4초쯤이어서 **죽은 브리지를 STARTED 로 보고**했다
+    # (2026-07-28·29 실제로 두 번). 시간을 늘리는 건 땜질이라 성공 자체를 신호로 쓴다.
+    READY_FILE.unlink(missing_ok=True)
+
+    def _mark_ready() -> None:
+        # wait_ready 는 Adapter 계약 밖 어댑터 훅이라 getattr 로 선택 호출(계약 표면 오염 방지).
+        wait = getattr(adapter, "wait_ready", None)
+        if callable(wait) and wait(60):
+            READY_FILE.write_text("ready", encoding="utf-8")
+
+    threading.Thread(target=_mark_ready, name="ready-marker", daemon=True).start()
 
     # ① 시각 알림: poll(Gateway 수신) 블록 중에도 발송되도록 독립 타이머 스레드로 구동(§3.3).
     stop = threading.Event()
@@ -4112,7 +4140,10 @@ def main() -> int:
         stop.set()
         adapter.close()
         PID_FILE.unlink(missing_ok=True)
-    return 0
+        READY_FILE.unlink(missing_ok=True)
+    # 봇 스레드가 로그인 거부·게이트웨이 예외로 죽어 끝난 경우는 실패다. 종전엔 이때도 0 이라
+    # 종료코드만으로는 정상 종료와 구분할 수 없었다(런처·run_loop 가 재기동 판단을 못 함).
+    return 1 if getattr(adapter, "bot_failed", False) else 0
 
 
 def _selftest() -> None:

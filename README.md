@@ -8,7 +8,7 @@ PC 앞에 없어도 디스코드에 지시를 보내면 상시 호스트가 대�
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![discord.py](https://img.shields.io/badge/discord.py-2.7-5865F2?logo=discord&logoColor=white)
 ![core](https://img.shields.io/badge/core-stdlib_only-success)
-![tests](https://img.shields.io/badge/tests-361_passing-success)
+![tests](https://img.shields.io/badge/tests-1032_passing-success)
 
 <!-- 스크린샷: (추후) — 현재는 아래 아키텍처 다이어그램으로 대체 -->
 

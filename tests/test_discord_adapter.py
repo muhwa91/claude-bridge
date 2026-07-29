@@ -1755,6 +1755,49 @@ def test_build_card_embed_caps_description_and_field_count():
     assert [f.name for f in embed.fields] == [f"n{i}" for i in range(25)]  # 앞에서부터
 
 
+def test_build_card_embed_announces_omitted_fields_in_footer():
+    """조용한 절단 금지 — 미국주식 카드면 마지막 두 필드(한국·섹터)가 소리 없이 사라진다.
+    이 모듈의 원칙("조용히 죽는 것보다 안 쓴다고 말하고 죽는 것이 낫다")과 어긋난다."""
+    embed = discord_adapter.build_card_embed(
+        {"footer": "출처", "fields": [(f"n{i}", "값" * 1000, False) for i in range(10)]}, []
+    )
+    assert "생략" in embed.footer.text and "출처" in embed.footer.text
+    assert len(embed.footer.text) <= discord_adapter._OMIT_NOTE_MAXLEN + len("출처") + 3
+
+
+def test_build_card_embed_clamps_description_to_total_budget():
+    # 슬롯별 한도만 지킨 조합(title 256 + desc 4096 + author 256 + footer 2048 = 6656)은
+    # **필드가 0개여도** 6000 을 넘겨 400 이 난다.
+    embed = discord_adapter.build_card_embed(
+        {
+            "title": "제" * 256,
+            "author": "저" * 256,
+            "footer": "꼬" * 2048,
+            "description": "설" * 4096,
+            "fields": [],
+        },
+        [],
+    )
+    total = (
+        len(embed.title) + len(embed.description) + len(embed.author.name) + len(embed.footer.text)
+    )
+    assert total <= discord_adapter._EMBED_TOTAL_LIMIT
+
+
+def test_build_card_embed_drops_fields_past_total_limit():
+    """슬롯별 한도를 다 지켜도 **합계 6000 을 넘으면 디스코드가 400 으로 거부**해 메시지 자체가
+    사라진다. 호출자가 둘(오픈소스 5x1000 · 미국주식 8x700)이고 산식이 달라 누적으로도 센다.
+    넘치는 필드는 버리되 앞쪽은 살린다 — 한 필드를 잃는 게 카드 전체를 잃는 것보다 낫다.
+    """
+    embed = discord_adapter.build_card_embed(
+        {"title": "T", "fields": [(f"n{i}", "값" * 1000, False) for i in range(10)]}, []
+    )
+    total = len(embed.title or "") + sum(len(f.name) + len(f.value) for f in embed.fields)
+    assert total <= discord_adapter._EMBED_TOTAL_LIMIT
+    assert 0 < len(embed.fields) < 10  # 일부는 실리고 초과분만 잘린다
+    assert [f.name for f in embed.fields] == [f"n{i}" for i in range(len(embed.fields))]
+
+
 def test_build_card_embed_masks_every_slot():
     """author·title·description·field name·field value·footer — 한 슬롯이라도 새면 결함."""
     embed = discord_adapter.build_card_embed(

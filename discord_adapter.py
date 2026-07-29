@@ -88,6 +88,10 @@ _EMBED_FIELD_NAME_LIMIT = 256
 _EMBED_FIELD_VALUE_LIMIT = 1024
 _EMBED_FOOTER_LIMIT = 2048
 _EMBED_FIELDS_MAX = 25
+# 임베드 **전 슬롯 합계** 한도(디스코드). 넘으면 400 으로 메시지 자체가 안 나간다 — 슬롯별
+# 한도를 다 지켜도 걸릴 수 있어 누적으로도 센다(build_card_embed).
+_EMBED_TOTAL_LIMIT = 6000
+_OMIT_NOTE_MAXLEN = 40  # footer 에 붙일 `⚠️N개 필드 생략(길이 초과)` 몫 — 총합에서 미리 뺀다
 
 # ── ①(채널 자동생성 §4.4) — 서버 구조 ───────────────────────────────────────
 # 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag). 프로젝트 카테고리는 setup 시
@@ -251,31 +255,51 @@ def build_card_embed(card: dict[str, Any], secrets: list[str]) -> Any:
     분기를 섞으면 그쪽이 깨진다. 문자열 슬롯은 전부 마스킹(§2.1 방어심층: 카드도 send/edit 과
     같은 문을 지난다)하고 디스코드 한도로 자른다. 색은 코어가 판정별로 정해 넘긴다.
 
-    ponytail: 슬롯별 한도만 보고 **임베드 총합 6000자는 안 본다** — 유일한 호출자(다이제스트)가
-    카드마다 `DIGEST_CARD_MAXLEN` 으로 원문을 먼저 자르고 한 메시지에 `DIGEST_MAX_CARDS` 건까지만
-    담으므로 합이 6000 에 닿을 수 없다(5개 x 1000자 + 제목·footer ≈ 5.1KB). **그 두 상수를 키울 때는
-    곱을 다시 재라.** 다른 기능이 이 Card 규약을 쓰기 시작하면 그때 총합 가드를 넣는다.
+    **총합 가드는 필수다.** 호출자가 둘이고 산식이 서로 다르다:
+    ① 오픈소스 다이제스트 = `DIGEST_MAX_CARDS`(5) x `DIGEST_CARD_MAXLEN`(1000) + 제목·footer ≈ 5.1KB
+    ② 미국주식 다이제스트 = 필드 8 x `us_digest.FIELD_MAXLEN`(700) + 제목·footer ≈ 5.8KB
+    ②는 6000 까지 여유가 200자 남짓이라 **필드를 하나 늘리는 순간 400 으로 메시지가 통째로
+    사라진다**(슬롯별 한도는 전부 지켜도 걸린다). 넘치는 필드는 버리되 **footer 에 `⚠️N개 생략`
+    을 남긴다** — 한 필드를 잃는 편이 카드 전체를 잃는 것보다 낫지만, 조용히 잃으면 읽는 사람은
+    미국주식 카드의 마지막 두 필드(한국·섹터)가 사라진 걸 모른다.
+    description 도 남은 예산으로 한 번 더 자른다 — 슬롯별 한도만 지킨 조합(256+4096+256+2048)은
+    **필드가 0개여도** 6000 을 넘는다.
     """
 
     def m(v: object, limit: int) -> str:
         return mask_secrets(str(v), secrets)[:limit]
 
+    title = m(card.get("title") or "", _EMBED_TITLE_LIMIT)
+    author = m(card.get("author") or "", _EMBED_AUTHOR_LIMIT)
+    footer = m(card.get("footer") or "", _EMBED_FOOTER_LIMIT)
+    budget = _EMBED_TOTAL_LIMIT - _OMIT_NOTE_MAXLEN  # 생략 안내 몫을 미리 뺀다
+    fixed = len(title) + len(author) + len(footer)
+    description = m(card.get("description") or "", min(_EMBED_DESC_LIMIT, max(0, budget - fixed)))
     embed = discord.Embed(
         color=int(card.get("color") or _COLOR_INFO),
-        title=m(card.get("title") or "", _EMBED_TITLE_LIMIT) or None,
-        description=m(card.get("description") or "", _EMBED_DESC_LIMIT) or None,
+        title=title or None,
+        description=description or None,
     )
-    author = m(card.get("author") or "", _EMBED_AUTHOR_LIMIT)
     if author:
         embed.set_author(name=author)
-    for name, value, inline in list(card.get("fields") or [])[:_EMBED_FIELDS_MAX]:
+    total = fixed + len(description)
+    entries = list(card.get("fields") or [])[:_EMBED_FIELDS_MAX]
+    omitted = 0
+    for i, (name, value, inline) in enumerate(entries):
         # 이름·값이 빈 필드는 디스코드가 400 으로 거부한다 — 코어가 안 넣지만 여기서도 막는다.
         fname, fvalue = m(name, _EMBED_FIELD_NAME_LIMIT), m(value, _EMBED_FIELD_VALUE_LIMIT)
-        if fname and fvalue:
-            embed.add_field(name=fname, value=fvalue, inline=bool(inline))
-    footer = m(card.get("footer") or "", _EMBED_FOOTER_LIMIT)
+        if not (fname and fvalue):
+            continue
+        if total + len(fname) + len(fvalue) > budget:
+            omitted = len(entries) - i
+            log.warning("카드 임베드 총합 초과 — 이후 %d개 필드 생략(%s)", omitted, fname[:40])
+            break
+        embed.add_field(name=fname, value=fvalue, inline=bool(inline))
+        total += len(fname) + len(fvalue)
+    if omitted:
+        footer = f"⚠️{omitted}개 필드 생략(길이 초과)" + (f" · {footer}" if footer else "")
     if footer:
-        embed.set_footer(text=footer)
+        embed.set_footer(text=footer[:_EMBED_FOOTER_LIMIT])
     return embed
 
 

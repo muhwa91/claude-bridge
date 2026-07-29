@@ -18,6 +18,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from adapter import _NOREDIRECT_OPENER
+
 _ROOT = Path(__file__).resolve().parent
 CLIENT_FILE = _ROOT / ".oauth_client.json"  # {"installed":{"client_id","client_secret",...}}
 TOKEN_FILE = _ROOT / ".oauth_token.json"  # {"refresh_token": "..."}
@@ -36,7 +38,13 @@ _access_exp = 0.0
 
 
 def _http_json(req: urllib.request.Request) -> dict[str, Any]:
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+    """고정 host(googleapis.com) GET/POST → JSON. **리다이렉트 미추종**(adapter 공용 opener).
+
+    urllib 의 기본 리다이렉트는 `Content-*` 헤더만 떨구고 **`Authorization: Bearer` 는 재전송**한다
+    → 3xx 를 따라가면 액세스 토큰이 그 목적지로 간다. host 가 하드코딩이라 실현성은 낮지만
+    비용이 한 줄이라 막아둔다(bridge.fetch_rest_probe·us_digest._get 과 같은 opener).
+    """
+    with _NOREDIRECT_OPENER.open(req, timeout=_TIMEOUT) as resp:
         data: dict[str, Any] = json.loads(resp.read().decode("utf-8"))
     return data
 

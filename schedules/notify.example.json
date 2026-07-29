@@ -27,6 +27,20 @@
       "label": "주말 상태 점검",
       "note": "주말 진입 시 인라인 표시가 example 규칙대로 바뀌는지 확인",
       "grace_min": 30
+    },
+    {
+      "id": "os-digest",
+      "on": "session",
+      "channel": "오픈소스",
+      "label": "오픈소스 다이제스트",
+      "note": "시각 대신 세션 시작으로 발화한다(on:session) — 호스트가 꺼져 있어도 유실되지 않는다"
+    },
+    {
+      "id": "us-digest",
+      "on": "session",
+      "channel": "미국주식",
+      "label": "미국주식 다이제스트",
+      "note": "전일 반도체·AI 재료"
     }
   ]
 }

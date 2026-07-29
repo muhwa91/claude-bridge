@@ -40,6 +40,7 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any
 
+import us_digest
 import youtube
 from adapter import _NOREDIRECT_OPENER, Adapter, Button, Event, _valid_id, mask_secrets
 
@@ -337,8 +338,10 @@ pending_photos: dict[int, tuple[str, float]] = {}
 # ponytail: in-memory — 재시작하면 옛 카드 버튼은 "만료" 안내로 떨어진다(유실 수용).
 digest_pending: dict[int, dict[str, Any]] = {}
 _digest_seq = itertools.count(1)
-# 다이제스트 실패 되돌림 횟수 {"YYYY-MM-DD": n} — 오늘 키 1개만 유지(_run_digest 가 갱신 시 정리).
-_digest_attempts: dict[str, int] = {}
+# 다이제스트 실패 되돌림 횟수 {(id, "YYYY-MM-DD"): n} — **id 별로** 센다. 키가 날짜뿐이면
+# 같은 틱에 함께 도는 다른 다이제스트가 예산을 나눠 써, 한쪽이 3번 실패하면 다른 쪽은 한 번도
+# 시도되지 못하고 그날 포기된다. 오늘 것만 남긴다(_revert_digest_fired 가 갱신 시 정리).
+_digest_attempts: dict[tuple[str, str], int] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -639,12 +642,15 @@ def fetch_rest_probe(path: str, *, timeout: float = _REST_PROBE_TIMEOUT) -> str:
     방어적(load_env·load_schedules 스타일): 타임아웃·연결실패·비-`/api/` 경로는 예외를 삼키고
     조용히 "조회 실패/안 함" 요약을 돌려준다(점검 자체는 계속되게). SSRF 차단: path 만 받아
     고정 host(127.0.0.1:8000)에 조립 — 전체 URL·타 호스트 불가. path 는 `/api/` 로 시작해야 한다.
+    리다이렉트도 추종하지 않는다(_NOREDIRECT_OPENER): **3xx 를 따라가면 host 고정이 무의미**해지고,
+    이 응답 1,500자는 그대로 claude 프롬프트에 주입되는데 그 claude 는 쓰기·커밋 도구를 갖는다
+    (프롬프트 주입 경로). 3xx 는 HTTPError 로 승격돼 아래 광범위 캐치가 "조회 실패"로 받는다.
     """
     if not isinstance(path, str) or not path.startswith("/api/"):
         return f"{path!r}: 조회 안 함(경로가 /api/ 로 시작해야 함)"
     req = urllib.request.Request(_REST_PROBE_BASE + path, method="GET")  # GET 고정
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _NOREDIRECT_OPENER.open(req, timeout=timeout) as resp:
             body = resp.read(_REST_PROBE_MAXLEN + 1).decode("utf-8", "replace")
     except Exception as exc:
         # 방어적 광범위 캐치 — http.client.InvalidURL(제어문자) 등 어떤 예외도 콜백 스레드로
@@ -900,7 +906,7 @@ def dispatch_notifications(
 
     발송 타겟(§4.4): 항목의 `channel`(없으면 "알림") 역할 채널로 send — 채널 1곳에 1회. 채널
     매핑이 없으면(자동생성 실패) 그 항목만 스킵한다(디스코드는 채널로만 발송 — 유저별 팬아웃 없음).
-    `on:"session"` + id=DIGEST_NOTIFY_ID 항목만 알림 카드 대신 다이제스트 파이프라인으로 간다.
+    `on:"session"` + id 가 DIGEST_RUNNERS 에 있는 항목만 알림 카드 대신 다이제스트로 간다.
     """
     if items is None:
         items = load_schedules(SCHEDULES_FILE)
@@ -933,14 +939,14 @@ def dispatch_notifications(
         if channel is None:
             # ponytail: 자동생성 성공 시 역할 채널은 항상 있다. 없으면 degraded — 그 건만 스킵.
             log.warning("#%s 채널 미매핑 — 알림 %s 발송 스킵", role, item_id)
-            if item_id == DIGEST_NOTIFY_ID:
+            if item_id in DIGEST_RUNNERS:
                 # 다이제스트는 하루 1회뿐이라 여기서 그냥 스킵하면 워커를 안 타 그날치가 재시도
                 # 없이 날아간다. 봇 기동 직후 첫 틱이 on_ready(채널 자동생성) 전일 수 있어 현실적
                 # → fired 를 풀어 다음 틱이 다시 잡게. 영구 미매핑이면 상한에서 멈춘다(공용 헬퍼).
                 # (일반 알림은 종전대로 fired 유지 — 시각 창이 지나면 어차피 안 잡힌다.)
                 _revert_digest_fired(item_id, today, "채널 미매핑")
             continue
-        if item_id == DIGEST_NOTIFY_ID:
+        if item_id in DIGEST_RUNNERS:
             # 수집·판정이 1~2분 걸려 타이머 스레드를 막으면 다른 알림이 밀린다 → 별도 데몬 스레드.
             _start_digest(adapter, channel, item_id, today)
             continue
@@ -953,8 +959,17 @@ def dispatch_notifications(
 # ADR-003 불변식: 헤드리스 claude 에 네트워크 도구를 주지 않는다. 외부 데이터는 **브리지가
 # urllib 로 선조회해 프롬프트에 텍스트 주입**(방식 B — fetch_rest_probe 와 같은 사상). claude 는
 # 읽기 전용 도구로 워크스페이스를 실측해 "이미 있는지·충돌하는지"만 판정한다.
-DIGEST_NOTIFY_ID = "os-digest"  # notify.json 의 이 id 만 다이제스트 파이프라인으로 간다.
-# ponytail: 다이제스트는 1종뿐이라 id 상수로 분기 — 종류가 늘면 item 에 "kind" 필드를 도입한다.
+DIGEST_NOTIFY_ID = "os-digest"  # 오픈소스 다이제스트(#오픈소스) — notify.json 의 이 id
+US_DIGEST_NOTIFY_ID = "us-digest"  # 미국주식 다이제스트(#미국주식) — 배선 공용, 러너만 다르다
+# 다이제스트 id → **러너 함수명**. 알림 카드 대신 파이프라인으로 가는 항목의 유일한 정본이며
+# dispatch_notifications·_run_digest 가 같은 이 맵을 본다(분기가 두 곳으로 갈라지지 않게).
+# 값이 함수 객체가 아니라 **이름**인 이유: ① 두 러너가 아래에 정의돼 전방참조가 되고
+# ② 테스트가 `monkeypatch.setattr(bridge, "run_opensource_digest", …)` 로 갈아끼우는데
+# 객체를 잡아두면 그 교체가 안 먹는다(늦은 바인딩이 필요).
+DIGEST_RUNNERS: dict[str, str] = {
+    DIGEST_NOTIFY_ID: "run_opensource_digest",
+    US_DIGEST_NOTIFY_ID: "run_us_digest",
+}
 DIGEST_MIN_STARS = 300  # 1차 거르기 하한(⭐) — 이 밑은 하네스에 붙일 만큼 안 익었다고 본다
 # 후보를 **좁고 깊게** 판정한다(v2): 8건만 싣되 8건 **전량**의 README 를 받는다. 채택 기준이
 # "롤백 가능한가"인데 README 없이는 판정이 불가능해, v1(후보 15 · README 4)에서는 11건이 사실상
@@ -2188,17 +2203,23 @@ def _revert_digest_fired(item_id: str, today: str, reason: str) -> None:
     재시도**하며 WARNING 을 하루 수천 줄 쌓는다 → 카운팅·되돌림을 여기 한 곳으로 모은다.
     상한 도달 후엔 fired 를 유지해 그날은 조용히 포기한다(봇 기동 직후 on_ready 전 1~2틱의
     자기치유는 상한 안이라 그대로 산다).
+    **예산은 다이제스트 id 별로 따로 센다** — 세션 항목 둘이 같은 틱에 함께 도는데 예산을
+    공유하면 한쪽 장애가 다른 쪽 그날치를 통째로 삼킨다(로그에도 어느 쪽인지 남긴다).
     """
     with _notify_lock:
-        tries = _digest_attempts.get(today, 0) + 1
-        _digest_attempts.clear()  # 오늘 키 1개만 유지(어제 카운터 누증 방지)
-        _digest_attempts[today] = tries
+        key = (item_id, today)
+        tries = _digest_attempts.get(key, 0) + 1
+        for stale in [k for k in _digest_attempts if k[1] != today]:
+            del _digest_attempts[stale]  # 어제 것만 정리(clear 면 형제 카운터까지 날아간다)
+        _digest_attempts[key] = tries
         if tries >= DIGEST_MAX_ATTEMPTS:
-            log.warning("다이제스트 %s %d회 — 오늘은 재시도 중단", reason, tries)
+            log.warning("다이제스트 %s %s %d회 — 오늘은 재시도 중단", item_id, reason, tries)
             return
-        notify_fired.discard((item_id, today))
+        notify_fired.discard(key)
         save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
-        log.info("다이제스트 %s %d/%d — 다음 틱 재시도", reason, tries, DIGEST_MAX_ATTEMPTS)
+        log.info(
+            "다이제스트 %s %s %d/%d — 다음 틱 재시도", item_id, reason, tries, DIGEST_MAX_ATTEMPTS
+        )
 
 
 def _start_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -> None:
@@ -2206,7 +2227,7 @@ def _start_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -
     threading.Thread(
         target=_run_digest,
         args=(adapter, channel_id, item_id, today),
-        name="os-digest",
+        name=item_id,  # 스레드 이름 = 다이제스트 id(로그에서 어느 쪽이 도는지 구분)
         daemon=True,
     ).start()
 
@@ -2217,14 +2238,45 @@ def _run_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -> 
     fired 선기록은 그대로 둔다 — 25초 틱이 같은 다이제스트를 겹쳐 돌리는 것을 반드시 막아야
     하기 때문(수집·판정이 분 단위라 겹치면 API 낭비·중복 게시). 대신 파이프라인이 실패하면
     _revert_digest_fired 로 discard 해 다음 틱이 다시 잡게 한다(상한은 그 함수가 건다).
+    실행할 러너는 DIGEST_RUNNERS 에서 **이름으로** 찾는다(늦은 바인딩 — 그 상수 주석 참조).
     """
     try:
-        posted = run_opensource_digest(adapter, channel_id, today)
+        runner = globals()[DIGEST_RUNNERS[item_id]]
+        posted = runner(adapter, channel_id, today)
     except Exception as e:  # 데몬 스레드가 조용히 죽지 않게(타입만) — 실패로 취급해 되돌린다
         log.error("다이제스트 예외: %s", type(e).__name__)
         posted = False
     if not posted:
         _revert_digest_fired(item_id, today, "실패")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 📈 미국주식 다이제스트 (세션 1회 · #미국주식) — 전일 반도체·AI 재료
+# ══════════════════════════════════════════════════════════════════════════
+# 수집·계산·포매팅은 전부 us_digest 모듈이 한다(bridge 는 배선만). 오픈소스 다이제스트와 달리
+# **claude 를 부르지 않는다** — 판정이 아니라 재료 제공이라 LLM 이 낄 자리가 없다.
+def run_us_digest(adapter: Adapter, channel_id: int, today: str) -> bool:
+    """미국주식 카드 1장 게시. 반환 = 게시 성공 여부(False 면 다음 틱 재시도).
+
+    카드를 못 만든 경우(us_digest 가 None = MU 시세 실패)와 게시 실패를 둘 다 False 로 낸다 —
+    보유 종목 시세가 빠진 카드는 낼 이유가 없고, 죽은 소스 하나 때문에 그날치를 포기하지도
+    않는다(블록 단위 부분 실패는 us_digest 안에서 `조회 실패`로 흡수된다).
+    """
+    spec = us_digest.build_us_digest(today)
+    if spec is None:
+        return False
+    # text 는 카드를 못 그리는 어댑터용 폴백(디스코드는 card 만 쓴다) — 카드 스펙을 사람이
+    # 읽는 텍스트로 펴는 함수가 이미 있어 그대로 쓴다(드라이런과 같은 모양이 나온다).
+    # ⚠️ send 를 try/except 로 감싸지 마라 — **계약상 예외를 던지지 않는다**(§3.3: 플랫폼 오류는
+    # 어댑터가 삼키고 로그+None). 감싸면 그 except 가 죽은 코드가 되고 실패가 True 로 나가
+    # fired 가 유지된다 → 그날 카드 0장에 재시도도 에러도 없다(봇 기동 직후 이벤트루프 미준비
+    # 틱에서 실제로 난다). **성공 판정은 반환값으로만.**
+    posted = adapter.send(channel_id, _dryrun_card_text(spec, ""), None, card=spec)
+    if posted is None:
+        log.warning("미국주식 다이제스트 게시 실패 — 되돌려 다음 틱 재시도")
+        return False
+    log.info("미국주식 다이제스트 게시 완료")
+    return True
 
 
 # ── 🧪 드라이런(`python bridge.py --digest-dry-run [--ignore-seen]`) ────────────
@@ -2352,6 +2404,25 @@ def digest_dry_run(*, ignore_seen: bool = False, out: Path | None = None) -> int
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(text + "\n", encoding="utf-8")
     return rc
+
+
+def us_digest_dry_run() -> int:
+    """미국주식 다이제스트를 **게시 없이** 1회 조립해 stdout 으로 찍는다. 반환 = 종료코드.
+
+    라이브와 **같은 함수**(us_digest.build_us_digest)를 쓴다. 오픈소스 드라이런과 달리 상태
+    격리가 필요 없다 — seen·기각 같은 소모성 상태가 없고 유일한 쓰기인 SEC 요약 캐시는 하루 1회
+    재조회를 아끼는 것이라 라이브에도 이롭다. 그래서 출력 파일도 남기지 않는다(표준출력이면 충분).
+    """
+    today = datetime.now(_KST).date().isoformat()
+    started = time.monotonic()
+    spec = us_digest.build_us_digest(today)
+    took = time.monotonic() - started
+    if spec is None:
+        print(f"(카드 없음 — {us_digest.TICKER} 시세 조회 실패. 수집 {took:.1f}초)")
+        return 1
+    print(_dryrun_card_text(spec, ""))
+    print(f"[소요]     {took:.1f}초")
+    return 0
 
 
 def list_projects(target_root: str) -> list[str]:
@@ -4411,7 +4482,7 @@ def _selftest() -> None:
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         _selftest()
-    elif "--digest-dry-run" in sys.argv:
+    elif "--digest-dry-run" in sys.argv or "--us-digest-dry-run" in sys.argv:
         # Windows 콘솔 기본 코드페이지(cp949)는 `🧩` 를 못 찍어 print 가 죽는다 — 파일은 utf-8
         # 인데 stdout 때문에 리포트를 통째로 잃지 않게 여기서 콘솔만 utf-8 로 돌린다.
         _reconfigure = getattr(sys.stdout, "reconfigure", None)
@@ -4422,6 +4493,8 @@ if __name__ == "__main__":
         logging.basicConfig(
             level=logging.INFO, format="%(levelname)s %(message)s", stream=sys.stdout
         )
+        if "--us-digest-dry-run" in sys.argv:
+            sys.exit(us_digest_dry_run())
         sys.exit(digest_dry_run(ignore_seen="--ignore-seen" in sys.argv))
     else:
         sys.exit(main())

@@ -2717,7 +2717,9 @@ def test_fetch_rest_probe_builds_fixed_host_and_injects_body(monkeypatch):
         seen["method"] = req.get_method()
         return _Resp()
 
-    monkeypatch.setattr(bridge.urllib.request, "urlopen", _fake_urlopen)
+    # 맨 urlopen 이 아니라 **리다이렉트 미추종 opener** 를 쓴다 — 3xx 를 따라가면 host 고정이
+    # 무의미해지고, 이 응답은 그대로 claude 프롬프트에 주입된다(주입 경로).
+    monkeypatch.setattr(bridge._NOREDIRECT_OPENER, "open", _fake_urlopen)
     out = bridge.fetch_rest_probe("/api/indices")
     assert seen["url"] == "http://127.0.0.1:8000/api/indices"  # 고정 host 조립
     assert seen["method"] == "GET"
@@ -5161,7 +5163,7 @@ def test_dispatch_missing_channel_stops_after_max_attempts(digest_env, monkeypat
     for _ in range(bridge.DIGEST_MAX_ATTEMPTS + 3):
         bridge.dispatch_notifications(digest_env, [_SESSION_ITEM])
     assert ("os-digest", "2026-07-15") in bridge.notify_fired
-    assert bridge._digest_attempts["2026-07-15"] == bridge.DIGEST_MAX_ATTEMPTS
+    assert bridge._digest_attempts[("os-digest", "2026-07-15")] == bridge.DIGEST_MAX_ATTEMPTS
 
 
 def test_dispatch_plain_item_still_goes_to_alert_channel(digest_env, monkeypatch):
@@ -5625,7 +5627,7 @@ def test_real_schedules_four_alerts_fields_unchanged():
 def test_real_schedules_time_alerts_unaffected_by_session_ping(moment, expected):
     for ping in _PINGS:
         got = [it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), ping)]
-        assert [i for i in got if i != bridge.DIGEST_NOTIFY_ID] == expected, f"ping={ping!r}"
+        assert [i for i in got if i not in bridge.DIGEST_RUNNERS] == expected, f"ping={ping!r}"
 
 
 @_needs_real_schedules
@@ -5634,18 +5636,21 @@ def test_real_schedules_time_alerts_respect_fired():
     moment = datetime(2026, 7, 15, 22, 45, tzinfo=_KST)
     fired = {("ti-us-open", "2026-07-15")}
     assert due_notifications(_REAL_ITEMS, moment, fired, "2026-07-15") == [
-        it for it in _REAL_ITEMS if it["id"] == bridge.DIGEST_NOTIFY_ID
+        it for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS
     ]
 
 
 @_needs_real_schedules
 def test_real_schedules_digest_needs_session_ping_only():
-    # 다이제스트는 요일·시각과 무관 — 아무 창에도 안 걸리는 시각에도 오늘 핑이면 혼자 due.
+    # 다이제스트는 요일·시각과 무관 — 아무 창에도 안 걸리는 시각에도 오늘 핑이면 저희끼리 due.
+    # 배포본의 다이제스트 항목 **전부**(오픈소스·미국주식)가 같은 규칙으로 잡혀야 한다.
     moment = datetime(2026, 7, 15, 3, 0, tzinfo=_KST)
+    expected = [it["id"] for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
+    assert expected, "배포본에 다이제스트 항목이 하나도 없다"
     assert due_notifications(_REAL_ITEMS, moment, set(), None) == []
-    assert [it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), "2026-07-15")] == [
-        bridge.DIGEST_NOTIFY_ID
-    ]
+    assert [
+        it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), "2026-07-15")
+    ] == expected
 
 
 # ── ② on:"session" x 핑 값 경계 ─────────────────────────────────────────────
@@ -5846,7 +5851,8 @@ def test_run_digest_attempt_counter_resets_next_day(digest_env, monkeypatch):
     bridge.notify_fired.add(("os-digest", "2026-07-16"))
     bridge._run_digest(digest_env, 555, "os-digest", "2026-07-16")
     assert ("os-digest", "2026-07-16") not in bridge.notify_fired  # 새 날은 다시 되돌린다
-    assert bridge._digest_attempts == {"2026-07-16": 1}  # 카운터는 오늘 키 1개만
+    # 카운터 키는 (id, 날짜) 이고 어제 것은 정리된다 — 오늘 것만 남는다.
+    assert bridge._digest_attempts == {("os-digest", "2026-07-16"): 1}
 
 
 # ── ⑦ 버튼 — 중복 탭 · seen 왕복 · custom_id 한도 ───────────────────────────

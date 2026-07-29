@@ -13,6 +13,8 @@ logs/channel_map.json
 logs/channel_sessions.json
 logs/restart_notice.json
 logs/photos/
+logs/us_sec_facts.json
+logs/us_sec_facts.tmp
 
 # 의존성 (스택별)
 /vendor/

@@ -144,6 +144,9 @@ _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
     _CAT_SCHED: [("미국주식", "role", "미국주식"), ("오픈소스", "role", "오픈소스")],
     _CAT_SYSTEM: [("알림", "role", "알림"), ("봇상태", "role", "봇상태")],  # 하이픈 원천 제거
 }
+# 사람이 글을 못 쓰는 채널(tag 기준). **봇이 카드를 밀어넣기만 하고 왕복이 없는 곳만** 넣는다 —
+# `#오픈소스` 는 📌 버튼 상호작용이 있어 대상이 아니다(사용자: "매일 보는 용도로만 사용").
+_READONLY_TAGS = frozenset({"미국주식"})
 # 프로젝트 채널 내부 정본 순서(폴더명). 목록에 없는 프로젝트는 뒤로. h_* 를 맨 위(개발자 확정).
 _PROJECT_ORDER = [
     "pdf_restyler",
@@ -755,6 +758,14 @@ class DiscordAdapter:
                 if kind == "project":
                     project_chs.append(ch)
                 await self._rename_if_needed(ch, target)
+                if tag in _READONLY_TAGS:
+                    # 권한 편집은 봇에 '역할 관리' 권한이 있어야 한다 — 없으면 Forbidden 이다.
+                    # **여기서 예외가 새면 채널 자동생성 전체가 중단**되므로(실측: 매핑이 통째로
+                    # 폴백) 이 한 채널의 부가 설정 실패는 그 채널만 로그하고 넘어간다.
+                    try:
+                        await self._ensure_readonly(guild, ch)
+                    except discord.DiscordException as e:
+                        log.warning("읽기전용 설정 실패 %r(%s) — 계속", display, type(e).__name__)
         await self._ensure_voice(guild, new_map, cats.get(_CAT_VOICE), old_by_keytag, by_id)
         await self._reorder_projects(project_chs)  # #4 프로젝트 채널 내부 순서
         await self._order_categories(guild)  # #3 카테고리 순서
@@ -779,6 +790,27 @@ class DiscordAdapter:
             log.info("카테고리 리네임: %r → %r", cat.name, display)
             await cat.edit(name=display)
         return cat
+
+    async def _ensure_readonly(self, guild: Any, ch: Any) -> None:
+        """사람은 못 쓰고 **봇만 쓰는** 채널로 만든다(@everyone 쓰기 금지 · 봇 쓰기 허용). 멱등.
+
+        `#미국주식` 은 매일 카드를 읽기만 하는 채널이라 메시지 왕복이 없다(사용자 요청) —
+        사람이 쓴 글이 섞이면 카드 흐름이 끊긴다.
+        ⚠️ **봇 자신을 함께 잠그면 다이제스트가 못 나간다** → @everyone 만 막고 봇에는 명시 허용.
+        이미 그 상태면 아무것도 하지 않는다(재기동마다 감사 로그 금지 — 리네임과 같은 태도).
+        """
+        everyone, me = getattr(guild, "default_role", None), getattr(guild, "me", None)
+        if everyone is None or me is None:
+            log.warning("길드 역할 정보 없음 — 읽기전용 설정 스킵 %r", ch.name)
+            return
+        if (
+            ch.overwrites_for(everyone).send_messages is False
+            and ch.overwrites_for(me).send_messages is True
+        ):
+            return  # 멱등 — 이미 적용됨
+        await ch.set_permissions(everyone, send_messages=False)
+        await ch.set_permissions(me, send_messages=True)  # 봇은 반드시 먼저 풀어둔다
+        log.info("채널 읽기전용 설정: %r id=%s", ch.name, ch.id)
 
     async def _rename_if_needed(self, ch: Any, target: str) -> None:
         """정확 이름 비교 best-effort 리네임(같으면 skip). 실패는 로그+기존명 보존(매핑 유지)."""

@@ -1,0 +1,16 @@
+This product bundles software from:
+
+  anthropics/financial-services
+  https://github.com/anthropics/financial-services
+  Copyright Anthropic, PBC.
+  Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Bundled file (verbatim, unmodified):
+  skills/earnings-preview/SKILL.md
+    from plugins/vertical-plugins/equity-research/skills/earnings-preview/SKILL.md
+    at commit eb0c1ea962d4c6cee07f4920e36b1aa7a025d320 (2026-07-22), vendored 2026-07-29
+    sha256 a30d383a6f1c06b732b4d34e422dd2ff18f6340db67229a3347d057d52697f33
+
+No changes were made to the bundled file. It is kept byte-identical on purpose:
+a leading comment would precede the YAML frontmatter that Claude Code parses,
+and would also make the 'unmodified' statement false.

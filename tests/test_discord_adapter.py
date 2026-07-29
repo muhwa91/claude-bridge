@@ -895,14 +895,28 @@ def test_message_event_unmapped_falls_back_to_channel_name():
     assert ev.project == "trading_info" and ev.channel_role is None
 
 
+class _FakeOverwrite:
+    def __init__(self, send_messages=None):
+        self.send_messages = send_messages
+
+
 class _FakeChannel:
-    def __init__(self, cid, name, position=0, reject_rename=False):
+    def __init__(self, cid, name, position=0, reject_rename=False, overwrites=None):
         self.id = cid
         self.name = name
         self.position = position
         self.deleted = False
         self.reject_rename = reject_rename  # 디스코드 이름 거부 시나리오
         self.renames = []  # edit(name=…) 시도 기록
+        self.overwrites = dict(overwrites or {})  # target → send_messages(True/False/None)
+        self.perm_calls = []  # set_permissions 호출 기록(멱등 확인용)
+
+    def overwrites_for(self, target):
+        return _FakeOverwrite(self.overwrites.get(target))
+
+    async def set_permissions(self, target, **kwargs):
+        self.perm_calls.append((target, kwargs))
+        self.overwrites[target] = kwargs.get("send_messages")
 
     async def edit(self, *, name=None, position=None, **_kwargs):
         if name is not None:
@@ -944,6 +958,8 @@ class _FakeGuild:
         self.created = []  # (name, topic) — 텍스트 생성
         self.voice_created = []  # 음성 생성 name
         self._next = 1000
+        self.default_role = "@everyone"  # 권한 오버라이트 대상(읽기전용 채널)
+        self.me = "bot"  # 봇 자신 — 함께 잠기면 다이제스트가 못 나간다
 
     @property
     def channels(self):  # by_id 용(텍스트+음성 — 카테고리 id 는 매핑에 불필요)
@@ -1299,6 +1315,32 @@ def test_scheduler_channels_created_and_mapped(monkeypatch):
     assert {"미국주식", "오픈소스"} <= created
     assert a.role_channel("미국주식") is not None and a.role_channel("오픈소스") is not None
     assert any(discord_adapter._cat_core(c.name) == "스케쥴러" for c in guild.categories)
+
+
+def test_us_channel_is_readonly_for_people_but_writable_by_bot(monkeypatch):
+    # #미국주식 은 읽기 전용(사용자: "매일 보는 용도로만"). **봇까지 잠그면 카드가 못 나간다.**
+    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    a.setup_channels([])
+    guild = _guild_for(a)
+    asyncio.run(a._ensure_channels())
+    ch = next(c for c in guild.text_channels if c.name == "미국주식")
+    assert ch.overwrites["@everyone"] is False  # 사람은 못 쓴다
+    assert ch.overwrites["bot"] is True  # 봇은 쓴다
+    others = [c for c in guild.text_channels if c.name in ("오픈소스", "알림")]
+    assert others and all(c.perm_calls == [] for c in others)  # 다른 채널은 안 건드린다
+
+
+def test_us_channel_readonly_is_idempotent(monkeypatch):
+    # 이미 적용돼 있으면 아무것도 하지 않는다(재기동마다 감사 로그를 남기지 않게).
+    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    a.setup_channels([])
+    ch = _FakeChannel(777, "미국주식", overwrites={"@everyone": False, "bot": True})
+    a._channel_map = {777: ("role", "미국주식")}
+    _guild_for(a, text_channels=[ch])
+    asyncio.run(a._ensure_channels())
+    assert ch.perm_calls == []
 
 
 def test_categories_created_with_emoji(monkeypatch):

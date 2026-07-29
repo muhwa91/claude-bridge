@@ -12,6 +12,7 @@
 """
 
 import json
+import re
 import urllib.error
 from datetime import date, datetime
 
@@ -57,9 +58,25 @@ def _isolate_sec_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(us_digest, "SEC_CACHE_FILE", tmp_path / "us_sec_facts.json")
 
 
+# `_no_claude` autouse 픽스처가 `us_digest.llm_analyze` 를 스텁으로 갈아끼운다 → **그 함수 자체를
+# 시험하는 테스트**는 import 시점의 진짜 함수를 붙잡아 둬야 한다(스텁을 부르면 아무것도 못 본다).
+_REAL_LLM_ANALYZE = us_digest.llm_analyze
+
+
 def _line(text: str, prefix: str) -> str:
     """포맷 결과에서 그 접두어로 시작하는 줄 1개(없으면 "")."""
-    return next((ln for ln in text.split("\n") if ln.startswith(prefix)), "")
+    return next(
+        (ln for ln in text.strip().split("\n") if ln.strip().startswith(prefix)), ""
+    ).strip()
+
+
+def _norm(text: str) -> str:
+    """연속 공백을 한 칸으로 접은 문자열.
+
+    카드는 표시폭 정렬(한글 2칸)로 라벨·값 사이 공백 수가 값 길이에 따라 달라진다 →
+    **의미를 보는 단언은 정렬 공백에 걸리면 안 된다**(정렬 자체는 별도 테스트가 본다).
+    """
+    return re.sub(r"[ \t]+", " ", text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -299,7 +316,8 @@ def test_valuations_loss_quarters_yield_negative_pe_marked_as_loss():
     def _q(eps: float) -> list[dict]:
         return [{"end": f"2026-0{i + 1}-28", "rev": 1e10, "eps": eps} for i in range(4)]
 
-    assert "P/E TTM -25.0(적자)" in fmt_fundamentals({"quarters": _q(-1.0)}, 100.0, None, None)[0]
+    loss = _norm(fmt_fundamentals({"quarters": _q(-1.0)}, 100.0, None, None)[0])
+    assert "P/E TTM -25.0(적자)" in loss
     assert "(적자)" not in fmt_fundamentals({"quarters": _q(1.0)}, 100.0, None, None)[0]
 
 
@@ -446,8 +464,9 @@ def test_fit_skips_oversized_line_but_keeps_later_short_ones():
     assert fit(["A" * 10, "B" * 10, "C"], 13) == "A" * 10 + "\nC"
 
 
-def test_fit_drops_empty_lines():
-    assert fit(["", "A", "", "B"], 100) == "A\nB"
+def test_fit_keeps_blank_lines_as_separators():
+    # 빈 줄은 **의도적 구분자**다(fmt_korea 가 종목과 해설 사이에 쓴다) → 살려야 한다.
+    assert fit(["", "A", "", "B"], 100) == "\nA\n\nB"
 
 
 def test_fit_never_exceeds_limit():
@@ -682,7 +701,8 @@ def test_surprise_consumers_agree_on_the_same_quarter():
     out = us_digest.fmt_earnings(rows, None, [], date(2026, 7, 29))
     # 다음 발표 추정의 기준 = 가장 나중 발표일 · 서프라이즈 첫 항목 = 같은 분기
     assert _next_earnings(rows, date(2026, 7, 29))[0] == "2026-09-24"
-    assert f"서프라이즈 {latest['fiscalQtrEnd']}" in out
+    assert f"서프라이즈 {us_digest.ko_month(latest['fiscalQtrEnd'])}" in out
+    assert "May" not in out  # 영문 월은 카드에 남지 않는다
 
 
 def test_next_earnings_uses_latest_row_not_first():
@@ -694,9 +714,11 @@ def test_next_earnings_uses_latest_row_not_first():
 
 def test_fmt_earnings_says_unknown_when_estimate_date_passed():
     # 추정일이 지났는데 이력이 안 갱신됐다 → 지난 날짜를 "다음 발표"로 내면 거짓이다.
-    out = us_digest.fmt_earnings([{"dateReported": "1/15/2026"}], None, [], date(2026, 7, 29))
-    assert "다음 발표 미정" in out and "경과" in out
-    assert "D-" not in out.split("\n")[0]  # 음수 D-day 표기(`D--104`)가 새어나가지 않는다
+    rows = [{"dateReported": "1/15/2026"}]
+    out = _norm(us_digest.fmt_earnings(rows, None, [], date(2026, 7, 29)))
+    assert "실적 발표일 미정" in out  # ▸ 요약
+    assert "다음 발표 미정 (추정일 2026년 4월 16일 경과)" in out  # 세부 행
+    assert "D-" not in out  # 음수 D-day 표기(`D--104`)가 어디에도 새어나가지 않는다
 
 
 def test_parse_short_interest_latest_two():
@@ -767,14 +789,16 @@ def test_parse_news_truncates_title_and_limits():
 # ═══════════════════════════════════════════════════════════════════════════
 def test_form4_none_says_failed_not_none_found():
     # 인덱스를 못 받았는데 "없음"이라고 쓰면 카드가 거짓말을 한다(§4-4·§4-6 의 핵심).
-    line = _line(fmt_flows(None, None, None, None, None), "Form 4")
-    assert line == f"Form 4 {FAIL}"
+    line = _norm(_line(fmt_flows(None, None, None, None, None), "내부자 Form 4"))
+    assert line == f"내부자 Form 4 {FAIL}"
     assert "없음" not in line
 
 
 def test_form4_empty_says_none_found_not_failed():
-    line = _line(fmt_flows(None, [], None, None, None), "Form 4")
-    assert line == "Form 4 없음"
+    out = fmt_flows(None, [], None, None, None)
+    assert "내부자 신고 없음" in out  # ▸ 요약 줄
+    line = _norm(_line(out, "내부자 Form 4"))
+    assert line == "내부자 Form 4 없음"
     assert FAIL not in line
 
 
@@ -786,17 +810,18 @@ def test_form4_rows_show_count_owner_and_code_note():
         None,
         None,
     )
-    assert _line(out, "Form 4") == "Form 4 2건 — MEHROTRA SANJAY(MS)"  # 건수 2, 표시는 중복 제거
+    assert _norm(_line(out, "내부자 Form 4")) == "내부자 Form 4 2건"  # 건수는 2
+    assert _norm(_line(out, "신고자")) == "신고자 MEHROTRA SANJAY(MS)"  # 표시는 중복 제거
     assert "매도 우위가 곧 악재는 아니다" in out  # 옵션행사분이 섞인다는 주석은 항상 붙는다
 
 
 def test_eightk_none_says_failed_and_empty_says_none_found():
-    assert _line(fmt_filings(None, []), "8-K") == f"8-K {FAIL}"
-    empty = _line(fmt_filings({"day": "2026-07-28", "total": 323, "8-K": []}, []), "8-K")
-    assert empty == "8-K 없음 (2026-07-28 전체 323건 중 해당 없음)"
+    assert _norm(_line(fmt_filings(None, []), "8-K")) == f"8-K {FAIL}"
+    empty = _norm(_line(fmt_filings({"day": "2026-07-28", "total": 323, "8-K": []}, []), "8-K"))
+    assert empty == "8-K 없음 (2026년 7월 28일 전체 323건 중)"
     assert FAIL not in empty
-    hit = _line(fmt_filings({"day": "2026-07-28", "total": 323, "8-K": ["p"]}, []), "8-K")
-    assert hit == "8-K 1건 (2026-07-28 접수)"
+    hit = _norm(_line(fmt_filings({"day": "2026-07-28", "total": 323, "8-K": ["p"]}, []), "8-K"))
+    assert hit == "8-K 1건 (2026년 7월 28일 접수)"
 
 
 def test_filings_news_failure_is_separate_from_8k():
@@ -820,11 +845,29 @@ def test_filings_rejects_url_that_could_forge_a_second_link():
     assert "정상 제목" in out and "Reuters" in out
 
 
-def test_filings_keeps_normal_link_and_escapes_title():
+def test_filings_never_renders_links():
+    # 링크는 싣지 않는다(사용자: 영문 링크는 어차피 안 읽는다) — 제목·출처만.
     news = [{"title": "MU [속보] 실적", "publisher": "P", "link": "https://ok.example/a?b=1&c=2"}]
     out = fmt_filings({"day": "2026-07-28", "total": 1, "8-K": []}, news)
-    assert "(https://ok.example/a?b=1&c=2)" in out
-    assert "[MU (속보) 실적]" in out  # 제목 안 대괄호는 링크를 깨뜨리므로 치환된다
+    assert "http" not in out and "](" not in out
+    assert "MU (속보) 실적" in out  # 대괄호는 치환된 채 제목은 그대로 남는다
+
+
+def test_filings_uses_korean_summaries_when_available():
+    news = [{"title": "Micron beats", "publisher": "Reuters", "link": "https://x/y"}]
+    out = fmt_filings(
+        {"day": "2026-07-28", "total": 1, "8-K": []}, news, ["마이크론이 실적을 냈다"]
+    )
+    assert "· 마이크론이 실적을 냈다 (Reuters)" in out
+    assert "Micron beats" not in out and "요약 실패" not in out
+
+
+def test_filings_falls_back_to_original_titles_and_says_so():
+    # 조용히 비우지 않는다 — 원문을 싣고 **요약이 실패했다는 사실**을 카드에 적는다.
+    news = [{"title": "Micron beats", "publisher": "Reuters", "link": "https://x/y"}]
+    for summaries in (None, ["줄", "이", "안맞음"]):
+        out = fmt_filings({"day": "2026-07-28", "total": 1, "8-K": []}, news, summaries)
+        assert "Micron beats" in out and "한글 요약 실패" in out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -846,7 +889,7 @@ _FX_QUOTE = {"symbol": "KRW=X", "price": 1464.4, "prev": 1460.0, "pct": 0.3, "ba
 def test_fmt_price_without_fx_marks_only_that_line():
     out = fmt_price(_MU_QUOTE, None)
     assert "$820.53" in out and "-8.85%" in out
-    assert f"원화환산 {FAIL}(환율)" in out
+    assert f"원화 환산 {FAIL}(환율)" in out
     assert "52주" in out  # 나머지 줄은 살아 있다
 
 
@@ -862,10 +905,10 @@ def test_fmt_price_missing_52w_skips_that_line_only():
 
 
 def test_fmt_expectation_partial_failures():
-    assert f"목표가 {FAIL}" in fmt_expectation_target_none()
-    both = us_digest.fmt_expectation(None, None)
-    assert f"목표가 {FAIL}" in both and f"추정치 조정 {FAIL}" in both
-    assert "괴리가 벌어진 상태" in both  # 해설 주석은 실패해도 남는다
+    assert f"목표가 {FAIL}" in _norm(fmt_expectation_target_none())
+    both = _norm(us_digest.fmt_expectation(None, None))
+    assert f"목표가 {FAIL}" in both and f"조정 {FAIL}" in both
+    assert f"컨센서스 {FAIL}" in both  # ▸ 요약도 실패를 그대로 말한다
 
 
 def fmt_expectation_target_none():
@@ -875,13 +918,14 @@ def fmt_expectation_target_none():
 def test_fmt_expectation_shows_zero_adjustments_verbatim():
     # 상향 0 / 하향 0 이 최고 신호(§4-3) — 0 을 falsy 로 취급해 감추면 안 된다.
     out = us_digest.fmt_expectation(parse_targetprice(_TARGETPRICE), parse_forecast(_FORECAST))
-    assert "최근 4주 추정치 상향 0 · 하향 0" in out
-    assert "2026-06 $1,036 → 2026-07 $1,569" in out
+    assert "최근 4주 상향 0 · 하향 0" in _norm(out)
+    assert "06월 $1,036 → 07월 $1,569" in out
+    assert "추정치 조정은 0건 — 기대치는 그대로다" in out  # ▸ 요약이 그날 값에서 만들어진다
 
 
 def test_fmt_earnings_all_sources_dead():
-    out = us_digest.fmt_earnings([], None, [], date(2026, 7, 29))
-    assert f"다음 발표일 {FAIL}" in out and f"서프라이즈 {FAIL}" in out
+    out = _norm(us_digest.fmt_earnings([], None, [], date(2026, 7, 29)))
+    assert f"다음 발표 {FAIL}" in out and f"서프라이즈 {FAIL}" in out
 
 
 def test_fmt_fundamentals_no_facts():
@@ -898,15 +942,15 @@ def test_fmt_fundamentals_mcap_crosscheck_warns_only_beyond_tolerance():
         "shares": 1_000_000_000,
     }
     ok_field, ok_warn = fmt_fundamentals(facts, 100.0, None, 100e9)  # SEC 100B vs Nasdaq 100B
-    assert ok_warn == "" and "시총 SEC 100.0B" in ok_field
+    assert ok_warn == "" and "SEC 100.0B" in _norm(ok_field)
     _bad_field, bad_warn = fmt_fundamentals(facts, 100.0, None, 50e9)  # 2배 차이
     assert "시총 교차검증 불일치" in bad_warn
 
 
 def test_fmt_fundamentals_ttm_failed_when_quarters_short():
     facts = {"quarters": [{"end": "2025-08-31", "rev": 1e10, "eps": 6.0}], "shares": 0}
-    field, _warn = fmt_fundamentals(facts, 100.0, None, None)
-    assert f"TTM {FAIL}" in field  # 1분기뿐이면 TTM 을 지어내지 않는다
+    field = _norm(fmt_fundamentals(facts, 100.0, None, None)[0])
+    assert f"P/E TTM {FAIL}" in field  # 1분기뿐이면 TTM 을 지어내지 않는다
     assert "최근분기 연율" in field
 
 
@@ -922,9 +966,10 @@ def test_fmt_korea_skhy_marks_ipo_age_and_skips_period_compare():
         "000660.KS": {"price": 512000.0, "pct": -10.52},
         "SKHY": {"price": 41.2, "pct": -8.98, "bars": 13, "high": 55.0},
     }
-    out = fmt_korea(quotes, None)
+    out = _norm(fmt_korea(quotes, None))
     assert "[상장 13일차]" in out
     assert "고점 대비 -25.1%" in out
+    assert "SK하이닉스 (SKHY)" in out  # 티커만으로는 어느 회사인지 안 읽힌다
 
 
 def test_fmt_korea_skhy_no_ipo_tag_after_enough_bars():
@@ -935,15 +980,18 @@ def test_fmt_korea_skhy_no_ipo_tag_after_enough_bars():
 def test_fmt_korea_skhy_forecast_always_states_estimate_count():
     # 추정인원 1~2명을 MU(12명)와 같은 무게로 읽으면 안 된다 → 인원 병기가 사라지면 안 됨.
     forecast = {"year": {"consensusEPSForecast": "2.10", "fiscalEnd": "Dec", "noOfEstimates": 2}}
-    out = fmt_korea({}, forecast)
-    assert "추정 2인" in out and "대표성은 낮다" in out
+    out = _norm(fmt_korea({}, forecast))
+    assert "추정 인원 2인" in out and "대표성은 낮다" in out
 
 
 def test_fmt_sector_partial_quotes():
-    out = fmt_sector({"^SOX": {"pct": -3.2}, "NVDA": {"pct": -2.1}})
-    assert "SOX -3.2%" in out and f"SMH {FAIL}" in out and "NVDA -2.1%" in out
+    quotes = {"^SOX": {"pct": -3.2}, "NVDA": {"pct": -2.1}}
+    out = fmt_sector(quotes)
+    assert "엔비디아 (NVDA) -2.1%" in out  # 한 줄에 한 종목 · 주식명(티커)
     assert "AMD" not in out  # 죽은 종목은 목록에서 빠지되(한 줄이 실패로 도배되지 않게)
     assert f"(8종 {FAIL})" in out  # 몇 종이 빠졌는지는 꼬리로 남는다
+    assert "SOX" not in out  # 지수 줄은 렌더에서 빠졌다(값 계산은 index_line 이 유지)
+    assert us_digest.index_line(quotes) == f"SOX -3.2% · SMH {FAIL}"
 
 
 def test_fmt_sector_all_dead():
@@ -952,24 +1000,26 @@ def test_fmt_sector_all_dead():
 
 
 def test_fmt_flows_all_dead():
-    out = fmt_flows(None, None, None, None, None)
-    for prefix in ("공매도", "Form 4", "레딧 언급", "심리지표"):
-        assert f"{prefix} {FAIL}" in out or _line(out, prefix).endswith(FAIL)
+    out = _norm(fmt_flows(None, None, None, None, None))
+    for prefix in ("공매도 잔고", "내부자 Form 4", "레딧 언급", "심리지표"):
+        assert f"{prefix} {FAIL}" in out
 
 
 def test_fmt_flows_fear_greed_omits_missing_previous_close():
     # 공포탐욕에서 **0 은 결측이 아니라 "극단적 공포"라는 실값**이다 → `or 0` 으로 채우면
     # 하루 만에 극단공포→중립으로 튄 것처럼 읽힌다. 없으면 아예 안 적는다.
-    out = fmt_flows(None, None, None, {"score": 40.0, "rating": "fear"}, None)
-    assert "공포탐욕 40 fear" in out and "전일" not in out
-    zero = fmt_flows(None, None, None, {"score": 40.0, "rating": "f", "previous_close": 0}, None)
-    assert "(전일 0)" in zero  # 진짜 0 은 표기한다
+    out = _norm(fmt_flows(None, None, None, {"score": 40.0, "rating": "fear"}, None))
+    assert "공포탐욕 40 (fear)" in out and "전일" not in out
+    zero = _norm(
+        fmt_flows(None, None, None, {"score": 40.0, "rating": "f", "previous_close": 0}, None)
+    )
+    assert "전일 0" in zero  # 진짜 0 은 표기한다
 
 
 def test_fmt_flows_form4_shows_index_day():
     # 인덱스가 하루 이상 거슬러 올라갔을 때 이틀 전 내부자거래가 오늘 것처럼 보이면 안 된다.
-    out = fmt_flows(None, [{"owner": "A", "codes": "S"}], None, None, None, "2026-07-28")
-    assert "Form 4 1건 (2026-07-28)" in out
+    out = _norm(fmt_flows(None, [{"owner": "A", "codes": "S"}], None, None, None, "2026-07-28"))
+    assert "내부자 Form 4 1건 (2026년 7월 28일)" in out
 
 
 def test_fmt_flows_missing_reddit_keys_do_not_print_none():
@@ -1244,6 +1294,16 @@ class _FakeNet:
         return b""
 
 
+@pytest.fixture(autouse=True)
+def _no_claude(monkeypatch):
+    """**LLM seam 차단** — 뉴스 요약은 이 모듈에서 유일하게 claude 를 부르는 곳이다.
+
+    막지 않으면 통합 테스트가 실제 claude CLI 를 띄워 스위트가 분 단위로 늘어난다(실측 4분 30초).
+    기본값 None = 요약 실패 → 원문 폴백 경로. 요약 성공 경로는 그 테스트가 직접 덮어쓴다.
+    """
+    monkeypatch.setattr(us_digest, "llm_analyze", lambda _items, _facts: (None, None))
+
+
 @pytest.fixture
 def net(monkeypatch):
     """네트워크 seam 을 통째로 가짜로. 반환값을 통해 drop 을 조정한다."""
@@ -1254,14 +1314,372 @@ def net(monkeypatch):
 
 
 @pytest.mark.usefixtures("net")
-def test_build_us_digest_full_card():
+@pytest.mark.usefixtures("net")
+def test_every_block_ends_with_an_interpretation_line():
+    """**8블록 전부** 마지막이 빈 줄 + `↳ 해석` 으로 끝난다(사용자 요청).
+
+    이 마지막 줄은 숫자 되풀이가 아니라 "그래서 무슨 뜻인가"다 → 그날 값에서 만들어지므로
+    고정 문구가 아닌지도 함께 본다(값이 다른 두 입력이 다른 문장을 내는지는 아래 단위 테스트).
+    """
     spec = build_us_digest("2026-07-29")
     assert spec is not None
-    assert spec["title"] == "📈 미국주식 2026-07-29 · MU $820.53 -8.85%"
+    for name, value, _inline in spec["fields"]:
+        tail = value.split("\n")
+        assert tail[-1].startswith("↳ "), f"{name} 마지막 줄이 해석이 아니다: {tail[-1]!r}"
+        assert tail[-2] == "", f"{name} 해석 앞에 빈 줄이 없다"
+
+
+# ── 마지막 `↳ 해석` 의 **경계값** ─────────────────────────────────────────────
+# 2026-07-29 검수에서 섹터 임계값이 8/9 하락을 "혼조"로 읽어 같은 블록의 `▸` 와 모순됐다.
+# 하나가 틀렸다는 건 나머지도 경계에서 틀릴 수 있다는 뜻 → **8블록 전부 경계 양쪽을 못박는다.**
+def _closing(text: str) -> str:
+    """블록 마지막 줄(= `↳ 해석`)."""
+    return text.split("\n")[-1]
+
+
+@pytest.mark.parametrize(
+    ("down", "must"),
+    [
+        (9, "전부 같이 빠졌다"),  # 전량
+        (8, "거의 다 빠졌다"),  # ← 검수에서 "혼조"로 나오던 자리
+        (7, "거의 다 빠졌다"),  # 7/9=0.78 ≥ 0.75
+        (6, "섞였다"),  # 6/9=0.67 < 0.75 — 경계 반대쪽
+        (3, "섞였다"),
+        (2, "거의 다 올랐다"),  # 2/9 하락 = 0.78 상승
+        (0, "전부 같이 올랐다"),
+    ],
+)
+def test_sector_closing_matches_the_headline_count(down, must):
+    quotes = {s: {"pct": -1.0 if i < down else 1.0} for i, s in enumerate(us_digest.SECTOR)}
+    out = fmt_sector(quotes)
+    assert f"9종 중 {down}종 하락" in out.split("\n")[0]  # ▸ 요약
+    assert must in _closing(out), _closing(out)  # ↳ 해석이 그 요약과 어긋나면 안 된다
+
+
+@pytest.mark.parametrize(
+    ("change", "fx_pct", "must"),
+    [
+        (-8.85, -0.8, "같은 방향"),  # 실측일
+        (-8.85, 0.8, "반대로 움직여"),
+        (-8.85, 0.0, "환율이 그대로라"),  # 곱셈 부호로는 못 가르던 경계
+        (0.0, -0.8, "주가는 제자리인데"),  # 〃
+        (0.0, 0.0, "환율이 그대로라"),
+    ],
+)
+def test_price_closing_separates_zero_cases(change, fx_pct, must):
+    quote = {"price": 100.0, "prev": 100.0, "pct": change, "w52h": 200.0, "w52l": 50.0}
+    assert must in _closing(fmt_price(quote, {"price": 1400.0, "pct": fx_pct}))
+
+
+@pytest.mark.parametrize(
+    ("reported", "must"),
+    [
+        ("4/30/2026", "발표까지"),  # 미래(D>0)
+        ("4/29/2026", "오늘이 발표 예정일"),  # D-0 경계 — 91일 뒤가 오늘
+        ("4/28/2026", "정해지지 않아"),  # 지남(D<0)
+    ],
+)
+def test_earnings_closing_handles_d_day_zero(reported, must):
+    rows = [{"dateReported": reported}]
+    assert must in _closing(us_digest.fmt_earnings(rows, None, [], date(2026, 7, 29)))
+
+
+@pytest.mark.parametrize(
+    ("now_inv", "must"),
+    [(7e9, "줄었다"), (9e9, "늘었다"), (8e9, "제자리")],
+)
+def test_fundamentals_closing_follows_inventory_direction(now_inv, must):
+    facts = {
+        "quarters": [
+            {"end": "2026-02-28", "rev": 1e10, "inv": 8e9},
+            {"end": "2026-05-31", "rev": 1e10, "inv": now_inv},
+        ],
+        "shares": 0,
+    }
+    assert must in _closing(fmt_fundamentals(facts, 100.0, None, None)[0])
+
+
+@pytest.mark.parametrize(
+    ("score", "must"),
+    [
+        (44.0, "겁먹은 구간"),
+        (45.0, "중립"),  # 경계 — CNN 중립 구간 시작
+        (55.0, "중립"),  # 경계 — 중립 구간 끝
+        (56.0, "낙관 구간"),
+    ],
+)
+def test_flows_closing_uses_cnn_bands(score, must):
+    assert must in _closing(fmt_flows(None, None, None, {"score": score, "rating": "x"}, None))
+
+
+@pytest.mark.parametrize(
+    ("index", "must"),
+    [
+        ({"day": "2026-07-28", "total": 10, "8-K": []}, "회사가 낸 공시가 없다"),
+        ({"day": "2026-07-28", "total": 10, "8-K": ["p"]}, "회사가 직접 낸 발표가 있다"),
+        (None, "확인하지 못해"),
+    ],
+)
+def test_filings_closing_follows_8k_presence(index, must):
+    assert must in _closing(fmt_filings(index, []))
+
+
+@pytest.mark.parametrize(
+    ("kospi_pct", "must"),
+    [
+        (-8.0, "다르게 움직였다"),  # SKHY -7.0 대비 1.0%p 차 — 경계(임계값 이상)
+        (-7.9, "거의 같은 폭"),  # 0.9%p 차 — 경계 반대쪽
+        (-9.61, "다르게 움직였다"),  # 2.61%p 차
+    ],
+)
+def test_korea_closing_thresholds_market_gap(kospi_pct, must):
+    quotes = {
+        "SKHY": {"price": 130.0, "pct": -7.0, "bars": 13, "high": 190.0},
+        "000660.KS": {"price": 1_400_000.0, "pct": kospi_pct},
+        "005930.KS": {"price": 208_500.0, "pct": -5.2},
+    }
+    assert must in _closing(fmt_korea(quotes, None))
+
+
+@pytest.mark.parametrize(
+    ("up", "down", "must"),
+    [(0, 0, "아직 그대로"), (0, 3, "내려오는 중"), (2, 0, "올라가는 중"), (1, 1, "갈렸다")],
+)
+def test_closing_line_follows_the_days_numbers(up, down, must):
+    # 고정 문구를 박으면 값이 반대로 움직인 날 거짓이 된다 → 같은 함수가 값에 따라 다른 문장을 낸다.
+    forecast = {"quarter": {"up": up, "down": down, "fiscalEnd": "Aug 2026", "noOfEstimates": 9}}
+    assert must in us_digest.fmt_expectation(None, forecast).split("\n")[-1]
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        ("May 2026", "2026년 5월"),
+        ("Aug 2026", "2026년 8월"),
+        ("Dec 2026", "2026년 12월"),
+        ("2026년 5월", "2026년 5월"),  # 이미 한글이면 그대로
+        ("Dec", "Dec"),  # 못 읽으면 **원문 그대로**(빈 값·거짓 날짜 금지)
+        ("", ""),
+    ],
+)
+def test_ko_month(raw, want):
+    assert us_digest.ko_month(raw) == want
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        ("2026-09-23", "2026년 9월 23일"),
+        ("07/15/2026", "2026년 7월 15일"),
+        ("2026-07-28", "2026년 7월 28일"),
+        ("not a date", "not a date"),
+        ("2026/13", "2026/13"),
+        ("", ""),
+    ],
+)
+def test_ko_date(raw, want):
+    assert us_digest.ko_date(raw) == want
+
+
+def test_ko_date_without_year_and_session_words():
+    assert us_digest.ko_date("2026-07-29", with_year=False) == "7월 29일"
+    assert us_digest.ko_session("time-after-hours") == "장마감 후"
+    assert us_digest.ko_session("time-pre-market") == "장전"
+    assert us_digest.ko_session("time-weird") == "weird"  # 모르는 값은 원문
+
+
+def test_llm_analyze_returns_none_without_claude(monkeypatch):
+    # claude CLI 가 없으면 조용히 (None, None) → 호출측이 원문 폴백. 카드 전체가 죽으면 안 된다.
+    monkeypatch.setattr(us_digest.shutil, "which", lambda _n: None)
+    assert _REAL_LLM_ANALYZE([{"title": "T", "publisher": "P", "link": ""}], []) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("d_day", "want"),
+    [
+        (None, False),  # 발표일 미상 — 무엇을 앞두고 쓰는 글인지 불분명
+        (-1, False),  # 추정일 경과
+        (0, True),  # 오늘 발표 — 이 카드가 제일 필요한 날
+        (7, True),  # 경계(포함)
+        (8, False),  # 경계 밖
+        (56, False),  # 실측일 — 여기서 빈 문장이 나왔다
+    ],
+)
+def test_skill_window_boundaries(d_day, want):
+    assert us_digest.skill_window(d_day) is want
+
+
+def test_llm_prompt_drops_the_earnings_section_outside_the_window():
+    items = [{"title": "T", "publisher": "P", "link": ""}]
+    outside = us_digest.build_llm_prompt(items, None)
+    assert "[실적]" not in outside and us_digest.SKILL_NAME not in outside
+    inside = us_digest.build_llm_prompt(items, ["다음 발표일 2026년 8월 4일 추정 (D-6)"])
+    assert "[실적]" in inside and us_digest.SKILL_NAME in inside
+
+
+def test_llm_prompt_bans_empty_recommendations():
+    # D-56 실측에서 나온 "지켜보면 된다"·"확인하면 된다" 류를 프롬프트가 직접 금지한다.
+    prompt = us_digest.build_llm_prompt(
+        [{"title": "T", "publisher": "P", "link": ""}], ["컨센서스 EPS $31.17"]
+    )
+    for banned in ("지켜보면 된다", "확인하면 된다", "살필 지표다", "관전 포인트다"):
+        assert banned in prompt  # 금지어 목록에 들어 있어야 한다
+    assert "수치나 비교가 없는 줄은 쓰지 마라" in prompt
+    assert f"최대 {us_digest.EARNINGS_LINE_MAX}줄" in prompt
+
+
+@pytest.mark.parametrize(
+    ("earnings", "want_tools"), [(None, []), ([], []), (["컨센서스 EPS $1"], ["Skill"])]
+)
+def test_llm_analyze_opens_the_skill_tool_only_inside_the_window(
+    monkeypatch, tmp_path, earnings, want_tools
+):
+    """창 밖이면 **도구도 주지 않는다** — 필요 없을 때 열어둘 이유가 없다(권한 최소화)."""
+    seen: dict = {}
+
+    def fake_run(_exe, cwd, _prompt, _timeout, **kwargs):
+        seen["cwd"], seen["tools"] = cwd, kwargs.get("allowed_tools")
+        return {"result": "[뉴스]\n1. 요약"}
+
+    monkeypatch.setattr(us_digest.shutil, "which", lambda _n: "claude")
+    monkeypatch.setattr(bridge, "run_claude", fake_run)
+    monkeypatch.setattr(bridge, "US_DIGEST_SANDBOX_DIR", tmp_path)
+    _REAL_LLM_ANALYZE([{"title": "T", "publisher": "P", "link": ""}], earnings)
+    assert seen["tools"] == want_tools
+    # 스킬 파일도 창 안일 때만 심는다
+    placed = (tmp_path / ".claude" / "skills" / us_digest.SKILL_NAME / "SKILL.md").exists()
+    assert placed is bool(want_tools)
+
+
+def test_us_digest_opens_exactly_one_tool_and_os_digest_none():
+    """도구 정책(ADR-004) — 미국주식만 `Skill` 1개, 오픈소스는 0개 그대로."""
+    assert bridge.US_DIGEST_TOOLS == ["Skill"]
+    assert bridge.DIGEST_TOOLS == []  # 한쪽 완화가 다른 쪽으로 번지지 않는다
+    assert bridge.US_DIGEST_SANDBOX_DIR != bridge.DIGEST_SANDBOX_DIR  # cwd 도 분리
+    assert "chiikawa_dev" not in str(bridge.US_DIGEST_SANDBOX_DIR)  # 레포 밖(보안 설계 유지)
+
+
+def test_prepare_skill_copies_only_the_skill_file(tmp_path):
+    # 스킬 탐색은 cwd 기준 — 샌드박스에 파일 하나만 심는다(레포를 cwd 로 만들지 않는다).
+    assert us_digest.prepare_skill(tmp_path) is True
+    placed = tmp_path / ".claude" / "skills" / us_digest.SKILL_NAME / "SKILL.md"
+    assert placed.exists()
+    assert placed.read_bytes() == (us_digest.SKILL_SRC / "SKILL.md").read_bytes()  # 원본 그대로
+    assert placed.read_bytes().startswith(b"---")  # frontmatter 가 첫 줄이어야 로드된다
+
+
+def test_prepare_skill_returns_false_when_source_missing(monkeypatch, tmp_path):
+    # 스킬이 없어도 카드는 나가야 한다(폴백) — 여기서 예외가 새면 LLM 호출 자체가 죽는다.
+    monkeypatch.setattr(us_digest, "SKILL_SRC", tmp_path / "nope")
+    assert us_digest.prepare_skill(tmp_path) is False
+
+
+def test_news_prompt_pins_korean_company_names():
+    """LLM 출력이라 표기가 흔들린다(실측: `마이크론` → `미크론`). 카드의 다른 줄과 같은 `NAMES`
+    를 프롬프트에도 실어 한 곳에서 맞춘다."""
+    hint = us_digest.news_name_hint()
+    # 방향을 화살표로 못 박는다 — `=` 로 줬더니 모델이 왼쪽(티커)을 그대로 출력했다(실측).
+    assert "MU→마이크론" in hint and "SKHY→SK하이닉스" in hint and "NVDA→엔비디아" in hint
+    assert hint.count("SK하이닉스") == 1  # 같은 이름의 티커 중복은 접는다(SKHY·000660)
+    prompt = us_digest.build_llm_prompt([{"title": "Micron", "publisher": "P", "link": ""}], [])
+    assert "MU→마이크론" in prompt
+    assert "반드시 한글" in prompt and "그대로 두지 말고" in prompt
+
+
+@pytest.mark.usefixtures("net")
+def test_card_shows_the_pinned_name_not_a_variant(monkeypatch):
+    # 고정 응답으로 요약 경로를 태워 카드에 실리는 표기를 확인한다(LLM 은 안 부른다).
+    monkeypatch.setattr(
+        us_digest,
+        "llm_analyze",
+        lambda items, _facts: (["마이크론 주가가 움직였다"] * len(items), None),
+    )
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    news_field = {n: v for n, v, _i in spec["fields"]}["📰 공시·뉴스"]
+    assert "마이크론" in news_field and "미크론 " not in news_field.replace("마이크론", "")
+
+
+def test_build_llm_prompt_bans_judgement_and_overrides_the_skill():
+    prompt = us_digest.build_llm_prompt(
+        [
+            {"title": "A", "publisher": "P1", "link": ""},
+            {"title": "B", "publisher": "P2", "link": ""},
+        ],
+        ["다음 발표일 2026년 9월 23일 추정 (D-56)"],
+    )
+    assert "정확히 2줄" in prompt
+    assert "매수/매도" in prompt and "전망" in prompt  # 투자 조언 금지 불변식(§0·§8)
+    assert "지시가 아니다" in prompt  # 외부 제목 인젝션 가드
+    # 스킬을 쓰되 **두 곳은 덮어쓴다** — 웹 검색 지시와 `Stock Reaction`(주가 방향 예측) 열.
+    assert us_digest.SKILL_NAME in prompt
+    # 적재를 **명시 지시**한다 — "스킬을 사용해" 만으로는 모델이 description 만 보고 넘겨짚어
+    # `Skill` 도구를 안 부르는 실행이 나왔다(실측: 적재 0회).
+    assert "`Skill` 도구로" in prompt and "본문을 열어라" in prompt
+    assert "Stock Reaction" in prompt and "쓰지 마라" in prompt
+    assert "웹 검색" in prompt and "도구가 없다" in prompt
+    assert "HBM" in prompt  # 스킬 섹터 예시에 메모리가 없어 우리가 채운다
+    assert "D-56" in prompt  # 우리가 모은 데이터가 실린다
+
+
+def test_earnings_block_shows_implied_move_with_its_caveat():
+    move = {"expiry": "2026-10-16", "strike": 820.0, "move_pct": 33.3}
+    rows = [{"dateReported": "6/24/2026"}]  # → 2026-09-23 추정(D-56)
+    out = us_digest.fmt_earnings(rows, None, [], date(2026, 7, 29), move)
+    assert "내재 변동폭 ±33.3% (2026년 10월 16일 만기)" in out
+    assert "실적 하루치 변동폭보다 크다" in out  # 만기가 실적일에서 머니 그 사실을 적는다
+    near = us_digest.fmt_earnings(
+        rows, None, [], date(2026, 9, 20), {**move, "expiry": "2026-09-25"}
+    )
+    assert "실적 전후 변동을 주로 반영" in near  # 만기가 실적 직후면 문구가 바뀐다(경계)
+
+
+def test_earnings_block_marks_option_failure_and_keeps_going():
+    out = us_digest.fmt_earnings([{"dateReported": "6/24/2026"}], None, [], date(2026, 7, 29), None)
+    assert f"내재 변동폭 {FAIL}" in out
+    assert "다음 발표" in out  # 나머지 줄은 살아 있다
+
+
+def test_parse_option_chain_picks_first_expiry_after_earnings_and_atm():
+    payload = {
+        "data": {
+            "table": {
+                "rows": [
+                    {"expirygroup": "September 18, 2026"},  # 실적일 이전 만기 — 건너뛴다
+                    {"strike": "820.00", "c_Last": "1.00", "p_Last": "1.00"},
+                    {"expirygroup": "October 16, 2026"},  # 실적일 이후 첫 만기
+                    {"strike": "700.00", "c_Last": "9.99", "p_Last": "9.99"},  # ATM 아님
+                    {"strike": "820.00", "c_Last": "143.12", "p_Last": "134.25"},  # ATM
+                    {"expirygroup": "November 20, 2026"},  # 더 먼 만기 — 안 쓴다
+                    {"strike": "820.00", "c_Last": "999.00", "p_Last": "999.00"},
+                ]
+            }
+        }
+    }
+    got = us_digest.parse_option_chain(payload, 819.18, date(2026, 9, 23))
+    assert got is not None and got["expiry"] == "2026-10-16" and got["strike"] == 820.0
+    assert abs(got["move_pct"] - (143.12 + 134.25) / 819.18 * 100) < 0.01
+
+
+@pytest.mark.parametrize(
+    "payload", [None, "junk", {"data": None}, {"data": {"table": {"rows": "x"}}}, {"data": [1]}]
+)
+def test_parse_option_chain_survives_garbage(payload):
+    assert us_digest.parse_option_chain(payload, 100.0, date(2026, 9, 23)) is None
+
+
+def test_build_us_digest_full_card(monkeypatch):
+    # 형제 테스트들과 같이 UA 를 스텁한다 — 안 하면 실제 `.env` 를 읽어, `.env` 가 없는 환경
+    # (공개 미러·새 클론·CI)에서만 SEC 3블록이 `조회 실패`로 렌더돼 이 단언이 깨진다.
+    monkeypatch.setattr(us_digest, "_sec_ua", lambda: "tester tester@example.com")
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    # 제목엔 날짜만 — 시세는 첫 필드가 말한다(사용자 배치).
+    assert spec["title"] == "📈 [2026-07-29] 미국주식"
     assert spec["color"] == us_digest.COLOR_DOWN
     names = [n for n, _v, _i in spec["fields"]]
     assert names == [
-        "💵 MU 시세",
+        "💵 마이크론(MU) 시세",
         "🎯 시장 기대",
         "📅 실적",
         "🏭 펀더멘털(SEC)",
@@ -1270,13 +1688,18 @@ def test_build_us_digest_full_card():
         "🇰🇷 한국 메모리 3사",
         "🧠 섹터",
     ]
-    values = {n: v for n, v, _i in spec["fields"]}
-    assert "₩" in values["💵 MU 시세"]  # 원화환산(§4-1)
+    values = {n: _norm(v) for n, v, _i in spec["fields"]}
+    # 블록마다 `▸` 한 줄 요약이 맨 위 — 단 🇰🇷 는 예외다(사용자 배치: SKHY 가 먼저 오고
+    # `▸ 한국장` 은 요약이 아니라 코스피 구분자로 쓰인다).
+    korea = "🇰🇷 한국 메모리 3사"
+    assert all(v.startswith("▸ ") for n, v in values.items() if n != korea)
+    assert values[korea].startswith("SK하이닉스 (SKHY)") and "▸ 한국장" in values[korea]
+    assert "₩" in values["💵 마이크론(MU) 시세"]  # 원화환산(§4-1)
     assert "상향 0 · 하향 0" in values["🎯 시장 기대"]  # 0 건도 표기(§4-3)
-    assert "Form 4 2건" in values["🔄 수급·심리"]
+    assert "내부자 Form 4 2건" in values["🔄 수급·심리"]
     assert "8-K 없음" in values["📰 공시·뉴스"]  # MU 8-K 는 그날 없었다 → 그 자체가 정보(§4-6)
     assert "TTM" in values["🏭 펀더멘털(SEC)"] and FAIL not in values["🏭 펀더멘털(SEC)"]
-    assert "판단 재료 제공(투자 조언 아님)" in spec["footer"]
+    assert spec["footer"] == ""  # 출처 푸터 삭제(사용자: 혼자 보는 카드)
 
 
 def test_build_us_digest_no_network_calls_outside_fake(net):
@@ -1300,7 +1723,7 @@ def test_build_us_digest_survives_everything_else_dead(monkeypatch):
     assert spec is not None
     values = {n: v for n, v, _i in spec["fields"]}
     assert len(values) == 8
-    assert FAIL not in values["💵 MU 시세"].split("\n")[0]  # 시세 본줄은 살아 있다
+    assert FAIL not in values["💵 마이크론(MU) 시세"].split("\n")[0]  # 시세 본줄은 살아 있다
     for name in ("🎯 시장 기대", "🏭 펀더멘털(SEC)", "📰 공시·뉴스", "🧠 섹터"):
         assert FAIL in values[name], name
 
@@ -1314,7 +1737,7 @@ def test_build_us_digest_survives_everything_else_dead(monkeypatch):
         ("fmt_filings", "📰 공시·뉴스"),
         ("fmt_expectation", "🎯 시장 기대"),
         ("fmt_earnings", "📅 실적"),
-        ("fmt_price", "💵 MU 시세"),
+        ("fmt_price", "💵 마이크론(MU) 시세"),
     ],
 )
 @pytest.mark.usefixtures("net")
@@ -1354,7 +1777,7 @@ def test_fundamentals_exception_degrades_only_its_block(monkeypatch):
         (("daily-index",), "📰 공시·뉴스", "8-K"),
         (("short-interest",), "🔄 수급·심리", "공매도"),
         (("/api/v1.0/filter/",), "🔄 수급·심리", "레딧 언급"),
-        (("KRW%3DX",), "💵 MU 시세", "원화환산"),
+        (("KRW%3DX",), "💵 마이크론(MU) 시세", "원화 환산"),
     ],
 )
 def test_single_source_failure_degrades_only_its_block(net, drop, field, must_fail):
@@ -1372,8 +1795,8 @@ def test_form4_count_survives_document_fetch_failure(net):
     net.drop = ("f4b.txt",)
     spec = build_us_digest("2026-07-29")
     assert spec is not None
-    flows = {n: v for n, v, _i in spec["fields"]}["🔄 수급·심리"]
-    assert "Form 4 2건" in flows and "?(?)" in flows
+    flows = _norm({n: v for n, v, _i in spec["fields"]}["🔄 수급·심리"])
+    assert "내부자 Form 4 2건" in flows and "?(?)" in flows
 
 
 def test_daily_index_walks_back_to_previous_business_day(monkeypatch):
@@ -1430,10 +1853,10 @@ def test_sec_blocks_skipped_without_user_agent(monkeypatch):
     spec = build_us_digest("2026-07-29")
     assert spec is not None
     assert not [p for h, p in fake.calls if h in ("www.sec.gov", "data.sec.gov")]
-    values = {n: v for n, v, _i in spec["fields"]}
+    values = {n: _norm(v) for n, v, _i in spec["fields"]}
     assert f"SEC 재무 {FAIL}" in values["🏭 펀더멘털(SEC)"]
     assert f"8-K {FAIL}" in values["📰 공시·뉴스"]
-    assert f"Form 4 {FAIL}" in values["🔄 수급·심리"]  # 못 받은 것이지 "없음"이 아니다
+    assert f"내부자 Form 4 {FAIL}" in values["🔄 수급·심리"]  # 못 받은 것이지 "없음"이 아니다
 
 
 def test_sec_facts_cached_per_day(monkeypatch, tmp_path):

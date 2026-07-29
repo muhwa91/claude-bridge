@@ -1023,6 +1023,14 @@ DIGEST_MAX_ATTEMPTS = 3  # 하루 실패-되돌림 상한(종일 실패 시 25�
 # **Bash 는 앞으로도 한 항목도 넣지 않는다**: `--allowedTools` 의 Bash 접두 매칭은 `;`·`&&`·`|`
 # 체이닝을 못 막아 `git status; <임의명령>` 이 통과한다(2026-07-23 `Bash(curl …)` 반려와 같은 잣대).
 DIGEST_TOOLS: list[str] = []
+# 미국주식 다이제스트만 **`Skill` 1개**를 연다(ADR-004). 오픈소스 다이제스트는 위 0개 그대로 —
+# 두 러너의 도구 목록을 **분리**해 한쪽 완화가 다른 쪽으로 번지지 않게 한다.
+# ADR-003 불변식은 유지된다: Skill 은 네트워크 도구가 아니고, 파일·셸·git·웹 도구는 여전히 0개다.
+# 스킬 탐색은 **cwd 기준**이라 US_DIGEST_SANDBOX_DIR 에 심은 것만 걸린다(개발자 세션엔 안 딸려간다).
+US_DIGEST_TOOLS: list[str] = ["Skill"]
+# 미국주식 전용 샌드박스 — 오픈소스 다이제스트와 **다른 폴더**여야 한다. 같은 cwd 를 쓰면
+# 도구 0개인 쪽 컨텍스트에도 스킬 목록이 실린다(불필요한 표면).
+US_DIGEST_SANDBOX_DIR = Path(tempfile.gettempdir()) / "claude_bridge_us_digest_sandbox"
 # 판정 cwd = **레포 밖 격리 폴더**(게스트질문 채널 선례, 별도 디렉터리). 레포 루트를 cwd 로 쓰면:
 # ① 루트 CLAUDE.md 가 자동 로드돼 **2차 인증 SHA-256 해시**까지 모델 컨텍스트에 들어온다 —
 #    이 값은 `.env` 에 없어 build_secrets 마스킹 대상이 아니라, 인젝션이 성공하면 카드 본문으로

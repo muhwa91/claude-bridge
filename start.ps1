@@ -6,9 +6,11 @@
 # (root CLAUDE.md, 2FA step) and by hand when the bot died.
 #   - Already running -> no-op. Restarting would drop a healthy Gateway session for nothing.
 #   - -Force          -> kill it first, then start (use after editing bridge.py).
+#   - -NoPing         -> restart for verification/inspection. Does not count as a session start,
+#                        so the day's digest does not fire. Everything else is identical.
 # Starts hidden + detached so closing this window does not kill the bot
 # (that is exactly why run_loop.ps1 is not used interactively anymore).
-param([switch]$Force)
+param([switch]$Force, [switch]$NoPing)
 $ErrorActionPreference = 'Stop'
 Set-Location -Path $PSScriptRoot
 
@@ -16,9 +18,14 @@ Set-Location -Path $PSScriptRoot
 # (schedules/notify.json item with "on": "session"). Written BEFORE the ALREADY_RUNNING
 # exit on purpose -- the ping means "a session started", which is independent of whether
 # the bot needed starting. SilentlyContinue: a failed log write must never block the bot.
+# -NoPing skips only this write: a verification restart is not a session start. Do NOT "fix" this
+# by moving the write after ALREADY_RUNNING -- opening a second session on the same day should
+# still stamp the ping, and duplicate sends are already prevented by notify_fired.
 New-Item -ItemType Directory -Force -Path 'logs' -ErrorAction SilentlyContinue | Out-Null
-Set-Content -Path 'logs\session_ping' -Value (Get-Date -Format 'yyyy-MM-dd') `
-    -Encoding ascii -ErrorAction SilentlyContinue
+if (-not $NoPing) {
+    Set-Content -Path 'logs\session_ping' -Value (Get-Date -Format 'yyyy-MM-dd') `
+        -Encoding ascii -ErrorAction SilentlyContinue
+}
 
 $running = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
     Where-Object { $_.CommandLine -like '*bridge.py*' })

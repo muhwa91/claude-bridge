@@ -896,8 +896,30 @@ def test_message_event_unmapped_falls_back_to_channel_name():
 
 
 class _FakeOverwrite:
-    def __init__(self, send_messages=None):
-        self.send_messages = send_messages
+    """`discord.PermissionOverwrite` 최소 모사 — 비트별 True/False/None(상속).
+
+    ⚠️ **여러 비트를 담는 것이 핵심이다** — 종전 페이크는 `send_messages` 하나만 저장해
+    "다른 권한이 존재하지 않는 세계"를 만들었고, 그래서 `set_permissions` 가 오버라이트를
+    **통째로 치환**한다는 사실을 1,114개 테스트 중 어느 것도 볼 수 없었다.
+    비트 목록을 고정하지 않는다 — 프로덕션이 새 권한을 만지면 그대로 따라간다.
+    """
+
+    def __init__(self, **bits):
+        self.send_messages = self.view_channel = None  # 자주 읽는 것은 기본값을 둔다
+        self.__dict__.update(bits)
+
+    def as_dict(self):
+        return {k: v for k, v in vars(self).items() if v is not None}
+
+
+class _FakePermissions:
+    def __init__(self, view_channel):
+        self.view_channel = view_channel
+
+
+def _as_bits(value):
+    """페이크 입력 축약형 허용 — `True/False/None` 은 `send_messages` 로 읽는다."""
+    return dict(value) if isinstance(value, dict) else {"send_messages": value}
 
 
 class _FakeChannel:
@@ -908,15 +930,41 @@ class _FakeChannel:
         self.deleted = False
         self.reject_rename = reject_rename  # 디스코드 이름 거부 시나리오
         self.renames = []  # edit(name=…) 시도 기록
-        self.overwrites = dict(overwrites or {})  # target → send_messages(True/False/None)
-        self.perm_calls = []  # set_permissions 호출 기록(멱등 확인용)
+        # target → {권한명: True/False}. 축약형(bool)도 받아 기존 테스트 호출부를 그대로 둔다.
+        self.overwrites = {t: _as_bits(v) for t, v in (overwrites or {}).items()}
+        self.perm_calls = []  # (target, 적용된 비트) — 멱등·보존 확인용
+
+    def bit(self, target, name="send_messages"):
+        """저장된 권한 비트 하나(없으면 None = 상속)."""
+        return self.overwrites.get(target, {}).get(name)
 
     def overwrites_for(self, target):
-        return _FakeOverwrite(self.overwrites.get(target))
+        return _FakeOverwrite(
+            **self.overwrites.get(target, {})
+        )  # 매번 **새 객체**(discord.py 동형)
 
-    async def set_permissions(self, target, **kwargs):
-        self.perm_calls.append((target, kwargs))
-        self.overwrites[target] = kwargs.get("send_messages")
+    def permissions_for(self, target):
+        """유효 권한 — **채널 오버라이트만** 접는다(멤버 → @everyone → 기본 허용).
+
+        ⚠️ **한계: 길드 역할 권한·채널 역할 오버라이트·Administrator 를 모델링하지 않는다.**
+        진짜 `discord.abc.GuildChannel.permissions_for` 는 길드 기본권한(@everyone 역할 +
+        멤버의 역할들) → 채널 @everyone → 채널 역할 → 채널 멤버 순으로 접고 Administrator 는
+        단축한다. **그 네 경로가 걸린 시나리오는 이 층에서 끝내 검증되지 않는다** — 프로덕션이
+        `permissions_for` 에 위임하는 근거는 이 페이크가 아니라 그 소스와 실측 대조다.
+        "테스트가 다 통과하니 안전하다"고 읽지 마라.
+        """
+        for key in (target, "@everyone"):
+            value = self.overwrites.get(key, {}).get("view_channel")
+            if value is not None:
+                return _FakePermissions(value)
+        return _FakePermissions(True)  # 오버라이트가 없으면 기본 허용
+
+    async def set_permissions(self, target, *, overwrite=None, **kwargs):
+        # ⚠️ 실제 discord.py 2.7.1 과 동일하게 **전체 치환**이다 — kwargs 형이든 overwrite 형이든
+        # 그 대상의 오버라이트를 통째로 갈아끼운다(부분 갱신이 아니다).
+        bits = overwrite.as_dict() if overwrite is not None else dict(kwargs)
+        self.perm_calls.append((target, bits))
+        self.overwrites[target] = bits
 
     async def edit(self, *, name=None, position=None, **_kwargs):
         if name is not None:
@@ -1325,8 +1373,8 @@ def test_us_channel_is_readonly_for_people_but_writable_by_bot(monkeypatch):
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     ch = next(c for c in guild.text_channels if c.name == "미국주식")
-    assert ch.overwrites["@everyone"] is False  # 사람은 못 쓴다
-    assert ch.overwrites["bot"] is True  # 봇은 쓴다
+    assert ch.bit("@everyone") is False  # 사람은 못 쓴다
+    assert ch.bit("bot") is True  # 봇은 쓴다
     others = [c for c in guild.text_channels if c.name in ("오픈소스", "알림")]
     assert others and all(c.perm_calls == [] for c in others)  # 다른 채널은 안 건드린다
 
@@ -1341,6 +1389,169 @@ def test_us_channel_readonly_is_idempotent(monkeypatch):
     _guild_for(a, text_channels=[ch])
     asyncio.run(a._ensure_channels())
     assert ch.perm_calls == []
+
+
+@pytest.mark.parametrize(
+    ("overwrites", "want_targets"),
+    [
+        # ① 이미 읽기 전용(사람이 채널 설정에서 손으로 해둔 상태 = 현재 실서버) → 호출 0
+        ({"@everyone": False, "bot": True}, []),
+        # ② 미설정 → 봇 허용 **먼저**, 그다음 @everyone 거부
+        ({}, ["bot", "@everyone"]),
+        # ③ @everyone 만 거부 · 봇 누락 = **가장 위험**(봇이 잠긴다) → "완료" 로 읽지 말고 봇을 푼다
+        ({"@everyone": False}, ["bot"]),
+        # ④ 봇이 상속(None)뿐 → 명시 허용이 아니므로 @everyone 거부에 걸린다 → 봇을 푼다
+        ({"@everyone": False, "bot": None}, ["bot"]),
+        # ⑤ 봇만 허용 · 사람 미차단(반대쪽 절반) → 이미 된 봇은 다시 안 부르고 @everyone 만
+        ({"bot": True}, ["@everyone"]),
+    ],
+)
+def test_ensure_readonly_reads_first_then_fixes_only_whats_missing(overwrites, want_targets):
+    """**먼저 읽고 필요할 때만 쓴다.** 부분 상태를 "완료"로 읽으면 봇이 잠긴 채 방치된다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식", overwrites=overwrites)
+    guild = _FakeGuild(text_channels=[ch])
+    asyncio.run(a._ensure_readonly(guild, ch))
+    assert [t for t, _kw in ch.perm_calls] == want_targets
+    assert all(kw == {"send_messages": t == "bot"} for t, kw in ch.perm_calls)
+
+
+def test_ensure_readonly_keeps_everyone_view_deny_intact():
+    """🔴 실서버 상태 재현 — `@everyone` 은 **채널 보기까지 거부**(사용자가 비공개로 만듦)인데
+    `send_messages` 만 빠진 경우. `send_messages=` 만 넘기면 오버라이트가 통째로 치환돼
+    **비공개 채널이 서버 전체에 공개된다.** 그 회귀를 여기서 못박는다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(
+        777,
+        "미국주식",
+        overwrites={
+            "@everyone": {"view_channel": False},
+            "bot": {"send_messages": True, "view_channel": True},
+        },
+    )
+    asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    assert ch.bit("@everyone", "view_channel") is False  # 비공개 유지 — 지워지면 안 된다
+    assert ch.bit("@everyone", "send_messages") is False  # 우리가 건 것
+    assert [t for t, _b in ch.perm_calls] == ["@everyone"]  # 봇은 이미 완료라 안 건드린다
+
+
+def test_ensure_readonly_keeps_the_bots_other_permissions():
+    """봇 쪽도 같은 함정 — `채널 보기 ✓`·`앱 명령`이 지워지면 봇이 채널을 못 봐 카드가 안 나간다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(
+        777,
+        "미국주식",
+        overwrites={
+            "@everyone": {"send_messages": False, "view_channel": False},
+            "bot": {"view_channel": True, "use_application_commands": True},  # 쓰기만 빠짐
+        },
+    )
+    asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    assert ch.bit("bot", "send_messages") is True  # 채웠고
+    assert ch.bit("bot", "view_channel") is True  # 원래 있던 것은 살아 있다
+    assert ch.bit("bot", "use_application_commands") is True
+    assert [t for t, _b in ch.perm_calls] == ["bot"]
+
+
+def test_ensure_readonly_grants_bot_view_when_channel_is_private():
+    """@everyone 이 채널 보기까지 막힌 비공개 채널에서 봇 오버라이트가 아예 없으면,
+    쓰기만 열어봐야 **채널을 못 봐서** 카드가 안 나간다 → 보기도 함께 켠다(호출은 1회)."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식", overwrites={"@everyone": {"view_channel": False}})
+    asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    assert ch.bit("bot", "send_messages") is True and ch.bit("bot", "view_channel") is True
+    assert [t for t, _b in ch.perm_calls] == ["bot", "@everyone"]  # 봇은 한 번만
+
+
+def test_ensure_readonly_warning_reports_fresh_state_not_stale(caplog):
+    """🟡 봇 설정은 성공하고 @everyone 만 실패(5xx·429)했을 때, 경고가 `봇 허용=False` 라고
+    말하면 운영자가 **이미 끝난 조치를 다시 하러 간다**. 성공 즉시 값을 갱신해야 한다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식")
+    granted = ch.set_permissions
+
+    async def fail_on_everyone(target, **kwargs):
+        if target == "@everyone":
+            raise discord.DiscordException("ServerError")
+        await granted(target, **kwargs)
+
+    ch.set_permissions = fail_on_everyone  # type: ignore[method-assign]
+    with caplog.at_level("WARNING"):
+        asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    assert "봇 허용=True" in caplog.text  # 낡은 False 가 아니라 방금의 성공을 말한다
+    assert "@everyone 차단=False" in caplog.text  # 못 건 쪽은 정확히 False
+
+
+def test_ensure_readonly_logs_nothing_when_already_readonly(caplog):
+    """완료 상태면 **로그도 0줄**. 호출 0회만 보면 이 회귀를 못 잡는다.
+
+    안쪽 `if not bot_ok`/`if not blocked` 가 이미 호출을 막으므로, 조기반환을 지워도
+    `set_permissions` 는 여전히 0회다 — 대신 끝줄 `log.info` 가 살아나 **재기동마다** 같은
+    줄이 쌓인다(이번 수정이 없앤 바로 그 증상). 그래서 호출 수가 아니라 로그로 고정한다.
+    """
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식", overwrites={"@everyone": False, "bot": True})
+    with caplog.at_level("DEBUG", logger=discord_adapter.log.name):
+        asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    ours = [r.getMessage() for r in caplog.records if r.name == discord_adapter.log.name]
+    assert ch.perm_calls == [] and ours == []  # asyncio 자체 DEBUG 는 우리 로그가 아니다
+
+
+def test_ensure_readonly_warns_with_a_remedy_when_forbidden(caplog):
+    """권한이 없으면 **경고를 유지**하되(조용한 실패 금지) 무엇을 하면 되는지 적는다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식")
+
+    async def deny(*_a, **_k):
+        raise discord.DiscordException("Forbidden")
+
+    ch.set_permissions = deny  # type: ignore[method-assign]
+    with caplog.at_level("WARNING"):
+        asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    text = caplog.text
+    assert "읽기전용 설정 실패" in text
+    assert "메시지 보내기" in text and "역할 관리" in text  # 조치 방법이 들어 있다
+
+
+def test_ensure_readonly_unlocks_the_bot_before_locking_people():
+    """순서가 뒤바뀌면 두 번째 호출 실패 시 **봇이 잠긴 채** 남는다 — 봇 허용이 항상 먼저다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식")
+    asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    assert next(t for t, _kw in ch.perm_calls) == "bot"
+
+
+def test_ensure_readonly_leaves_the_bot_writable_when_the_second_call_fails():
+    """순서 뒤집힘이 실제로 무엇을 망치는지 — **결과**로 고정한다(호출 순서 관찰이 아니라).
+
+    봇 허용은 통과하고 @everyone 거부만 막히는 부분 실패에서, 봇은 **쓸 수 있는 채로** 남아야
+    그날 카드가 나간다. 종전 순서(@everyone 먼저)면 여기서 봇 허용이 아예 실행되지 않는다.
+    """
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식")
+    granted = ch.set_permissions
+
+    async def fail_on_everyone(target, **kwargs):
+        if target == "@everyone":
+            raise discord.DiscordException("Forbidden")
+        await granted(target, **kwargs)
+
+    ch.set_permissions = fail_on_everyone  # type: ignore[method-assign]
+    asyncio.run(a._ensure_readonly(_FakeGuild(text_channels=[ch]), ch))
+    assert ch.bit("bot") is True  # 봇은 잠기지 않았다 — 카드 경로 생존
+
+
+@pytest.mark.parametrize("missing", ["default_role", "me"])
+def test_ensure_readonly_skips_when_guild_role_info_is_missing(missing, caplog):
+    """길드 역할 정보가 없으면 **아무 권한도 건드리지 않고** 경고만 — 추측으로 잠그지 않는다."""
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    ch = _FakeChannel(777, "미국주식")
+    guild = _FakeGuild(text_channels=[ch])
+    setattr(guild, missing, None)
+    with caplog.at_level("WARNING"):
+        asyncio.run(a._ensure_readonly(guild, ch))
+    assert ch.perm_calls == []
+    assert "길드 역할 정보 없음" in caplog.text
 
 
 def test_categories_created_with_emoji(monkeypatch):

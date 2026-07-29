@@ -759,9 +759,10 @@ class DiscordAdapter:
                     project_chs.append(ch)
                 await self._rename_if_needed(ch, target)
                 if tag in _READONLY_TAGS:
-                    # 권한 편집은 봇에 '역할 관리' 권한이 있어야 한다 — 없으면 Forbidden 이다.
                     # **여기서 예외가 새면 채널 자동생성 전체가 중단**되므로(실측: 매핑이 통째로
                     # 폴백) 이 한 채널의 부가 설정 실패는 그 채널만 로그하고 넘어간다.
+                    # 설정 실패는 _ensure_readonly 안에서 조치 안내와 함께 잡는다 — 이 try 는
+                    # 그 앞단(오버라이트 **조회**)까지 덮는 안전망이다.
                     try:
                         await self._ensure_readonly(guild, ch)
                     except discord.DiscordException as e:
@@ -792,24 +793,65 @@ class DiscordAdapter:
         return cat
 
     async def _ensure_readonly(self, guild: Any, ch: Any) -> None:
-        """사람은 못 쓰고 **봇만 쓰는** 채널로 만든다(@everyone 쓰기 금지 · 봇 쓰기 허용). 멱등.
+        """사람은 못 쓰고 **봇만 쓰는** 채널로 만든다(@everyone 쓰기 금지 · 봇 쓰기 허용).
 
         `#미국주식` 은 매일 카드를 읽기만 하는 채널이라 메시지 왕복이 없다(사용자 요청) —
         사람이 쓴 글이 섞이면 카드 흐름이 끊긴다.
-        ⚠️ **봇 자신을 함께 잠그면 다이제스트가 못 나간다** → @everyone 만 막고 봇에는 명시 허용.
-        이미 그 상태면 아무것도 하지 않는다(재기동마다 감사 로그 금지 — 리네임과 같은 태도).
+
+        **먼저 읽고, 필요할 때만 쓴다.** 오버라이트 조회는 '역할 관리' 권한 없이도 되므로,
+        이미 읽기 전용이면(사람이 채널 설정에서 손으로 해둔 경우 포함) **아무것도 하지 않고
+        로그도 남기지 않는다.**
+
+        ⚠️ **부분 적용이 가장 위험하다** — @everyone 거부는 걸렸는데 봇 허용이 빠지면 **봇이 잠겨
+        카드가 안 나간다**. 그래서 ① 둘 다 갖춰야 "완료"로 보고 ② 고칠 때는 **봇 허용을 먼저** 건다.
+
+        🔴 **`set_permissions` 는 부분 갱신이 아니라 전체 치환이다**(discord.py 2.7.1 — kwargs 로
+        `PermissionOverwrite` 를 새로 만들어 PUT). `send_messages=` 만 넘기면 그 대상의 **다른
+        권한이 전부 지워진다**(이 채널은 @everyone·봇 모두 `채널 보기` 오버라이트를 갖고 있다).
+        → **읽은 오버라이트 객체를 고쳐 `overwrite=` 로 되돌려준다**(read-modify-write).
+        `overwrites_for()` 는 매번 새 객체라 추가 조회가 없다.
+        ⚠️ **`@everyone` 의 `view_channel` 은 건드리지 않는다** — 공개/비공개는 사용자 정책이다.
         """
         everyone, me = getattr(guild, "default_role", None), getattr(guild, "me", None)
         if everyone is None or me is None:
             log.warning("길드 역할 정보 없음 — 읽기전용 설정 스킵 %r", ch.name)
             return
-        if (
-            ch.overwrites_for(everyone).send_messages is False
-            and ch.overwrites_for(me).send_messages is True
-        ):
-            return  # 멱등 — 이미 적용됨
-        await ch.set_permissions(everyone, send_messages=False)
-        await ch.set_permissions(me, send_messages=True)  # 봇은 반드시 먼저 풀어둔다
+        ow_all, ow_me = ch.overwrites_for(everyone), ch.overwrites_for(me)
+        blocked = ow_all.send_messages is False  # 사람 쓰기 막혔나
+        # 봇이 채널을 **실제로 볼 수 있는가** — 못 보면 쓰기 권한이 있어도 카드가 안 나간다.
+        # 손으로 계산하지 않는다: 유효 권한은 길드 역할 권한 → 채널 @everyone → 채널 역할 →
+        # 채널 멤버 오버라이트(Administrator 는 단축) 순으로 접히는데, 오버라이트 두 개만 보면
+        # 어긋난다. discord.py 가 캐시로 계산해 준다(추가 호출 0).
+        bot_can_view = ch.permissions_for(me).view_channel
+        # ⚠️ 비대칭이 의도다 — view 는 **효력**으로 보고 send 는 **명시 허용(is True)** 만 인정한다.
+        # 우리가 곧 @everyone 의 send 를 막을 것이라, 상속을 완료로 읽으면 그 순간 봇이 잠긴다.
+        bot_ok = ow_me.send_messages is True and bot_can_view
+        if blocked and bot_ok:
+            return  # 이미 읽기 전용 — 조용히 지나간다
+        try:
+            if not bot_ok:  # **봇 먼저** — 여기서 실패해도 사람 권한은 그대로 남는다
+                ow_me.send_messages = True
+                if not bot_can_view:  # 볼 수 없을 때만 — 같은 객체라 호출은 여전히 1회
+                    ow_me.view_channel = True
+                await ch.set_permissions(me, overwrite=ow_me)
+                bot_ok = True  # 아래 경고가 **낡은 값**을 말하지 않게 즉시 반영
+            if not blocked:
+                ow_all.send_messages = False  # view_channel 은 그대로 둔다(사용자 정책)
+                await ch.set_permissions(everyone, overwrite=ow_all)
+                blocked = True
+        except discord.DiscordException as e:
+            # 경고를 없애지 않는다 — 채널이 실제로 읽기 전용이 아닌데 조용하면 아무도 모른다.
+            # 대신 **무엇을 하면 되는지**를 적는다(봇에 '역할 관리'가 없으면 코드로는 못 고친다).
+            log.warning(
+                "#%s 읽기전용 설정 실패(%s) — 채널 설정에서 @everyone '메시지 보내기' ✗ + "
+                "봇 ✓ 로 직접 지정하거나 봇 역할에 '역할 관리'를 주세요 "
+                "(현재 @everyone 차단=%s · 봇 허용=%s)",
+                ch.name,
+                type(e).__name__,
+                blocked,
+                bot_ok,
+            )
+            return
         log.info("채널 읽기전용 설정: %r id=%s", ch.name, ch.id)
 
     async def _rename_if_needed(self, ch: Any, target: str) -> None:

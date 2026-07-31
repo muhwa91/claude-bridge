@@ -2771,7 +2771,11 @@ def test_fetch_rest_probe_graceful_on_error(monkeypatch):
     def _boom(*_a, **_k):
         raise bridge.urllib.error.URLError("연결 거부")
 
-    monkeypatch.setattr(bridge.urllib.request, "urlopen", _boom)
+    # 위 성공 케이스와 **같은 seam** 을 막는다 — fetch_rest_probe 는 맨 urlopen 이 아니라
+    # _NOREDIRECT_OPENER.open 을 쓴다. urllib.request.urlopen 을 패치하면 스텁이 안 걸려
+    # 진짜 127.0.0.1:8000 으로 나가고, trading_info 가 떠 있는 머신에서만 실패한다
+    # (2026-08-01 실제로 그렇게 깨져 발견 — 서버가 죽어 있을 때만 통과하던 테스트였다).
+    monkeypatch.setattr(bridge._NOREDIRECT_OPENER, "open", _boom)
     out = bridge.fetch_rest_probe("/api/indices")
     assert "조회 실패" in out and "/api/indices" in out
 
@@ -5672,8 +5676,12 @@ _needs_real_schedules = pytest.mark.skipif(
 # 제거됐고(커밋 66d3d6e), 그것을 이 테스트가 잡아 여기서 4→3 으로 내렸다.
 # `ti-sat-nightfut`(토 00:00/grace 30)은 2026-08-01 졸업 — 라이브 관측 통과(야간선물 '거래중'
 # 헤더 노출) + trading-info 회귀 케이스가 대신 지킨다. 3→2.
+# `ti-weekend-nq-off`(토 06:00/grace 30)도 2026-08-01 졸업 — 라이브 관측 통과(05:56 '거래중'+NQ
+# 인라인 있음 → 06:04 '장마감'+인라인 소멸) + trading-info 회귀 케이스('EDT 토 06:00 KST =
+# 금 17:00 ET → 장마감')가 대신 지킨다. 2→1.
+# 남은 1건은 `enabled: false`(일시 정지)지만 베이스라인은 그대로 잰다 — load_schedules 는 거르지
+# 않고(순수 로더) 정지 필터는 dispatch_notifications 몫이라, 꺼져 있어도 요일·시각 계약은 산다.
 _REAL_BASELINE = {
-    "ti-weekend-nq-off": (["sat"], "06:00", 30),
     "ti-mon-nightfut": (["mon"], "00:00", 30),
 }
 # 핑 값이 무엇이든 시각 알림 판정은 불변이어야 한다(없음·오늘·과거·미래·깨진 문자열).
@@ -5702,9 +5710,10 @@ def test_real_schedules_baseline_fields_unchanged():
         # 토 00:00 대 창도 비었다 — ti-sat-nightfut 이 2026-08-01 졸업(라이브 관측 통과)하며 빠졌다.
         # 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
         (datetime(2026, 7, 18, 0, 10, tzinfo=_KST), []),
-        # ti-weekend-nq-off: 토 06:00 [06:00, 06:30]
-        (datetime(2026, 7, 18, 6, 15, tzinfo=_KST), ["ti-weekend-nq-off"]),
-        (datetime(2026, 7, 20, 6, 15, tzinfo=_KST), []),  # 월요일엔 없다
+        # 토 06:00 대 창도 비었다 — ti-weekend-nq-off 이 2026-08-01 졸업(라이브 관측 통과)하며
+        # 빠졌다. 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
+        (datetime(2026, 7, 18, 6, 15, tzinfo=_KST), []),
+        (datetime(2026, 7, 20, 6, 15, tzinfo=_KST), []),  # 월요일 06:00 대에도 없다
         # ti-mon-nightfut: 월 00:00 [00:00, 00:30]
         (datetime(2026, 7, 20, 0, 10, tzinfo=_KST), ["ti-mon-nightfut"]),
         (datetime(2026, 7, 20, 0, 31, tzinfo=_KST), []),

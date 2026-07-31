@@ -27,6 +27,7 @@ import logging
 import math
 import re
 import shutil
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -211,10 +212,17 @@ def plain(text: object) -> str:
        만들어 `8-K 없음` 같은 우리 표기를 위조한다(bridge.strip_control_line 과 같은 사상).
     ③ None 은 ""(빈 값) — `str(None)` 은 `"None"` 이라 카드에 `(전일 None · 전체 None위)` 처럼
        찍힌다. 외부 응답에 키가 빠지는 일은 흔하다(레딧 신규 추적 티커 실측).
+    ④ **유니코드 Cf(형식) 문자를 걷어낸다** — `\\s` 가 U+200B·U+202E·U+00AD 를 매치하지 않아
+       ②를 그냥 통과한다. U+202E(RTL Override)가 들어오면 그 줄의 이후 텍스트가 **역방향으로
+       그려져** 신고자 이름·해석 가드가 다르게 보인다(Trojan-Source 류). 제출자가 통제하는
+       Form 4 `<rptOwnerName>`·야후 헤드라인이 실제 입구다. U+200B 다수는 눈에 안 보이면서
+       필드 예산만 먹어 다른 줄을 밀어낸다. 걷어내면 카드에 남는 비가시 문자는 우리가 심는
+       `_FIELD_GAP` 하나뿐이라 불변식이 깔끔해진다.
     """
     if text is None:
         return ""
-    return re.sub(r"\s+", " ", str(text).translate(_MD_TRANS)).strip()
+    stripped = "".join(c for c in str(text) if unicodedata.category(c) != "Cf")
+    return re.sub(r"\s+", " ", stripped.translate(_MD_TRANS)).strip()
 
 
 def safe_url(url: object) -> str:
@@ -334,16 +342,24 @@ def closing_note(text: str) -> str:
 _FIELD_GAP = "\n​"  # 블록 사이 한 행. `​` = zero-width space(디스코드 trim 방지)
 
 
-def block(summary: str, rows: list[str], limit: int = FIELD_MAXLEN) -> str:
-    """`▸ 요약` + 바로 아래 세부 → 필드 값 하나. 세부가 한도를 넘으면 줄 단위로 버린다. 순수.
+def block(summary: str, rows: list[str], limit: int = FIELD_MAXLEN, closing: str = "") -> str:
+    """`▸ 요약` + 세부 + `📌 결론` → 필드 값 하나. 세부가 한도를 넘으면 줄 단위로 버린다. 순수.
 
     끝에 `_FIELD_GAP` 을 붙여 **다음 소주제와 한 행 띄운다**(사용자 요청). 그냥 `"\\n"` 으로는
     안 된다 — 디스코드가 필드 값 **끝의 공백을 잘라내서** 빈 줄이 사라진다. 보이지 않는
     문자(zero-width space)를 한 글자 세워 그 줄을 살린다.
+
+    ⚠️ **결론은 `rows` 에 넣지 말고 `closing` 으로 넘긴다.** `fit()` 은 넘치는 줄을 만나면
+    `break` 가 아니라 `continue` 로 흘리므로, 결론이 `rows` 의 **마지막이자 최장급 줄**이면
+    한도에 걸리는 순간 **결론만 조용히 사라지고 앞의 짧은 줄들은 남는다** — 카드는 멀쩡해
+    보이는데 "그래서 무슨 뜻인가"가 없다. 게다가 삭제 순서가 길이에 따라 뒤바뀌어(제목 85·90자
+    에선 결론이, 95·100자에선 뉴스 줄이 날아간다) **간헐적 결함처럼 보인다.**
+    여기서는 결론 몫을 **예산에서 먼저 떼어** 두므로 잘리는 것은 항상 중간 세부다.
     """
     head = f"{_SUMMARY_LEAD}{summary}"
-    body = fit(rows, limit - len(head) - 1 - len(_FIELD_GAP))
-    return (f"{head}\n{body}" if body else head) + _FIELD_GAP
+    tail = f"\n{closing}" if closing else ""
+    body = fit(rows, limit - len(head) - 1 - len(tail) - len(_FIELD_GAP))
+    return (f"{head}\n{body}" if body else head) + tail + _FIELD_GAP
 
 
 def label_of(symbol: str) -> str:
@@ -502,7 +518,7 @@ def fmt_price(quote: dict[str, Any], fx: dict[str, Any] | None) -> str:
         closing = "주가와 환율이 같은 방향이라 원화로 느끼는 폭이 달러보다 크다"
     else:
         closing = "환율이 반대로 움직여 원화로 느끼는 폭은 달러보다 작다"
-    return block(summary, [*lines, closing_note(closing)])
+    return block(summary, lines, closing=closing_note(closing))
 
 
 # ── ② 시장 기대(Nasdaq targetprice · earnings-forecast) ─────────────────────
@@ -627,7 +643,7 @@ def fmt_expectation(target: dict[str, Any] | None, forecast: dict[str, Any] | No
         closing = "증권사끼리 판단이 갈렸다 — 한 방향으로 정리되지 않은 구간이다"
     else:
         closing = "기대치는 아직 그대로다 — 하향이 나오기 시작하면 그때 이야기가 달라진다"
-    return block(_expectation_summary(target, quarter), [*lines, closing_note(closing)])
+    return block(_expectation_summary(target, quarter), lines, closing=closing_note(closing))
 
 
 # ── ③ 실적(Nasdaq surprise · calendar) ──────────────────────────────────────
@@ -851,7 +867,7 @@ def fmt_earnings(
         closing = "오늘이 발표 예정일이다 — 기대치와 실제 숫자가 오늘 맞부딪친다"
     else:
         closing = f"발표까지 {nxt[1]}일 — 그때까지는 실제 실적이 아니라 기대치가 주가를 움직인다"
-    return block(summary, [*lines, closing_note(closing)])
+    return block(summary, lines, closing=closing_note(closing))
 
 
 # ── ④ 펀더멘털(SEC XBRL) ───────────────────────────────────────────────────
@@ -1130,7 +1146,6 @@ def fmt_fundamentals(
         )
     else:
         closing = "창고 재고가 제자리다 — 만드는 만큼 그대로 팔리고 있다는 뜻이다"
-    lines.append(closing_note(closing))
     # 요약 = 매출 방향 + 재고 방향(그날 값에서). 두 개가 이 블록에서 제일 먼저 읽어야 할 사실이다.
     summary = "SEC 재무"
     if len(quarters) >= 2 and prior.get("rev"):
@@ -1138,7 +1153,7 @@ def fmt_fundamentals(
         summary = f"직전 분기 매출 {_billions(last['rev'])} · 전분기 대비 {pct(qoq, 1)}"
     if inventory and ratio(prior, "inv"):
         summary += f" · 재고/매출 {ratio(prior, 'inv')}→{inventory}"
-    return block(summary, lines), warn
+    return block(summary, lines, closing=closing_note(closing)), warn
 
 
 # ── ⑤ 수급·심리(공매도 · Form 4 · 레딧 · 공포탐욕 · VIX) ────────────────────
@@ -1256,7 +1271,7 @@ def fmt_flows(
     else:
         closing = "시장 심리는 중립이라 개별 종목 재료가 그대로 반영되기 쉬운 구간이다"
     summary = " · ".join(p for p in [insider, f"시장 심리 {mood}" if mood else ""] if p)
-    return block(summary or "수급·심리", [*lines, closing_note(closing)])
+    return block(summary or "수급·심리", lines, closing=closing_note(closing))
 
 
 # ── ⑥ 공시·뉴스(SEC 일별 인덱스 1회 · Yahoo 뉴스) ───────────────────────────
@@ -1633,7 +1648,7 @@ def fmt_filings(
             lines.append(note("한글 요약 실패 — 원문 제목 그대로 싣는다"))
     if not news:
         lines.append(f"뉴스 {FAIL}")
-    return block(summary, [*lines, closing_note(closing)])
+    return block(summary, lines, closing=closing_note(closing))
 
 
 # ── ⑦ 한국 메모리 3사 · ⑧ 섹터 ────────────────────────────────────────────
@@ -1704,9 +1719,10 @@ def fmt_korea(
                 " — 환율·시차·투자자 구성이 달라서다"
             )
         )
-    lines.append(closing_note(closing))
-    # 이 블록만 `block()` 을 안 쓴다(`▸` 가 중간에 있다) → 블록 간격도 손으로 붙인다.
-    return fit(lines, FIELD_MAXLEN - len(_FIELD_GAP)) + _FIELD_GAP
+    # 이 블록만 `block()` 을 안 쓴다(`▸` 가 중간에 있다) → 결론 몫 선점·블록 간격을 손으로 맞춘다.
+    # 결론을 `lines` 에 넣으면 한도에 걸릴 때 그것부터 사라진다(`block()` docstring 참조).
+    tail = closing_note(closing)
+    return fit(lines, FIELD_MAXLEN - len(tail) - 1 - len(_FIELD_GAP)) + f"\n{tail}" + _FIELD_GAP
 
 
 def index_line(quotes: dict[str, dict[str, Any] | None]) -> str:
@@ -1762,7 +1778,7 @@ def fmt_sector(quotes: dict[str, dict[str, Any] | None]) -> str:
         closing = "거의 다 올랐다 — 사실상 업종 전체가 오른 날로 봐야 한다"
     else:
         closing = "오른 종목과 빠진 종목이 섞였다 — 업종 전체가 아니라 종목별로 갈린 날이다"
-    return block(summary, [*lines, closing_note(closing)])
+    return block(summary, lines, closing=closing_note(closing))
 
 
 # ── 조립 ──────────────────────────────────────────────────────────────────

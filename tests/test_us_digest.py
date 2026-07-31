@@ -44,6 +44,7 @@ from us_digest import (
     parse_short_interest,
     parse_surprise,
     parse_targetprice,
+    plain,
     valuations,
 )
 
@@ -2502,3 +2503,34 @@ def test_selftest_runs_in_the_suite():
     스위트에 넣어도 안전하다.
     """
     us_digest._selftest()
+
+
+def test_block_keeps_the_closing_when_the_body_overflows():
+    """한도에 걸리면 사라지는 건 **중간 세부**여야 한다 — 결론이 아니라.
+
+    `fit()` 은 넘치는 줄을 `break` 가 아니라 `continue` 로 흘린다. 결론이 `rows` 의 마지막이자
+    최장급 줄이던 종전 구조에서는 한도에 닿는 순간 **결론만 조용히 빠지고 앞의 짧은 줄들은
+    남았다** — 카드는 멀쩡해 보이는데 "그래서 무슨 뜻인가"가 없다. 2026-07-31 점검 실측 여유가
+    📅 실적 623/700 = **77자**뿐이라 상한 하나만 올려도 터질 자리였다. 삭제 순서가 길이에 따라
+    뒤바뀌어 **간헐적 결함처럼 보이는** 것이 이 결함의 고약한 점이라 경계를 테스트로 못 박는다.
+    """
+    rows = [f"세부{i} " + "가" * 40 for i in range(30)]  # 합계가 한도를 크게 넘는다
+    out = us_digest.block("요약", rows, closing=us_digest.closing_note("결론"))
+    assert len(out) <= us_digest.FIELD_MAXLEN, f"한도 초과: {len(out)}"
+    assert out.removesuffix(us_digest._FIELD_GAP).split("\n")[-1] == "📌 결론"
+    assert "세부0" in out  # 넘치는 것만 버린다 — 본문을 통째로 날리지 않는다
+    assert "세부29" not in out  # 실제로 넘쳤다(테스트가 무의미해지지 않게 확인)
+
+
+def test_plain_strips_invisible_format_characters():
+    r"""유니코드 Cf(형식) 문자는 `\s` 에 안 걸려 종전엔 **그대로 카드에 실렸다.**
+
+    U+202E(RTL Override)가 섞이면 그 줄의 이후 텍스트가 역방향으로 그려져 신고자 이름·해석
+    가드가 다르게 보인다(Trojan-Source 류). 입구는 제출자가 통제하는 Form 4 `<rptOwnerName>`
+    과 야후 헤드라인이다. U+200B 는 눈에 안 보이면서 필드 예산만 먹어 다른 줄을 밀어낸다.
+    """
+    assert plain("MEHROTRA\u202eSANJAY") == "MEHROTRASANJAY"  # RTL Override
+    assert plain("a\u200b\u200bb") == "ab"  # zero-width space
+    assert plain("소프트­하이픈") == "소프트하이픈"  # soft hyphen
+    # 걷어낸 뒤 카드에 남는 비가시 문자는 **우리가 심는 간격 하나뿐**이라는 불변식
+    assert us_digest._FIELD_GAP not in plain(f"x{us_digest._FIELD_GAP}y")

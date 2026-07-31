@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2413,6 +2413,47 @@ def test_dispatch_skips_send_when_no_alert_channel(notify_env, monkeypatch):
     assert notify_env.sent == []  # 발송 스킵
     assert ("a", "2026-07-15") in bridge.notify_fired  # 상태는 기록·저장(재발송 방지)
     assert len(notify_env.saves) == 1
+
+
+# ── `enabled: false` = 일시 정지(삭제 아님) ─────────────────────────────────
+# 졸업(항목 제거)은 "관측해 통과" 가 조건이라, 아직 검증 못 한 항목은 지울 수 없다. 그래서 항목을
+# notify.json 에 남긴 채 발화만 막는 플래그다. dispatch 가 due 계산 **전에** 한 번 거르므로
+# 시각·스누즈·세션 세 경로가 함께 막힌다(due_notifications 자체는 무변경 — 실물 베이스라인 테스트가
+# 항목을 끌 때마다 흔들리면 그 트립와이어의 신뢰가 깎이기 때문).
+def test_dispatch_disabled_item_not_due_in_window(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0910)  # 창 한가운데 = 켜져 있으면 반드시 발송되는 시각
+    bridge.dispatch_notifications(notify_env, [_item(id="a", enabled=False)])
+    assert notify_env.sent == []
+    assert bridge.notify_fired == set()  # fired 도 안 남는다(다시 켜면 그날 정상 발송)
+    assert notify_env.saves == []
+
+
+def test_dispatch_enabled_key_absent_or_true_still_due(notify_env, monkeypatch):
+    # 무회귀: 기존 항목엔 이 키가 없다 — **명시적 false 만** 끈다.
+    _freeze_now(monkeypatch, _WED_0910)
+    bridge.dispatch_notifications(notify_env, [_item(id="a")])
+    bridge.dispatch_notifications(notify_env, [_item(id="b", enabled=True)])
+    assert [c for c, _t, _b in notify_env.sent] == [999, 999]
+
+
+def test_dispatch_disabled_item_not_revived_by_snooze(notify_env, monkeypatch):
+    # 구멍 차단: 꺼지기 전에 [🕐 나중에] 를 눌러둔 항목이 스누즈 재발송으로 되살아나면 안 된다.
+    # (대조군 = test_dispatch_snooze_refires_then_pops — 같은 조건에서 켜져 있으면 1회 발송)
+    _freeze_now(monkeypatch, _WED_0931)  # 창 밖 → 스누즈 경로만 남는다
+    bridge.notify_fired.add(("a", "2026-07-15"))
+    bridge.notify_snooze["a"] = datetime(2026, 7, 15, 9, 20, tzinfo=_KST).isoformat()
+    bridge.dispatch_notifications(notify_env, [_item(id="a", enabled=False)])
+    assert notify_env.sent == []
+    assert "a" in bridge.notify_snooze  # 소비되지 않고 그대로(다시 켜면 그때 재발송)
+
+
+def test_dispatch_disabled_session_item_no_digest(digest_env, monkeypatch):
+    # on:"session" 다이제스트도 같은 규칙 — 분기가 갈리면 나중에 함정이 된다.
+    _freeze_now(monkeypatch, _WED_0910)
+    started = []
+    monkeypatch.setattr(bridge, "_start_digest", lambda *a: started.append(a))
+    bridge.dispatch_notifications(digest_env, [{**_SESSION_ITEM, "enabled": False}])
+    assert started == [] and digest_env.sent == [] and bridge.notify_fired == set()
 
 
 # ---------------------------------------------------------------------------
@@ -5629,8 +5670,9 @@ _needs_real_schedules = pytest.mark.skipif(
 # 이 베이스라인이 줄어드는 것은 **졸업이 실제로 일어났을 때뿐**이다(약화 금지 — 남은 항목의
 # 감지력은 그대로). `ti-us-open`(평일 22:30/grace 30)은 2026-07-30 졸업하며 notify.json 에서
 # 제거됐고(커밋 66d3d6e), 그것을 이 테스트가 잡아 여기서 4→3 으로 내렸다.
+# `ti-sat-nightfut`(토 00:00/grace 30)은 2026-08-01 졸업 — 라이브 관측 통과(야간선물 '거래중'
+# 헤더 노출) + trading-info 회귀 케이스가 대신 지킨다. 3→2.
 _REAL_BASELINE = {
-    "ti-sat-nightfut": (["sat"], "00:00", 30),
     "ti-weekend-nq-off": (["sat"], "06:00", 30),
     "ti-mon-nightfut": (["mon"], "00:00", 30),
 }
@@ -5657,10 +5699,9 @@ def test_real_schedules_baseline_fields_unchanged():
         # 평일 22:30 대 창은 비었다 — ti-us-open 이 2026-07-30 졸업(커밋 66d3d6e)하며 빠졌다.
         # 이 한 줄은 그 자리에 새 항목이 조용히 들어오는 것을 감지하는 용도로 남긴다.
         (datetime(2026, 7, 15, 22, 45, tzinfo=_KST), []),  # 수 22:30~23:00
-        # ti-sat-nightfut: 토 00:00 [00:00, 00:30]
-        (datetime(2026, 7, 18, 0, 0, tzinfo=_KST), ["ti-sat-nightfut"]),
-        (datetime(2026, 7, 18, 0, 30, tzinfo=_KST), ["ti-sat-nightfut"]),
-        (datetime(2026, 7, 18, 0, 31, tzinfo=_KST), []),
+        # 토 00:00 대 창도 비었다 — ti-sat-nightfut 이 2026-08-01 졸업(라이브 관측 통과)하며 빠졌다.
+        # 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
+        (datetime(2026, 7, 18, 0, 10, tzinfo=_KST), []),
         # ti-weekend-nq-off: 토 06:00 [06:00, 06:30]
         (datetime(2026, 7, 18, 6, 15, tzinfo=_KST), ["ti-weekend-nq-off"]),
         (datetime(2026, 7, 20, 6, 15, tzinfo=_KST), []),  # 월요일엔 없다
@@ -5679,14 +5720,21 @@ def test_real_schedules_time_alerts_unaffected_by_session_ping(moment, expected)
 @_needs_real_schedules
 def test_real_schedules_time_alerts_respect_fired():
     # 무회귀: fired 중복차단도 종전 그대로(핑이 있어도 시각 항목은 재발송 안 됨).
-    # 기준 항목을 ti-us-open → ti-sat-nightfut 로 옮겼다(전자는 2026-07-30 졸업, 커밋 66d3d6e).
+    # 기준 항목을 하드코딩하지 않고 _REAL_BASELINE 첫 항목에서 **유도**한다 — 졸업 때마다
+    # (ti-us-open → ti-sat-nightfut → …) 여기까지 고쳐야 했다. 이제 _REAL_BASELINE 만 고치면 된다.
     # 없는 id 로 재면 "안 나온다"가 공허하게 통과한다 → fired 없이 **나오는 것**부터 확인한다.
-    moment = datetime(2026, 7, 18, 0, 10, tzinfo=_KST)  # 토 00:10 = ti-sat-nightfut 창 안
+    target, (days, at, grace) = next(iter(_REAL_BASELINE.items()))
+    hh, mm = map(int, at.split(":"))
+    # 2026-07-13(월) 기준 주에 요일 오프셋을 더해 그 항목의 창 한가운데를 만든다
+    moment = datetime(2026, 7, 13, hh, mm, tzinfo=_KST) + timedelta(
+        days=bridge._WEEKDAYS.index(days[0]), minutes=grace // 2
+    )
+    ping = moment.date().isoformat()
     digests = [it for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
-    alert = [it for it in _REAL_ITEMS if it["id"] == "ti-sat-nightfut"]
-    assert due_notifications(_REAL_ITEMS, moment, set(), "2026-07-18") == alert + digests
-    fired = {("ti-sat-nightfut", "2026-07-18")}
-    assert due_notifications(_REAL_ITEMS, moment, fired, "2026-07-18") == digests
+    alert = [it for it in _REAL_ITEMS if it["id"] == target]
+    assert alert, f"{target} 이 배포본에 없다 — 유도한 기준 항목이 죽었다(공허한 통과 방지)"
+    assert due_notifications(_REAL_ITEMS, moment, set(), ping) == alert + digests
+    assert due_notifications(_REAL_ITEMS, moment, {(target, ping)}, ping) == digests
 
 
 @_needs_real_schedules

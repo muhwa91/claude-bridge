@@ -910,6 +910,14 @@ def dispatch_notifications(
     """
     if items is None:
         items = load_schedules(SCHEDULES_FILE)
+    # `enabled: false` = **일시 정지**(삭제 아님). 졸업(항목 제거)의 조건은 "그 알람이 보라는 상태를
+    # 실제로 관측해 통과" 라(CLAUDE.md 예약 알림 졸업), 아직 못 본 항목을 지우면 되살릴 근거가
+    # 사라진다. 그래서 항목은 notify.json 에 그대로 두고 발화만 막는다.
+    # 여기(due 계산 **전**)에서 한 번 거르는 이유: due·스누즈 재발송·세션 다이제스트가 전부 이
+    # items 를 타므로, 이 한 줄이 세 경로를 동시에 막는다(분기가 갈라져 꺼진 항목이 스누즈로
+    # 되살아나는 구멍이 안 생기게). due_notifications 는 순수한 "시각 판정"으로 남긴다.
+    # 키가 없으면 종전대로 활성 — **명시적 false 만** 건너뛴다(기존 항목 무회귀).
+    items = [it for it in items if it.get("enabled") is not False]
     now = datetime.now(_KST)
     today = now.date().isoformat()
     ping = read_session_ping(SESSION_PING_FILE)  # 파일 I/O 는 여기서(due_notifications 는 순수)

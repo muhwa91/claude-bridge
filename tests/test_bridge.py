@@ -5615,7 +5615,7 @@ def test_encode_callback_digest_roundtrip():
 # (전부 순수/monkeypatch — 네트워크·subprocess 0)
 # ===========================================================================
 
-# ── ① 기존 예약 알림 4건 무회귀 잠금(실제 schedules/notify.json 을 그대로 읽는다) ────
+# ── ① 기존 예약 알림 3건 무회귀 잠금(실제 schedules/notify.json 을 그대로 읽는다) ────
 # on:"session" 분기가 들어오며 due_notifications 시그니처가 바뀌었다. "요일·at·grace_min 판정이
 # 종전과 완전히 동일한가" 를 파일 실물 + 창 경계로 못 박는다(합성 _item() 이 아니라 배포본으로).
 _REAL_ITEMS = load_schedules(bridge.SCHEDULES_FILE)
@@ -5626,8 +5626,10 @@ _needs_real_schedules = pytest.mark.skipif(
     not bridge.SCHEDULES_FILE.exists(),
     reason="배포용 schedules/notify.json 없음 — 공개 미러본에는 익명 example 만 공개된다",
 )
+# 이 베이스라인이 줄어드는 것은 **졸업이 실제로 일어났을 때뿐**이다(약화 금지 — 남은 항목의
+# 감지력은 그대로). `ti-us-open`(평일 22:30/grace 30)은 2026-07-30 졸업하며 notify.json 에서
+# 제거됐고(커밋 66d3d6e), 그것을 이 테스트가 잡아 여기서 4→3 으로 내렸다.
 _REAL_BASELINE = {
-    "ti-us-open": (["mon", "tue", "wed", "thu", "fri"], "22:30", 30),
     "ti-sat-nightfut": (["sat"], "00:00", 30),
     "ti-weekend-nq-off": (["sat"], "06:00", 30),
     "ti-mon-nightfut": (["mon"], "00:00", 30),
@@ -5637,9 +5639,11 @@ _PINGS = (None, "2026-07-15", "2026-07-14", "2026-07-16", "oops", "")
 
 
 @_needs_real_schedules
-def test_real_schedules_four_alerts_fields_unchanged():
+def test_real_schedules_baseline_fields_unchanged():
+    # 이름에 건수를 박지 않는다 — 졸업할 때마다 개명이 강제되면 그 개명이 일이 된다.
+    # 건수의 정본은 _REAL_BASELINE 하나뿐이다(2026-08-01).
     by_id = {it["id"]: it for it in _REAL_ITEMS}
-    assert set(_REAL_BASELINE) <= set(by_id)  # 4건이 그대로 있다(졸업·오타 제거 감지)
+    assert set(_REAL_BASELINE) <= set(by_id)  # 베이스라인이 그대로 있다(졸업·오타 제거 감지)
     for item_id, (days, at, grace) in _REAL_BASELINE.items():
         it = by_id[item_id]
         assert (it["days"], it["at"], it["grace_min"]) == (days, at, grace)
@@ -5650,15 +5654,9 @@ def test_real_schedules_four_alerts_fields_unchanged():
 @pytest.mark.parametrize(
     ("moment", "expected"),
     [
-        # ti-us-open: 평일 22:30 + grace 30 → [22:30, 23:00] 폐구간
-        (datetime(2026, 7, 15, 22, 29, tzinfo=_KST), []),  # 수 창 직전
-        (datetime(2026, 7, 15, 22, 30, tzinfo=_KST), ["ti-us-open"]),  # 창 시작(포함)
-        (datetime(2026, 7, 15, 23, 0, tzinfo=_KST), ["ti-us-open"]),  # grace 끝(포함)
-        (datetime(2026, 7, 15, 23, 1, tzinfo=_KST), []),  # grace 밖
-        (datetime(2026, 7, 13, 22, 45, tzinfo=_KST), ["ti-us-open"]),  # 월
-        (datetime(2026, 7, 17, 22, 45, tzinfo=_KST), ["ti-us-open"]),  # 금
-        (datetime(2026, 7, 18, 22, 45, tzinfo=_KST), []),  # 토 — 평일 아님
-        (datetime(2026, 7, 19, 22, 45, tzinfo=_KST), []),  # 일 — 평일 아님
+        # 평일 22:30 대 창은 비었다 — ti-us-open 이 2026-07-30 졸업(커밋 66d3d6e)하며 빠졌다.
+        # 이 한 줄은 그 자리에 새 항목이 조용히 들어오는 것을 감지하는 용도로 남긴다.
+        (datetime(2026, 7, 15, 22, 45, tzinfo=_KST), []),  # 수 22:30~23:00
         # ti-sat-nightfut: 토 00:00 [00:00, 00:30]
         (datetime(2026, 7, 18, 0, 0, tzinfo=_KST), ["ti-sat-nightfut"]),
         (datetime(2026, 7, 18, 0, 30, tzinfo=_KST), ["ti-sat-nightfut"]),
@@ -5681,11 +5679,14 @@ def test_real_schedules_time_alerts_unaffected_by_session_ping(moment, expected)
 @_needs_real_schedules
 def test_real_schedules_time_alerts_respect_fired():
     # 무회귀: fired 중복차단도 종전 그대로(핑이 있어도 시각 항목은 재발송 안 됨).
-    moment = datetime(2026, 7, 15, 22, 45, tzinfo=_KST)
-    fired = {("ti-us-open", "2026-07-15")}
-    assert due_notifications(_REAL_ITEMS, moment, fired, "2026-07-15") == [
-        it for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS
-    ]
+    # 기준 항목을 ti-us-open → ti-sat-nightfut 로 옮겼다(전자는 2026-07-30 졸업, 커밋 66d3d6e).
+    # 없는 id 로 재면 "안 나온다"가 공허하게 통과한다 → fired 없이 **나오는 것**부터 확인한다.
+    moment = datetime(2026, 7, 18, 0, 10, tzinfo=_KST)  # 토 00:10 = ti-sat-nightfut 창 안
+    digests = [it for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
+    alert = [it for it in _REAL_ITEMS if it["id"] == "ti-sat-nightfut"]
+    assert due_notifications(_REAL_ITEMS, moment, set(), "2026-07-18") == alert + digests
+    fired = {("ti-sat-nightfut", "2026-07-18")}
+    assert due_notifications(_REAL_ITEMS, moment, fired, "2026-07-18") == digests
 
 
 @_needs_real_schedules
@@ -5834,6 +5835,36 @@ def test_digest_rejects_only_output_is_failure(monkeypatch):
     fa = FakeAdapter(secrets=[])
     assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is False
     assert fa.sent == [] and bridge.digest_pending == {}
+
+
+def test_digest_format_deviation_writes_no_state(pipeline, monkeypatch):
+    """되돌림이면 상태도 되돌아야 한다 — 기각 이력·30일 쿨다운 **어느 것도** 안 쓰인다.
+
+    회귀 대상: append_rejected/mark_seen 이 `if not cards` 앞에 있던 시절. 판정이 `🚫기각:`
+    줄만 내고 `🧩 …없음` 한 줄을 빠뜨리면 되돌린다면서 기록만 확정돼, 재시도 3회 동안 같은
+    건이 rejected.jsonl 에 3번 쌓이고 후보는 이미 30일 매장됐다.
+    """
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": False, "result": "🚫기각: o/x|중복\n🚫기각: o/y|충돌"},
+    )
+    assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is False
+    assert not (pipeline / "rejected.jsonl").exists()
+    assert not (pipeline / "seen.json").exists()
+
+
+def test_digest_normal_verdict_writes_state(pipeline, monkeypatch):
+    """대조군 — 위 테스트가 "기록 자체가 사라져도 통과"하지 않도록 정상 경로를 함께 잠근다."""
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": False, "result": f"{_CARD1}\n🚫기각: o/x|중복"},
+    )
+    assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
+    row = json.loads((pipeline / "rejected.jsonl").read_text(encoding="utf-8").strip())
+    assert (row["name"], row["reason"]) == ("o/x", "중복")
+    assert json.loads((pipeline / "seen.json").read_text(encoding="utf-8"))["o/x"] == "2026-07-15"
 
 
 @pytest.mark.usefixtures("pipeline")

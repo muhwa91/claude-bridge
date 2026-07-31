@@ -2212,14 +2212,19 @@ def run_opensource_digest(adapter: Adapter, channel_id: int, today: str) -> bool
         log.warning("다이제스트 판정 실패 — 되돌림")
         return False
     body, rejects = parse_digest_rejects(str(data.get("result", "")))
-    append_rejected(REJECTED_FILE, today, rejects)
-    # 기각도 30일 쿨다운 — v1 은 매일 같은 후보를 다시 판정하느라 토큰을 태웠다(영구가 아닌 이유는
-    # active_seen 참조: 보류 사유가 해소되면 다시 올라와야 한다).
-    mark_seen(SEEN_FILE, [name for name, _reason in rejects], today)
     cards = split_digest_cards(body)
     if not cards:
         log.warning("다이제스트 카드 0건(형식 이탈) — 되돌림")
         return False
+    # **기록·매장은 되돌림 판정 뒤에** — 되돌림이면 상태도 되돌아야 한다(2026-08-01 점검 지적).
+    # 종전엔 이 두 줄이 위 `if not cards` 앞이라, 판정이 `🚫기각:` 줄만 내고 `🧩 …없음` 한 줄을
+    # 빠뜨리면(body="" → cards=[]) 되돌리면서도 기록만 확정됐다 → 재시도 3회를 태우는 동안 후보
+    # 풀은 이미 30일 매장돼 줄고, opensource_rejected.jsonl 엔 같은 건이 3번 쌓인다.
+    # 위 `if not kept` / `is_error` 되돌림도 기록이 없다 — 그 대칭을 맞춘다.
+    append_rejected(REJECTED_FILE, today, rejects)
+    # 기각도 30일 쿨다운 — v1 은 매일 같은 후보를 다시 판정하느라 토큰을 태웠다(영구가 아닌 이유는
+    # active_seen 참조: 보류 사유가 해소되면 다시 올라와야 한다).
+    mark_seen(SEEN_FILE, [name for name, _reason in rejects], today)
     # 1장이라도 나갔으면 성공(L-5) — 전량 실패만 되돌려 다음 틱이 다시 잡게 한다.
     return _post_digest_cards(adapter, channel_id, today, cards, kept) > 0
 

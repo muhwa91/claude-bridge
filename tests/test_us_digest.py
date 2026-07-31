@@ -317,7 +317,7 @@ def test_valuations_loss_quarters_yield_negative_pe_marked_as_loss():
         return [{"end": f"2026-0{i + 1}-28", "rev": 1e10, "eps": eps} for i in range(4)]
 
     loss = _norm(fmt_fundamentals({"quarters": _q(-1.0)}, 100.0, None, None)[0])
-    assert "P/E TTM -25.0(적자)" in loss
+    assert "P/E 최근 1년 -25.0(적자)" in loss
     assert "(적자)" not in fmt_fundamentals({"quarters": _q(1.0)}, 100.0, None, None)[0]
 
 
@@ -465,7 +465,8 @@ def test_fit_skips_oversized_line_but_keeps_later_short_ones():
 
 
 def test_fit_keeps_blank_lines_as_separators():
-    # 빈 줄은 **의도적 구분자**다(fmt_korea 가 종목과 해설 사이에 쓴다) → 살려야 한다.
+    # `fit` 은 자르기만 한다 — 줄을 **걸러내지는 않는다**(빈 줄도 넣은 그대로 나온다).
+    # ※ 지금은 어느 블록도 빈 줄을 넣지 않는다(2026-07-31 개편) — 그래도 필터가 아님은 그대로다.
     assert fit(["", "A", "", "B"], 100) == "\nA\n\nB"
 
 
@@ -487,6 +488,100 @@ def test_field_slice_is_noop_because_fit_shares_the_same_default():
     text = fit([line, line])  # limit 미지정 = 기본값
     assert text == line  # 둘째 줄은 통째로 버려진다
     assert us_digest._field("이름", text)[1] == line  # 슬라이스가 아무것도 안 자른다
+
+
+# ── 렌더 포맷(2026-07-31 개편) — 화살표 등락 · 💡/📌 접두 · 블록 간격 ─────────
+# 이 넷이 카드 겉모습을 통째로 정하는데, 블록 통합 테스트는 그날 값에 딸려 **스치기만** 한다
+# (`pct`·`ko_mood` 는 단위 테스트가 아예 없었다). 하나가 조용히 옛 형태로 되돌아가도 아무
+# 테스트가 안 깨지는 상태라 여기서 못박는다.
+FLAT = "➖"  # noqa: RUF001 (보합 표시 — 하이픈이 아니라 화살표와 같은 계열의 전각 기호)
+
+
+@pytest.mark.parametrize(
+    ("value", "digits", "want"),
+    [
+        (None, 2, "-"),  # 값 없음 — 화살표를 붙이면 "안 움직였다"는 거짓 진술이 된다
+        (1.234, 2, "🔺 1.23%"),
+        (-8.85, 2, "🔻 8.85%"),
+        (0, 2, f"{FLAT} 0.00%"),  # 진짜 보합
+        # 반올림하면 0 → `🔻 0.00%`(내렸다면서 0)라는 자기모순을 막는다
+        (-0.004, 2, f"{FLAT} 0.00%"),
+        (0.004, 2, f"{FLAT} 0.00%"),
+        (-0.04, 1, f"{FLAT} 0.0%"),  # 자릿수를 줄이면 보합 경계도 같이 넓어진다
+        (-0.06, 1, "🔻 0.1%"),  # 표시 자릿수에서 살아남는 하락은 화살표가 붙는다
+        (3.0, 1, "🔺 3.0%"),
+    ],
+)
+def test_pct_decides_direction_after_rounding_to_the_shown_digits(value, digits, want):
+    assert us_digest.pct(value, digits) == want
+
+
+def test_pct_never_leaks_plus_or_minus_signs():
+    # 부호를 화살표로 바꾼 게 이 개편의 요지다 → `-8.85%` 처럼 부호가 다시 새면 깨져야 한다.
+    for value in (1.5, -1.5, 0.0, -0.004, -123.456):
+        assert not re.search(r"[+\-]", us_digest.pct(value)), value
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        ("fear", "공포"),
+        ("Extreme Fear", "극도의 공포"),  # CNN 이 대소문자를 바꿔 보내도 같은 등급
+        ("  greed  ", "탐욕"),
+        ("neutral", "중립"),
+        ("extreme greed", "극도의 탐욕"),
+        ("brand new rating", "brand new rating"),  # 등급이 늘어도 원문 통과(카드가 비지 않는다)
+        ("", ""),  # rating 결측 → `plain(None)` 이 "" 를 준다
+    ],
+)
+def test_ko_mood(raw, want):
+    assert us_digest.ko_mood(raw) == want
+
+
+def test_note_and_closing_note_carry_different_marks():
+    # 💡(읽는 법)과 📌(그래서 무슨 뜻인가)가 같아지면 블록 안에서 결론이 주석에 묻힌다.
+    assert us_digest.note("읽는 법") == "💡 읽는 법"
+    assert us_digest.closing_note("결론") == "📌 결론"
+
+
+def test_field_gap_is_invisible_but_survives_a_trailing_trim():
+    """블록 간격의 계약: **보이지 않되 공백은 아닌** 한 글자.
+
+    디스코드는 필드 값 **끝의 공백을 잘라낸다** → 그냥 `"\\n"` 을 붙이면 빈 줄이 사라진다.
+    이 단언이 없으면 누군가 "개행이면 충분하지"로 되돌려도 테스트가 상수를 참조해 통과한다.
+    """
+    assert us_digest._FIELD_GAP.startswith("\n")
+    assert us_digest._FIELD_GAP.rstrip() == us_digest._FIELD_GAP  # trim 에도 안 지워진다
+    assert us_digest._FIELD_GAP.strip("\n").strip() != ""  # 개행 말고 실제 한 글자가 있다
+
+
+def test_block_appends_the_gap_and_still_fits_the_field_budget():
+    """블록 끝 간격(zero-width space)은 **한도 안에서** 붙는다.
+
+    `block()` 이 간격 몫을 한도에서 빼지 않으면 필드가 FIELD_MAXLEN 을 넘는데, 라이브 픽스처
+    날의 필드는 한도까지 여유가 있어(실측 674/700) 그 2자 초과가 통합 테스트엔 안 걸린다.
+
+    ⚠️ 세부 줄은 **긴 줄 + 짧은 줄**로 준다 — 같은 길이만 주면 `fit` 이 한도를 한참 남기고
+    끝나서(줄 단위로 버리므로) 2자 초과가 이 단언에도 안 걸린다.
+    """
+    out = us_digest.block("요약", ["가" * 50] * 13 + ["나"] * 100)
+    assert out.startswith("▸ 요약\n")
+    assert out.endswith(us_digest._FIELD_GAP)
+    assert len(out) <= us_digest.FIELD_MAXLEN
+
+
+def test_block_with_no_room_for_body_still_gets_the_gap():
+    # 세부가 전부 한도에 밀려도 다음 블록과 붙어 보이면 안 된다 → 요약만 남아도 간격은 붙는다.
+    assert us_digest.block("요약만", ["가" * 500], limit=20) == "▸ 요약만" + us_digest._FIELD_GAP
+
+
+def test_fmt_korea_gets_the_same_gap_within_the_same_budget():
+    # 이 블록만 `block()` 을 안 쓴다(`▸` 가 중간에 있다) → 간격·한도를 손으로 맞춘 자리라 따로 잰다.
+    quotes = {s: {"price": 1_234_567, "pct": 1.0} for s in ("005930.KS", "000660.KS")}
+    out = fmt_korea(quotes, None)
+    assert out.endswith(us_digest._FIELD_GAP)
+    assert len(out) <= us_digest.FIELD_MAXLEN
+    assert "\n\n" not in out  # 블록 **안**에는 빈 줄이 없다(띄는 자리는 블록 사이뿐)
 
 
 @pytest.mark.parametrize(
@@ -812,7 +907,7 @@ def test_form4_rows_show_count_owner_and_code_note():
     )
     assert _norm(_line(out, "내부자 Form 4")) == "내부자 Form 4 2건"  # 건수는 2
     assert _norm(_line(out, "신고자")) == "신고자 MEHROTRA SANJAY(MS)"  # 표시는 중복 제거
-    assert "매도 우위가 곧 악재는 아니다" in out  # 옵션행사분이 섞인다는 주석은 항상 붙는다
+    assert "팔았다고 다 나쁜 신호는 아니다" in out  # 옵션행사분이 섞인다는 주석은 항상 붙는다
 
 
 def test_eightk_none_says_failed_and_empty_says_none_found():
@@ -888,20 +983,20 @@ _FX_QUOTE = {"symbol": "KRW=X", "price": 1464.4, "prev": 1460.0, "pct": 0.3, "ba
 
 def test_fmt_price_without_fx_marks_only_that_line():
     out = fmt_price(_MU_QUOTE, None)
-    assert "$820.53" in out and "-8.85%" in out
+    assert "$820.53" in out and "🔻 8.85%" in out
     assert f"원화 환산 {FAIL}(환율)" in out
     assert "52주" in out  # 나머지 줄은 살아 있다
 
 
 def test_fmt_price_with_fx_shows_krw():
     out = fmt_price(_MU_QUOTE, _FX_QUOTE)
-    assert f"₩{820.53 * 1464.4:,.0f}" in out
+    assert f"{820.53 * 1464.4:,.0f}원" in out
     assert FAIL not in out
 
 
 def test_fmt_price_missing_52w_skips_that_line_only():
     out = fmt_price({**_MU_QUOTE, "w52h": None, "w52l": None}, _FX_QUOTE)
-    assert "52주" not in out and "$820.53" in out and "₩" in out
+    assert "52주" not in out and "$820.53" in out and "원화 환산 1,201,584원" in out
 
 
 def test_fmt_expectation_partial_failures():
@@ -943,15 +1038,21 @@ def test_fmt_fundamentals_mcap_crosscheck_warns_only_beyond_tolerance():
     }
     ok_field, ok_warn = fmt_fundamentals(facts, 100.0, None, 100e9)  # SEC 100B vs Nasdaq 100B
     assert ok_warn == "" and "SEC 100.0B" in _norm(ok_field)
-    _bad_field, bad_warn = fmt_fundamentals(facts, 100.0, None, 50e9)  # 2배 차이
+    # 괴리가 0 이면 "낮음 0.0%" 가 아니라 일치라고 말한다(줄 자체는 남긴다 — 확인했다는 정보다).
+    assert "두 출처 대조 일치" in _norm(ok_field)
+    bad_field, bad_warn = fmt_fundamentals(facts, 100.0, None, 50e9)  # 2배 차이
     assert "시총 교차검증 불일치" in bad_warn
+    # 이 괴리는 **등락이 아니다** → 방향 화살표를 쓰면 `🔻 100%` 가 "불일치가 줄었다"로 읽힌다.
+    # 방향은 라벨의 말(높음/낮음)이 지고, 숫자는 절대값이다.
+    assert "SEC가 Nasdaq보다 높음 100.0%" in _norm(bad_field)
+    assert "🔺" not in bad_warn and "🔻" not in bad_warn
 
 
 def test_fmt_fundamentals_ttm_failed_when_quarters_short():
     facts = {"quarters": [{"end": "2025-08-31", "rev": 1e10, "eps": 6.0}], "shares": 0}
     field = _norm(fmt_fundamentals(facts, 100.0, None, None)[0])
-    assert f"P/E TTM {FAIL}" in field  # 1분기뿐이면 TTM 을 지어내지 않는다
-    assert "최근분기 연율" in field
+    assert f"P/E 최근 1년 {FAIL}" in field  # 1분기뿐이면 TTM 을 지어내지 않는다
+    assert "P/E 최근 분기 환산" in field
 
 
 def test_fmt_korea_all_dead():
@@ -968,7 +1069,7 @@ def test_fmt_korea_skhy_marks_ipo_age_and_skips_period_compare():
     }
     out = _norm(fmt_korea(quotes, None))
     assert "[상장 13일차]" in out
-    assert "고점 대비 -25.1%" in out
+    assert "고점 대비 🔻 25.1%" in out
     assert "SK하이닉스 (SKHY)" in out  # 티커만으로는 어느 회사인지 안 읽힌다
 
 
@@ -981,17 +1082,17 @@ def test_fmt_korea_skhy_forecast_always_states_estimate_count():
     # 추정인원 1~2명을 MU(12명)와 같은 무게로 읽으면 안 된다 → 인원 병기가 사라지면 안 됨.
     forecast = {"year": {"consensusEPSForecast": "2.10", "fiscalEnd": "Dec", "noOfEstimates": 2}}
     out = _norm(fmt_korea({}, forecast))
-    assert "추정 인원 2인" in out and "대표성은 낮다" in out
+    assert "예상한 증권사 2곳" in out and "시장 전체 생각으로 보기는 어렵다" in out
 
 
 def test_fmt_sector_partial_quotes():
     quotes = {"^SOX": {"pct": -3.2}, "NVDA": {"pct": -2.1}}
     out = fmt_sector(quotes)
-    assert "엔비디아 (NVDA) -2.1%" in out  # 한 줄에 한 종목 · 주식명(티커)
+    assert "엔비디아 (NVDA) 🔻 2.1%" in out  # 한 줄에 한 종목 · 주식명(티커)
     assert "AMD" not in out  # 죽은 종목은 목록에서 빠지되(한 줄이 실패로 도배되지 않게)
     assert f"(8종 {FAIL})" in out  # 몇 종이 빠졌는지는 꼬리로 남는다
     assert "SOX" not in out  # 지수 줄은 렌더에서 빠졌다(값 계산은 index_line 이 유지)
-    assert us_digest.index_line(quotes) == f"SOX -3.2% · SMH {FAIL}"
+    assert us_digest.index_line(quotes) == f"SOX 🔻 3.2% · SMH {FAIL}"
 
 
 def test_fmt_sector_all_dead():
@@ -1009,7 +1110,7 @@ def test_fmt_flows_fear_greed_omits_missing_previous_close():
     # 공포탐욕에서 **0 은 결측이 아니라 "극단적 공포"라는 실값**이다 → `or 0` 으로 채우면
     # 하루 만에 극단공포→중립으로 튄 것처럼 읽힌다. 없으면 아예 안 적는다.
     out = _norm(fmt_flows(None, None, None, {"score": 40.0, "rating": "fear"}, None))
-    assert "공포탐욕 40 (fear)" in out and "전일" not in out
+    assert "공포탐욕 40 (공포)" in out and "전일" not in out
     zero = _norm(
         fmt_flows(None, None, None, {"score": 40.0, "rating": "f", "previous_close": 0}, None)
     )
@@ -1036,7 +1137,7 @@ def test_plain_blocks_spoiler_bars():
         None, [{"owner": "A||", "codes": "S"}, {"owner": "||B", "codes": "S"}], None, None, None
     )
     assert "||" not in out
-    assert "매도 우위가 곧 악재는 아니다" in out
+    assert "팔았다고 다 나쁜 신호는 아니다" in out
 
 
 def test_fmt_flows_escapes_markdown_from_external_names():
@@ -1316,7 +1417,7 @@ def net(monkeypatch):
 @pytest.mark.usefixtures("net")
 @pytest.mark.usefixtures("net")
 def test_every_block_ends_with_an_interpretation_line():
-    """**8블록 전부** 마지막이 빈 줄 + `↳ 해석` 으로 끝난다(사용자 요청).
+    """**8블록 전부** `📌 해석` 으로 끝나고, 그 뒤에 블록 간격 한 행이 붙는다(사용자 요청).
 
     이 마지막 줄은 숫자 되풀이가 아니라 "그래서 무슨 뜻인가"다 → 그날 값에서 만들어지므로
     고정 문구가 아닌지도 함께 본다(값이 다른 두 입력이 다른 문장을 내는지는 아래 단위 테스트).
@@ -1324,17 +1425,18 @@ def test_every_block_ends_with_an_interpretation_line():
     spec = build_us_digest("2026-07-29")
     assert spec is not None
     for name, value, _inline in spec["fields"]:
-        tail = value.split("\n")
-        assert tail[-1].startswith("↳ "), f"{name} 마지막 줄이 해석이 아니다: {tail[-1]!r}"
-        assert tail[-2] == "", f"{name} 해석 앞에 빈 줄이 없다"
+        assert value.endswith(us_digest._FIELD_GAP), f"{name} 블록 뒤 간격이 없다: {value[-3:]!r}"
+        tail = value[: -len(us_digest._FIELD_GAP)].split("\n")
+        assert tail[-1].startswith("📌 "), f"{name} 마지막 줄이 해석이 아니다: {tail[-1]!r}"
+        assert tail[-2] != "", f"{name} 해석이 앞줄에서 떨어졌다(빈 줄은 블록 사이에만)"
 
 
-# ── 마지막 `↳ 해석` 의 **경계값** ─────────────────────────────────────────────
+# ── 마지막 `📌 해석` 의 **경계값** ─────────────────────────────────────────────
 # 2026-07-29 검수에서 섹터 임계값이 8/9 하락을 "혼조"로 읽어 같은 블록의 `▸` 와 모순됐다.
 # 하나가 틀렸다는 건 나머지도 경계에서 틀릴 수 있다는 뜻 → **8블록 전부 경계 양쪽을 못박는다.**
 def _closing(text: str) -> str:
-    """블록 마지막 줄(= `↳ 해석`)."""
-    return text.split("\n")[-1]
+    """블록 마지막 줄(= `📌 해석`). 끝의 블록 간격은 걷어내고 본다."""
+    return text.removesuffix(us_digest._FIELD_GAP).split("\n")[-1]
 
 
 @pytest.mark.parametrize(
@@ -1353,7 +1455,7 @@ def test_sector_closing_matches_the_headline_count(down, must):
     quotes = {s: {"pct": -1.0 if i < down else 1.0} for i, s in enumerate(us_digest.SECTOR)}
     out = fmt_sector(quotes)
     assert f"9종 중 {down}종 하락" in out.split("\n")[0]  # ▸ 요약
-    assert must in _closing(out), _closing(out)  # ↳ 해석이 그 요약과 어긋나면 안 된다
+    assert must in _closing(out), _closing(out)  # 📌 해석이 그 요약과 어긋나면 안 된다
 
 
 @pytest.mark.parametrize(
@@ -1448,7 +1550,7 @@ def test_korea_closing_thresholds_market_gap(kospi_pct, must):
 def test_closing_line_follows_the_days_numbers(up, down, must):
     # 고정 문구를 박으면 값이 반대로 움직인 날 거짓이 된다 → 같은 함수가 값에 따라 다른 문장을 낸다.
     forecast = {"quarter": {"up": up, "down": down, "fiscalEnd": "Aug 2026", "noOfEstimates": 9}}
-    assert must in us_digest.fmt_expectation(None, forecast).split("\n")[-1]
+    assert must in _closing(us_digest.fmt_expectation(None, forecast))
 
 
 @pytest.mark.parametrize(
@@ -1627,11 +1729,11 @@ def test_earnings_block_shows_implied_move_with_its_caveat():
     rows = [{"dateReported": "6/24/2026"}]  # → 2026-09-23 추정(D-56)
     out = us_digest.fmt_earnings(rows, None, [], date(2026, 7, 29), move)
     assert "내재 변동폭 ±33.3% (2026년 10월 16일 만기)" in out
-    assert "실적 하루치 변동폭보다 크다" in out  # 만기가 실적일에서 머니 그 사실을 적는다
+    assert "실적 발표 하루 움직임보다 크게 나온다" in out  # 만기가 실적일에서 머니 그 사실을 적는다
     near = us_digest.fmt_earnings(
         rows, None, [], date(2026, 9, 20), {**move, "expiry": "2026-09-25"}
     )
-    assert "실적 전후 변동을 주로 반영" in near  # 만기가 실적 직후면 문구가 바뀐다(경계)
+    assert "실적 전후의 출렁임을 주로 담고 있다" in near  # 만기가 실적 직후면 문구가 바뀐다(경계)
 
 
 def test_earnings_block_marks_option_failure_and_keeps_going():
@@ -1668,9 +1770,12 @@ def test_parse_option_chain_survives_garbage(payload):
     assert us_digest.parse_option_chain(payload, 100.0, date(2026, 9, 23)) is None
 
 
+@pytest.mark.usefixtures("net")
 def test_build_us_digest_full_card(monkeypatch):
     # 형제 테스트들과 같이 UA 를 스텁한다 — 안 하면 실제 `.env` 를 읽어, `.env` 가 없는 환경
     # (공개 미러·새 클론·CI)에서만 SEC 3블록이 `조회 실패`로 렌더돼 이 단언이 깨진다.
+    # `net` 도 형제와 같이 붙인다 — 없으면 **라이브 시세**를 타서 그날 MU 가 오른 날마다
+    # `COLOR_DOWN` 단언이 깨진다(2026-07-31 실측: +18.36% → 실패).
     monkeypatch.setattr(us_digest, "_sec_ua", lambda: "tester tester@example.com")
     spec = build_us_digest("2026-07-29")
     assert spec is not None
@@ -1694,11 +1799,11 @@ def test_build_us_digest_full_card(monkeypatch):
     korea = "🇰🇷 한국 메모리 3사"
     assert all(v.startswith("▸ ") for n, v in values.items() if n != korea)
     assert values[korea].startswith("SK하이닉스 (SKHY)") and "▸ 한국장" in values[korea]
-    assert "₩" in values["💵 마이크론(MU) 시세"]  # 원화환산(§4-1)
+    assert "원화 환산 1,201,584원" in values["💵 마이크론(MU) 시세"]  # 원화환산(§4-1)
     assert "상향 0 · 하향 0" in values["🎯 시장 기대"]  # 0 건도 표기(§4-3)
     assert "내부자 Form 4 2건" in values["🔄 수급·심리"]
     assert "8-K 없음" in values["📰 공시·뉴스"]  # MU 8-K 는 그날 없었다 → 그 자체가 정보(§4-6)
-    assert "TTM" in values["🏭 펀더멘털(SEC)"] and FAIL not in values["🏭 펀더멘털(SEC)"]
+    assert "P/E 최근 1년" in values["🏭 펀더멘털(SEC)"] and FAIL not in values["🏭 펀더멘털(SEC)"]
     assert spec["footer"] == ""  # 출처 푸터 삭제(사용자: 혼자 보는 카드)
 
 
@@ -2386,3 +2491,14 @@ def test_run_us_digest_never_calls_claude(us_env, monkeypatch):
         bridge.us_digest, "build_us_digest", lambda _d: {"title": "T", "fields": [], "footer": ""}
     )
     assert bridge.run_us_digest(us_env, 777, _TODAY) is True
+
+
+def test_selftest_runs_in_the_suite():
+    """`_selftest()` 를 pytest 가 부른다 — **이 한 줄이 없어서 조용히 썩었다.**
+
+    계약서(`docs/기능/디스코드_이관/02_계약.md`)는 매 변경에 selftest 통과를 요구하는데
+    실행 경로가 `python us_digest.py` 뿐이라, 2026-07-31 렌더 개편 때 세 단언이 옛 포맷을
+    든 채 남았고 pytest 295건은 전부 초록이었다. 네트워크를 안 타는 순수 함수 검증뿐이라
+    스위트에 넣어도 안전하다.
+    """
+    us_digest._selftest()

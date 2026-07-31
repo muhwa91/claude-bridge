@@ -4833,18 +4833,30 @@ def test_harness_rejects_folds_control_chars(tmp_path):
 
 
 def test_collect_harness_caps_apply_on_real_call_path(tmp_path, monkeypatch):
-    # harness_backlog·harness_rejects 는 상한을 **기본 인자**로 받는다 — 직접 호출 테스트만으론
-    # collect_harness 가 그 기본값을 타는지 증명되지 않는다. 거대 입력으로 실제 경로를 잠근다.
+    """harness_backlog·harness_rejects 는 상한을 **기본 인자**로 받는다 — 직접 호출 테스트만으론
+    collect_harness 가 그 기본값을 타는지 증명되지 않는다. 거대 입력으로 실제 경로를 잠근다.
+
+    검사는 총길이가 아니라 **최소 입력 대비 증가분**으로 한다. 종전엔 "헤더+라벨+정책 여유
+    600자"라는 매직값을 총길이에 얹었는데, 그 여유를 먹는 것이 HARNESS_POLICY 라 정책을 한 줄
+    늘릴 때마다 여유가 깎였다(2026-07-31 실측 잔여 137자). 증가분은 헤더·정책 길이와 무관해
+    정책이 늘어도 이 테스트는 **절단 여부만** 본다.
+    """
     backlog = tmp_path / "b.md"
-    backlog.write_text("## 열린/미결 항목\n" + "가" * 50_000, encoding="utf-8")
     rejects = tmp_path / "r.jsonl"
-    rows = [{"date": "2026-07-27", "name": "o/" + "n" * 200, "reason": "x" * 200}] * 200
-    rejects.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
     monkeypatch.setattr(bridge, "BACKLOG_FILE", backlog)
     monkeypatch.setattr(bridge, "REJECTED_FILE", rejects)
-    out = bridge.collect_harness(tmp_path / "없음", tmp_path / "없음2")
-    # 헤더 5줄 + 라벨 2줄 + 고정 정책 블록 여유(600자)를 얹은 상한 — 상수를 키우면 같이 움직인다.
-    assert len(out) <= bridge.HARNESS_BACKLOG_MAXLEN + bridge.HARNESS_REJECT_MAXLEN + 600
+    home = tmp_path / "없음"
+    # ① 최소 입력 — 헤더·라벨·고정 정책이 다 실린 바닥 길이를 실측한다(두 블록은 라벨만).
+    backlog.write_text("## 열린/미결 항목\n- x", encoding="utf-8")
+    row = json.dumps({"date": "d", "name": "o/x", "reason": "r"})
+    rejects.write_text(row + "\n", encoding="utf-8")
+    floor = len(bridge.collect_harness(home, home))
+    # ② 거대 입력 — 늘어난 만큼이 두 블록 상한 안이면 절단이 실제로 걸린 것(안 걸리면 +5만).
+    backlog.write_text("## 열린/미결 항목\n" + "가" * 50_000, encoding="utf-8")
+    rows = [{"date": "2026-07-27", "name": "o/" + "n" * 200, "reason": "x" * 200}] * 200
+    rejects.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    grew = len(bridge.collect_harness(home, home)) - floor
+    assert grew <= bridge.HARNESS_BACKLOG_MAXLEN + bridge.HARNESS_REJECT_MAXLEN
 
 
 def test_collect_harness_survives_non_utf8_files(tmp_path, monkeypatch):
@@ -4893,6 +4905,9 @@ def test_harness_policy_carries_no_constitution_secrets():
     # 루트 CLAUDE.md 를 통째로 싣는 대신 사실만 상수로 둔다 — 2차 인증 해시가 다시 들어오면 안 된다.
     blob = "\n".join(bridge.HARNESS_POLICY)
     assert not re.search(r"[0-9a-f]{8,}", blob)
+    # 이 줄들만 strip_control_line 을 안 타고 신뢰 블록에 그대로 박힌다(bridge.py:1526) —
+    # 개행·CR 이 섞이면 블록 **안에서** 가짜 경계선 줄을 만든다. 설정 파일화되면 그때 접어야 한다.
+    assert not any(re.search(r"[\r\n]", p) for p in bridge.HARNESS_POLICY)
 
 
 # ── 모델 정책 자가치유(L-4) — 하드코딩이면 모델 교체 후 판정이 조용히 틀린 근거를 쓴다 ──
@@ -4936,6 +4951,18 @@ def test_build_digest_prompt_separates_harness_from_external():
     assert prompt.index("여기부터 외부 데이터") < prompt.index(bridge._DIGEST_GUARD)
     assert prompt.index(bridge._DIGEST_GUARD) < prompt.index("owner/repo")
     assert prompt.index("README") < prompt.index("외부 데이터 끝")
+
+
+def test_selftest_runs_in_the_suite():
+    """`bridge._selftest()` 를 pytest 가 부른다 — **이 한 줄이 없으면 조용히 썩는다.**
+
+    실행 경로가 `python bridge.py --selftest` 하나뿐이면 스위트가 1,149건 초록이어도 그 안의
+    단언은 **한 번도 안 돈다.** us_digest 가 이미 그렇게 데였다(`test_us_digest.py` 동명 테스트
+    참조 — 2026-07-31 렌더 개편 때 세 단언이 옛 포맷을 든 채 남았고 pytest 295건은 전부 초록).
+    네트워크·subprocess 를 안 타는 순수 함수 검증뿐이고 상태 파일은 conftest 가 tmp 로
+    격리하므로 스위트에 넣어도 안전하다.
+    """
+    bridge._selftest()
 
 
 _BOUNDARY_RE = re.compile(

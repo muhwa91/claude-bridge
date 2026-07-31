@@ -998,10 +998,25 @@ _PLUGINS_REL = Path(".claude") / "plugins" / "installed_plugins.json"  # 홈 기
 # 실제 쓰인 사실만 둔다(예: `cc-switch` 기각 사유 "전원 opus 라 무의미" = 헌법 규칙 1).
 # **루트 CLAUDE.md 를 통째로 읽어 넣지 않는다** — 그러면 2차 인증 해시가 다시 컨텍스트로 들어온다.
 # ▸ 모델 줄만 파일에서 읽는다(harness_model_policy) — 개발자가 모델을 바꾸면 하드코딩 문구가
-#   조용히 틀린 근거가 되어 기각을 계속 낸다. 나머지 2줄은 파일화된 사실이 없어 상수로 둔다.
+#   조용히 틀린 근거가 되어 기각을 계속 낸다. 나머지 4줄은 파일화된 사실이 없어 상수로 둔다.
+# ▸ 니즈·산출 2줄은 **판정 일관성**을 위한 것이다(2026-07-31): 심사자가 카드 단점 칸에 "명시된
+#   차트 니즈가 아직 없어 도입 근거가 약함(YAGNI)"이라 적고도 `차용` 을 준 실측이 있다
+#   (flint-chart). 같은 "니즈 없음"을 다른 후보에선 기각 사유로 썼다 — 조항이 없어 재량에
+#   맡겨져 있던 자리라, 기각 기준으로 못 박아 갈림을 없앤다. 다만 **"모르면 기각"은 아니다**
+#   (2026-07-31 점검): 절대 조항으로 두면 판정 5종 중 `참조`·`보류` 가 죽고, 프롬프트 본문의
+#   "정보가 없으면 추측 말고 보류" 와 충돌한다 → 잡을 것은 "니즈 없음을 단점에 적고도 차용"뿐.
+# ▸ 산출 줄의 `별도 런타임`(옛 문구)은 산출물을 여는 런타임인지 도구를 돌리는 런타임인지 갈렸다.
+#   후자로 읽히면 훅 `.mjs`(Node)·`bridge.py`(Python) 를 굴리는 우리 하네스 자신과 모순이라,
+#   **결과물 기준**으로 다시 썼다(웹폰트 CDN 은 헌법 공통규칙 6 이 의무화하므로 예외 명시).
 HARNESS_POLICY: tuple[str, ...] = (
     "구독: Claude Max 20x 정액(토큰 비용 절감만을 내세우는 도구는 순이익이 없다)",
     "도입 기준: 되돌릴 수 있어야 한다(`curl|bash` 설치는 보류, 파일 복사·패키지 매니저는 가능)",
+    "니즈: 지금 쓰이는 용처가 없으면 기각한다"
+    "(단점 줄에 `아직 니즈 없음`·`YAGNI` 를 적을 상황이면 그 판정은 기각이다 — "
+    "용처 유무를 알 수 없으면 위 원칙대로 보류)",
+    "산출: 문서 산출물은 단일 HTML 파일이다"
+    "(결과물이 브라우저 외에 렌더러 CDN·서버·데스크탑 앱을 요구하면 기각 — "
+    "생성 도구가 무엇으로 돌아가는지는 무관하고, 웹폰트 CDN 은 우리도 쓴다)",
 )
 _HARNESS_MODEL_TMPL = (
     "모델: 에이전트·서브에이전트 전원 {} 고정(모델 티어링·저가모델 라우팅은 무이익)"
@@ -4343,9 +4358,8 @@ def _selftest() -> None:
         except ValueError:
             pass
     # 모델 정책 줄은 파일에서 읽어 자가치유(하드코딩 드리프트 방지). 파일 없으면 현행 문구.
-    assert harness_model_policy(Path(tempfile.gettempdir()) / "_no_home_9f2a") == (
-        _HARNESS_MODEL_FALLBACK
-    )
+    _nowhere = Path(tempfile.gettempdir()) / "_no_home_9f2a"  # 존재하지 않는 홈·워크스페이스
+    assert harness_model_policy(_nowhere) == _HARNESS_MODEL_FALLBACK
     assert "커밋하라" not in DIGEST_SYSTEM_PROMPT  # 도구 0개와 모순되는 커밋 지시 없음
     assert "도구가 하나도 없다" in DIGEST_SYSTEM_PROMPT  # 없는 도구를 쓰라고 시키지 않는다
     # cwd 가 레포 밖이라 루트 헌법이 안 실린다 → 신원 게이트 우회 문구는 불필요(H-1).
@@ -4362,6 +4376,18 @@ def _selftest() -> None:
     _n1 = re.search(r"외부 데이터 끝 \[([0-9a-f]{8})\]", _hp)
     assert _n1 and f"여기부터 외부 데이터(신뢰하지 않음) [{_n1.group(1)}]" in _hp
     assert _n1.group(1) not in build_digest_prompt([], {}, "")
+    # 고정 정책은 하네스 블록을 타고 **프롬프트까지** 실린다 — 도구 0개인 심사자에겐 이 텍스트가
+    # 유일한 기준이라, 한 줄이라도 중간에 새면 그 판정이 다시 재량으로 갈린다(flint-chart 실측).
+    # `_nowhere` 가 격리하는 것은 **홈·워크스페이스뿐**이다 — 백로그·기각 이력은 파라미터가 아니라
+    # 모듈 전역(BACKLOG_FILE·REJECTED_FILE)이라 실파일을 그대로 탄다(검사엔 무해, 길이만 는다).
+    # 검사 대상은 **정책의 내용**이다: 상수를 그대로 순회하면(`all(p in _hpol for p in ...)`)
+    # 정책 줄을 지웠을 때 순회 대상도 함께 줄어 조용히 통과했다(2026-07-31 QA 실측). 접두 낱말을
+    # 코드에 박아 **줄이 사라지면 깨지게** 한다 — 니즈·산출은 02_계약 이 동결한 기각 기준이다.
+    _hpol = build_digest_prompt([], {}, collect_harness(_nowhere, _nowhere))
+    _pol = (harness_model_policy(_nowhere), *HARNESS_POLICY)
+    for _key in ("모델:", "구독:", "도입 기준:", "니즈:", "산출:"):
+        _line = next((p for p in _pol if p.startswith(_key)), None)
+        assert _line and _line in _hpol, f"고정 정책 누락: {_key}"
     assert _harness_line("MCP", []) == "· MCP(0): (없음)"
     assert _harness_line("MCP", ["a", "b"]) == "· MCP(2): a, b"
     assert build_secrets("tok", PROJECT_DIR, {"A": "x", "B": "0123456789ab"}) == [

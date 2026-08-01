@@ -4093,10 +4093,42 @@ def test_due_session_deduped_by_fired():
     assert due_notifications([_SESSION_ITEM], _WED_0910, fired, "2026-07-15") == []
 
 
-def test_due_session_ignores_days_and_at():
-    # on:"session" 항목은 요일·시각창을 보지 않는다(엉뚱한 요일·창 밖에도 세션 핑이면 due).
-    it = {**_SESSION_ITEM, "days": ["mon"], "at": "03:00"}
+def test_due_session_ignores_at_window():
+    # on:"session" 항목은 시각창을 보지 않는다(창 밖이어도 세션 핑이면 due — 판정은 핑이 한다).
+    it = {**_SESSION_ITEM, "at": "03:00", "grace_min": 1}
     assert due_notifications([it], _WED_0931, set(), "2026-07-15") == [it]
+
+
+def test_due_session_without_days_fires_on_every_weekday():
+    # ⓐ days 가 없으면 종전대로 매일(os-digest 무회귀). 7요일 전부 확인한다.
+    for offset in range(7):
+        moment = _WED_0910 + timedelta(days=offset)
+        ping = moment.date().isoformat()
+        assert due_notifications([_SESSION_ITEM], moment, set(), ping) == [_SESSION_ITEM], moment
+
+
+def test_due_session_with_days_fires_only_on_listed_weekdays():
+    # ⓑⓒ days 가 있으면 요일 화이트리스트로 쓴다(us-digest 의 일·월 재탕 차단).
+    it = {**_SESSION_ITEM, "days": ["tue", "wed", "thu", "fri", "sat"]}
+    for offset in range(7):  # 2026-07-15 = 수요일 → offset 4·5 가 일·월
+        moment = _WED_0910 + timedelta(days=offset)
+        ping = moment.date().isoformat()
+        expected = [] if bridge._WEEKDAYS[moment.weekday()] in ("sun", "mon") else [it]
+        assert due_notifications([it], moment, set(), ping) == expected, moment
+
+
+def test_due_session_days_checked_before_ping():
+    # 요일이 아니면 오늘 핑이 있어도 안 나간다(핑이 요일 판정을 덮지 않는다).
+    it = {**_SESSION_ITEM, "days": ["mon"]}
+    assert due_notifications([it], _WED_0910, set(), "2026-07-15") == []
+
+
+def test_due_session_malformed_days_ignored():
+    # days 가 list 가 아니면(오타·수동 편집) 요일 필터를 걸지 않는다 — 알림이 조용히 죽는 것보다
+    # 종전대로 나가는 쪽이 낫다(로더와 같은 방어적 태도).
+    for broken in ("wed", 3, {}, None):
+        it = {**_SESSION_ITEM, "days": broken}
+        assert due_notifications([it], _WED_0910, set(), "2026-07-15") == [it], broken
 
 
 def test_due_at_days_items_unaffected_by_ping():
@@ -5739,7 +5771,14 @@ def test_real_schedules_time_alerts_respect_fired():
         days=bridge._WEEKDAYS.index(days[0]), minutes=grace // 2
     )
     ping = moment.date().isoformat()
-    digests = [it for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
+    # 다이제스트도 `days` 가 있으면 그 요일에만 나온다(us-digest = 화~토) → 기준 항목의 요일에
+    # 실제로 나올 것만 센다. days 가 없는 항목(os-digest)은 종전대로 매일.
+    day = bridge._WEEKDAYS[moment.weekday()]
+    digests = [
+        it
+        for it in _REAL_ITEMS
+        if it["id"] in bridge.DIGEST_RUNNERS and day in it.get("days", [day])
+    ]
     alert = [it for it in _REAL_ITEMS if it["id"] == target]
     assert alert, f"{target} 이 배포본에 없다 — 유도한 기준 항목이 죽었다(공허한 통과 방지)"
     assert due_notifications(_REAL_ITEMS, moment, set(), ping) == alert + digests
@@ -5747,9 +5786,32 @@ def test_real_schedules_time_alerts_respect_fired():
 
 
 @_needs_real_schedules
+def test_real_schedules_us_digest_skips_kst_sun_mon():
+    """배포본 `us-digest` 가 **KST 일·월엔 안 나간다** — 그 두 날 마지막으로 끝난 미장이 여전히
+    금요일이라 토요일 카드의 재탕이다(미장 종료 05:00 / 개장 22:30 KST).
+
+    ⚠️ 이 계약을 나르는 것은 코드가 아니라 **`notify.json` 의 `days`** 다. `due_notifications`
+    쪽은 합성 항목으로 잠겨 있지만, 배포본에서 `days` 를 지우면 **함수 테스트는 전부 초록인 채**
+    일·월 재탕이 그대로 돌아온다(2026-08-02 뮤테이션으로 실제 확인 — 665건 전량 통과했다).
+    그래서 배포본 실물로 7요일을 다 돈다.
+    """
+    by_id = {it["id"]: it for it in _REAL_ITEMS}
+    # 없는 id 로 재면 "안 나온다"가 공허하게 통과한다 → 있는 것부터 확인(이 프로젝트 상습 함정).
+    assert bridge.US_DIGEST_NOTIFY_ID in by_id, "배포본에 us-digest 가 없다"
+    for offset in range(7):  # 2026-07-13 = 월요일. 시각창엔 안 걸리는 03:00 로 잡는다.
+        moment = datetime(2026, 7, 13, 3, 0, tzinfo=_KST) + timedelta(days=offset)
+        ping = moment.date().isoformat()
+        got = [it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), ping)]
+        weekday = bridge._WEEKDAYS[moment.weekday()]
+        expected = weekday not in ("sun", "mon")
+        assert (bridge.US_DIGEST_NOTIFY_ID in got) is expected, f"{weekday} {moment}"
+
+
+@_needs_real_schedules
 def test_real_schedules_digest_needs_session_ping_only():
     # 다이제스트는 요일·시각과 무관 — 아무 창에도 안 걸리는 시각에도 오늘 핑이면 저희끼리 due.
     # 배포본의 다이제스트 항목 **전부**(오픈소스·미국주식)가 같은 규칙으로 잡혀야 한다.
+    # 기준 시각은 **수요일** — us-digest 의 days(화~토) 안이라 요일 필터에 걸리지 않는다.
     moment = datetime(2026, 7, 15, 3, 0, tzinfo=_KST)
     expected = [it["id"] for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
     assert expected, "배포본에 다이제스트 항목이 하나도 없다"

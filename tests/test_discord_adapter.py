@@ -1344,14 +1344,22 @@ def test_scheduler_category_in_order_between_data_and_system():
 
 
 def test_scheduler_special_has_two_role_channels():
+    """**표시명과 tag 가 일부러 다르다** — 표시명은 `반도체주식`, tag 는 `미국주식` 그대로.
+
+    tag 를 표시명에 맞추면 채널 탐색 1차(`channel_map` 의 `(kind, tag)`)·2차(이름 canon)가
+    모두 빗나가 **새 채널이 생긴다** — 옛 채널의 히스토리도 손으로 건 읽기전용 권한도 안 따라온다.
+    표시명만 바꾸면 `_rename_if_needed` 가 기존 채널을 제자리에서 rename 한다.
+    """
     assert discord_adapter._SPECIAL[discord_adapter._CAT_SCHED] == [
-        ("미국주식", "role", "미국주식"),
+        ("반도체주식", "role", "미국주식"),
         ("오픈소스", "role", "오픈소스"),
     ]
+    # 읽기전용·notify.json 라우팅도 tag 기준이라 함께 무변경이어야 한다.
+    assert "미국주식" in discord_adapter._READONLY_TAGS
 
 
 def test_scheduler_channels_created_and_mapped(monkeypatch):
-    # 새 카테고리 🗓️ 스케쥴러 아래에 미국주식·오픈소스 role 채널 생성 + channel_map 매핑.
+    # 새 카테고리 🗓️ 스케쥴러 아래에 반도체주식·오픈소스 role 채널 생성 + channel_map 매핑.
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
@@ -1360,19 +1368,34 @@ def test_scheduler_channels_created_and_mapped(monkeypatch):
     tags = set(a._channel_map.values())
     assert ("role", "미국주식") in tags and ("role", "오픈소스") in tags
     created = {n for n, _ in guild.created}
-    assert {"미국주식", "오픈소스"} <= created
+    assert {"반도체주식", "오픈소스"} <= created
+    # 라우팅 키는 **tag** 다 — 표시명이 바뀌어도 `notify.json` 의 `channel: "미국주식"` 이 산다.
     assert a.role_channel("미국주식") is not None and a.role_channel("오픈소스") is not None
     assert any(discord_adapter._cat_core(c.name) == "스케쥴러" for c in guild.categories)
 
 
+def test_existing_us_channel_is_renamed_not_recreated(monkeypatch):
+    """표시명 변경은 **기존 채널 rename** 이어야 한다 — 새로 만들면 히스토리·권한이 사라진다."""
+    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    a.setup_channels([])
+    old = _FakeChannel(777, "미국주식", overwrites={"@everyone": False, "bot": True})
+    a._channel_map = {777: ("role", "미국주식")}
+    guild = _guild_for(a, text_channels=[old])
+    asyncio.run(a._ensure_channels())
+    assert old.name == "반도체주식"  # 제자리 rename
+    assert "반도체주식" not in {n for n, _ in guild.created}  # 새 채널을 만들지 않았다
+    assert a._channel_map[777] == ("role", "미국주식")  # tag 는 그대로 → 라우팅 유지
+
+
 def test_us_channel_is_readonly_for_people_but_writable_by_bot(monkeypatch):
-    # #미국주식 은 읽기 전용(사용자: "매일 보는 용도로만"). **봇까지 잠그면 카드가 못 나간다.**
+    # #반도체주식 은 읽기 전용(사용자: "매일 보는 용도로만"). **봇까지 잠그면 카드가 못 나간다.**
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
-    ch = next(c for c in guild.text_channels if c.name == "미국주식")
+    ch = next(c for c in guild.text_channels if c.name == "반도체주식")
     assert ch.bit("@everyone") is False  # 사람은 못 쓴다
     assert ch.bit("bot") is True  # 봇은 쓴다
     others = [c for c in guild.text_channels if c.name in ("오픈소스", "알림")]
@@ -2009,13 +2032,26 @@ def test_build_card_embed_caps_description_and_field_count():
 
 
 def test_build_card_embed_announces_omitted_fields_in_footer():
-    """조용한 절단 금지 — 미국주식 카드면 마지막 두 필드(한국·섹터)가 소리 없이 사라진다.
+    """조용한 절단 금지 — 반도체주식 카드면 맨 뒤 국내장 3필드(지수·메모리·장비소재)가 소리 없이
+    사라진다.
     이 모듈의 원칙("조용히 죽는 것보다 안 쓴다고 말하고 죽는 것이 낫다")과 어긋난다."""
     embed = discord_adapter.build_card_embed(
         {"footer": "출처", "fields": [(f"n{i}", "값" * 1000, False) for i in range(10)]}, []
     )
     assert "생략" in embed.footer.text and "출처" in embed.footer.text
     assert len(embed.footer.text) <= discord_adapter._OMIT_NOTE_MAXLEN + len("출처") + 3
+
+
+def test_omit_note_reserve_matches_the_us_digest_budget_assumption():
+    """`test_us_digest` 의 필드 예산 계약이 이 값을 **숫자로 베껴 둔다** — 그 파일은 discord.py
+    없이도 도느라 어댑터를 import 하지 않는다(공개 미러본 사정).
+
+    여기가 커지면 실제 예산은 줄어드는데 그쪽 계산은 그대로라 **조용히 낙관적**이 된다 →
+    카드 뒤쪽(국내장 3필드)이 말없이 잘린다. 두 숫자를 이 한 줄로 묶어 둔다.
+    """
+    import test_us_digest
+
+    assert discord_adapter._OMIT_NOTE_MAXLEN == test_us_digest.DISCORD_OMIT_NOTE_RESERVE
 
 
 def test_build_card_embed_clamps_description_to_total_budget():
@@ -2039,7 +2075,7 @@ def test_build_card_embed_clamps_description_to_total_budget():
 
 def test_build_card_embed_drops_fields_past_total_limit():
     """슬롯별 한도를 다 지켜도 **합계 6000 을 넘으면 디스코드가 400 으로 거부**해 메시지 자체가
-    사라진다. 호출자가 둘(오픈소스 5x1000 · 미국주식 8x700)이고 산식이 달라 누적으로도 센다.
+    사라진다. 호출자가 둘(오픈소스 5x1000 · 반도체주식 10x550)이고 산식이 달라 누적으로도 센다.
     넘치는 필드는 버리되 앞쪽은 살린다 — 한 필드를 잃는 게 카드 전체를 잃는 것보다 낫다.
     """
     embed = discord_adapter.build_card_embed(

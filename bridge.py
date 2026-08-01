@@ -578,6 +578,7 @@ def due_notifications(
     `"on": "session"` 항목은 시각창 대신 **세션 핑**으로 판정한다: session_ping_date(오늘 세션이
     열렸으면 오늘 날짜)가 오늘이고 아직 안 쐈으면 due. 핑 파일 읽기는 호출측(dispatch)이 하고
     여기엔 값만 주입해 이 함수의 순수성을 유지한다(테스트가 핑을 직접 주는 seam).
+    세션 항목도 `days` 가 **있으면** 그 요일에만 due 다(없으면 매일 — 종전 동작).
     """
     day = _WEEKDAYS[now_kst.weekday()]
     today = now_kst.date().isoformat()
@@ -587,9 +588,19 @@ def due_notifications(
         if not isinstance(item_id, str):
             continue
         if it.get("on") == "session":
+            # 세션 항목은 at/grace_min 을 안 본다(시각창 판정은 세션 핑이 대신한다). 다만 days 가
+            # **있으면** 요일 화이트리스트로 쓴다 — 미국주식 다이제스트는 KST 일·월에 보내봐야
+            # 마지막으로 **끝난** 미장이 여전히 금요일이라 토요일 카드의 재탕이 된다.
+            # days 가 없으면 종전대로 매일 통과(os-digest 무회귀).
+            # ponytail: 요일 화이트리스트라 미국 **휴장일**(추수감사절·독립기념일)은 못 거른다 —
+            # 그날 카드는 전일 재탕이 된다. 거슬리면 "마지막 세션 날짜"를 시세에서 읽어
+            # 직전 발송분과 비교하는 방식으로 올린다(요일 목록을 늘리는 게 아니라).
+            session_days = it.get("days")
+            if isinstance(session_days, list) and day not in session_days:
+                continue
             if session_ping_date == today and (item_id, today) not in fired:
                 out.append(it)
-            continue  # 세션 항목은 days/at 을 안 본다(있어도 무시)
+            continue
         days = it.get("days")
         at = it.get("at")
         if not isinstance(days, list) or day not in days:

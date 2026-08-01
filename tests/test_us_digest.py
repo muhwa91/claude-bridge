@@ -12,6 +12,8 @@
 """
 
 import json
+import logging
+import math
 import re
 import urllib.error
 from datetime import date, datetime
@@ -25,12 +27,15 @@ from us_digest import (
     _instant_series,
     _next_earnings,
     _num,
+    breadth_closing,
     build_us_digest,
     fit,
     fmt_filings,
     fmt_flows,
     fmt_fundamentals,
     fmt_korea,
+    fmt_korea_equip,
+    fmt_korea_index,
     fmt_price,
     fmt_sector,
     parse_apewisdom,
@@ -51,6 +56,19 @@ from us_digest import (
 # 디스코드 하드 한도(어댑터가 아니라 플랫폼이 정한 값) — 카드가 이걸 넘으면 게시 자체가 400.
 DISCORD_FIELD_MAX = 1024
 DISCORD_EMBED_TOTAL_MAX = 6000
+# 어댑터가 footer 의 `⚠️N개 필드 생략` 몫으로 총합에서 미리 떼는 값
+# (`discord_adapter._OMIT_NOTE_MAXLEN`). 여기 숫자로 박는 이유: 이 파일은 `discord.py` 없이도
+# 도는 순수 테스트라 어댑터를 import 하지 않는다.
+DISCORD_OMIT_NOTE_RESERVE = 40
+
+# 카드 필드 구성(미국장 7 + 국내장 3). 개수를 여기 한 곳에서 유도해 예산 테스트와 조립 테스트가
+# 갈리지 않게 한다 — 필드를 늘리면 `us_digest.FIELD_MAXLEN` 도 같이 내려야 한다(그 상수 주석).
+_US_PRICE_FIELD = "🇺🇸 💵 마이크론(MU) 시세"
+_FIELD_COUNT = 10
+# footer 는 시총 교차검증 경고 한 문장(`⚠️ 시총 교차검증 불일치 N% — 재무 수치 확인 필요`, 34자)
+# 뿐이다. **숫자로 박지 않고 코드 상수를 읽는다** — 종전엔 80 을 박아 뒀는데 상류가 이상한
+# 시총을 주면 실제 문장이 341자까지 부풀어(예산 초과) 상수가 예산의 근거가 못 됐다.
+_WORST_FOOTER = us_digest.FOOTER_MAXLEN
 
 
 @pytest.fixture(autouse=True)
@@ -83,15 +101,26 @@ def _norm(text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # ① 순수 파서 — parse_quote
 # ═══════════════════════════════════════════════════════════════════════════
-def _chart(closes, **meta):
+# 봉 시각 기본값 = **하루 간격 일봉**, 마지막 봉이 이 epoch. `gmtoffset` 이 없으면 거래소 현지
+# 날짜 = UTC 날짜라 `day` 가 2026-07-29(통합 테스트의 `today`)로 나온다.
+_LAST_BAR = 1_785_283_200  # 2026-07-29 00:00 UTC
+_DAY = 86_400
+
+
+def _chart(closes, timestamp=None, **meta):
     base = {"symbol": "MU", "currency": "USD", "chartPreviousClose": 95.0}
     base.update(meta)
+    stamps = (
+        list(timestamp)
+        if timestamp is not None
+        else [_LAST_BAR - _DAY * i for i in range(len(closes) - 1, -1, -1)]
+    )
     return {
         "chart": {
             "result": [
                 {
                     "meta": base,
-                    "timestamp": list(range(len(closes))),
+                    "timestamp": stamps,
                     "indicators": {"quote": [{"close": list(closes), "volume": [1] * len(closes)}]},
                 }
             ],
@@ -151,10 +180,146 @@ def test_parse_quote_high_is_window_max_not_52w():
     assert quote["high"] == 30.0
 
 
+def test_parse_quote_rejects_nan_and_bool_closes():
+    """`isinstance(c, (int, float))` 만으로는 **NaN 과 `True` 가 시세로 통과**한다.
+
+    도달 경로: `json.loads` 는 bare `NaN`/`Infinity` 토큰을 허용하고, `bool` 은 `int` 의
+    서브클래스다. `pct()` 는 `math.isfinite` 로 등락률만 막으므로, 여기서 안 거르면 가격
+    렌더가 `코스피 nan` 을 찍는다 → **거르는 자리는 이 파서 한 곳**이어야 한다.
+    """
+    quote = parse_quote(_chart([100.0, True, float("nan")]))
+    assert quote is not None
+    # 가드가 없으면 bars=3 · prev=True(1.0) 로 등락률이 -9,900% 가 된다.
+    assert (quote["price"], quote["prev"], quote["bars"]) == (100.0, None, 1)
+    assert parse_quote(_chart([float("nan"), float("inf")])) is None
+    assert parse_quote(_chart([True, False])) is None
+    # 포매터 쪽에 가드를 더하지 않고도 가격 줄이 낫는지 — 이게 이 수정의 목적이다.
+    rendered = fmt_korea_index({"^KS11": parse_quote(_chart([100.0, float("nan")]))})
+    assert "nan" not in rendered and "코스피 100.00" in _norm(rendered)
+
+
 def test_parse_quote_reads_52w_from_meta():
     quote = parse_quote(_chart([820.53], fiftyTwoWeekHigh=1213.56, fiftyTwoWeekLow=61.54))
     assert quote is not None
     assert (quote["w52h"], quote["w52l"]) == (1213.56, 61.54)
+
+
+# ── 마지막 봉의 거래일 · 장중 여부(2026-08-02) ─────────────────────────────
+# 라이브 실측(2026-08-02 일요일): `^KS11` gmtoffset 32400 · 마지막 봉 1785456000 → 07-31 09:00
+# (개장 시각) · `MU` gmtoffset -14400 · 마지막 봉 1785504600 → 07-31 09:30. 양쪽 intraday=False.
+_KS_OPEN = 1_785_456_000  # 2026-07-31 09:00 KST
+_KS_CLOSE = 1_785_477_600  # 2026-07-31 15:00 KST
+
+
+def _kospi(closes, timestamp=None, **meta):
+    """한국 거래소 응답 모양 — `gmtoffset` 이 있어야 UTC 날짜와 현지 날짜가 갈린다."""
+    return _chart(closes, timestamp=timestamp, symbol="^KS11", gmtoffset=32400, **meta)
+
+
+def _period(start, end, now):
+    return {
+        "currentTradingPeriod": {"regular": {"start": start, "end": end}},
+        "regularMarketTime": now,
+    }
+
+
+def test_parse_quote_day_survives_holes_in_the_close_series():
+    """⚠️ **이번 작업의 핵심.** 결측 봉을 거른 뒤에도 (시각, 종가) 짝이 유지돼야 한다.
+
+    `timestamp` 를 종가와 **따로** 인덱싱하면 걸러낸 수만큼 밀린다(오프바이원). trading-info 가
+    2026-07-30 에 같은 계열 실수로 코스피 기준가를 전전 거래일로 잡아 등락을 -5.98% →
+    -16.17% 로 부풀렸다 — 카드는 멀쩡해 보이고 숫자만 거짓이 되는 종류다.
+    """
+    payload = _kospi(
+        [100.0, None, None, 120.0],
+        timestamp=[_KS_OPEN - _DAY * 3, _KS_OPEN - _DAY * 2, _KS_OPEN - _DAY, _KS_OPEN],
+    )
+    quote = parse_quote(payload)
+    assert quote is not None
+    assert quote["day"] == "2026-07-31"  # 한 칸이라도 밀리면 07-30·07-29 가 나온다
+    # 값 계산은 리팩터 전과 **한 값도 달라지면 안 된다**.
+    assert (quote["price"], quote["prev"], quote["bars"], quote["high"]) == (120.0, 100.0, 2, 120.0)
+
+
+def test_parse_quote_day_is_the_exchange_local_date_not_utc():
+    """자정을 걸치는 봉에서 갈린다 — gmtoffset 을 안 더하면 서울 날짜가 하루 전으로 찍힌다.
+
+    `2026-07-30 23:00 UTC` = 서울 `2026-07-31 08:00`. 두 응답의 유일한 차이는 `gmtoffset` 이다.
+    """
+    before_dawn = _KS_OPEN - 3600
+    seoul = parse_quote(_kospi([100.0], timestamp=[before_dawn]))
+    utc = parse_quote(_chart([100.0], timestamp=[before_dawn]))  # gmtoffset 없음
+    assert seoul is not None and utc is not None
+    assert (seoul["day"], utc["day"]) == ("2026-07-31", "2026-07-30")
+
+
+@pytest.mark.parametrize(
+    ("stamps", "why"),
+    [
+        (None, "timestamp 키 자체가 없다"),
+        ([1, 2], "종가보다 짧다"),
+        ([1, 2, 3, 4], "종가보다 길다"),
+        ("nope", "리스트가 아니다"),
+    ],
+)
+def test_parse_quote_without_matching_timestamps_has_no_day_but_keeps_values(stamps, why):
+    """짝이 안 맞으면 **억지로 맞추지 않고** 날짜만 버린다 — 틀린 날짜보다 없는 날짜가 낫다."""
+    payload = _kospi([100.0, 110.0, 120.0])
+    if stamps is None:
+        del payload["chart"]["result"][0]["timestamp"]
+    else:
+        payload["chart"]["result"][0]["timestamp"] = stamps
+    quote = parse_quote(payload)
+    assert quote is not None, why
+    assert quote["day"] is None and quote["intraday"] is False, why
+    assert (quote["price"], quote["prev"], quote["bars"]) == (120.0, 110.0, 3), why
+
+
+@pytest.mark.parametrize(
+    ("now", "want", "why"),
+    [
+        (_KS_OPEN + 3600, True, "정규장 한복판 = 장중"),
+        (_KS_CLOSE - 1, True, "마감 1초 전도 장중"),
+        (_KS_CLOSE, False, "마감 시각에 닿으면 끝난 것"),
+        (_KS_CLOSE + 3600, False, "장 끝난 뒤"),
+    ],
+)
+def test_parse_quote_intraday_is_pure_epoch_comparison(now, want, why):
+    quote = parse_quote(_kospi([100.0], timestamp=[_KS_OPEN], **_period(_KS_OPEN, _KS_CLOSE, now)))
+    assert quote is not None
+    assert quote["intraday"] is want, why
+
+
+def test_parse_quote_not_intraday_when_the_last_bar_is_an_older_session():
+    """주말·휴장이면 `currentTradingPeriod` 가 **다음 세션**을 가리킬 수 있다.
+
+    그때 `regularMarketTime`(금요일 값)만 보면 `now < end` 라 장중으로 오판한다 → 마지막 봉이
+    그 창 **안에 있는지**를 함께 본다.
+    """
+    quote = parse_quote(
+        _kospi(
+            [100.0],
+            timestamp=[_KS_OPEN],  # 금요일 봉
+            **_period(_KS_OPEN + _DAY * 3, _KS_CLOSE + _DAY * 3, _KS_CLOSE),  # 다음 월요일 창
+        )
+    )
+    assert quote is not None
+    assert quote["intraday"] is False
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {},  # 필드 자체가 없다
+        {"currentTradingPeriod": "nope", "regularMarketTime": _KS_OPEN + 60},
+        {"currentTradingPeriod": {"regular": [1, 2]}, "regularMarketTime": _KS_OPEN + 60},
+        {"currentTradingPeriod": {"regular": {"start": None, "end": None}}},
+    ],
+)
+def test_parse_quote_intraday_defaults_to_closed_on_junk(meta):
+    # 보수적 기본값 = 마감. 모르는 상태를 "진행 중"이라고 우기면 카드가 없는 사실을 만든다.
+    quote = parse_quote(_kospi([100.0], timestamp=[_KS_OPEN], **meta))
+    assert quote is not None and quote["intraday"] is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -469,6 +634,21 @@ def test_fit_keeps_blank_lines_as_separators():
     # `fit` 은 자르기만 한다 — 줄을 **걸러내지는 않는다**(빈 줄도 넣은 그대로 나온다).
     # ※ 지금은 어느 블록도 빈 줄을 넣지 않는다(2026-07-31 개편) — 그래도 필터가 아님은 그대로다.
     assert fit(["", "A", "", "B"], 100) == "\nA\n\nB"
+
+
+def test_fit_says_out_loud_how_many_lines_it_dropped(caplog):
+    """버린 줄은 **로그로 말한다** — 안 그러면 "LLM 이 1줄만 냈다"로 오해한다.
+
+    `continue` 라 긴 줄만 골라 사라지므로 카드는 멀쩡해 보인다(`📅 실적` 의 LLM 줄이 실제
+    후보다). 이 로그가 그 유일한 단서다.
+    """
+    with caplog.at_level(logging.INFO, logger="bridge"):
+        assert fit(["A" * 10, "B" * 10, "C" * 10, "D"], 13) == "A" * 10 + "\nD"
+    assert "2줄 생략" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="bridge"):
+        fit(["A", "B"], 100)
+    assert "생략" not in caplog.text  # 안 버렸으면 조용하다
 
 
 def test_fit_never_exceeds_limit():
@@ -1049,6 +1229,25 @@ def test_fmt_fundamentals_mcap_crosscheck_warns_only_beyond_tolerance():
     assert "🔺" not in bad_warn and "🔻" not in bad_warn
 
 
+def test_mcap_warn_never_outgrows_the_footer_budget():
+    """footer 예산(`FOOTER_MAXLEN`)은 **실제 상한이어야** 한다 — 안 그러면 임베드 총합이 깨진다.
+
+    괴리가 크면 `{gap:.1f}` 가 수백 자로 부푼다(QA 실측 341자). 이때 **문장을 자르지 않는다** —
+    숫자 중간에서 끊으면 남은 자릿수가 다른 값으로 읽히므로, 수치 없는 문장으로 바꾼다.
+    """
+    facts = {
+        "quarters": [
+            {"end": "2025-05-31", "rev": 1e10, "gross": 5e9, "op": 3e9, "eps": 5.0, "inv": 8e9},
+            {"end": "2025-08-31", "rev": 1.2e10, "gross": 6e9, "op": 4e9, "eps": 6.0, "inv": 9e9},
+        ],
+        "shares": 10**100,
+    }
+    _field, warn = fmt_fundamentals(facts, 1e200, None, 1.0)  # gap ≈ 1e302 → 300자대 경고
+    assert len(warn) <= us_digest.FOOTER_MAXLEN, f"footer {len(warn)}자 — 예산 상수가 거짓이다"
+    assert "시총 교차검증 불일치" in warn  # 경고 자체는 살아 있어야 한다
+    assert not re.search(r"\d{5,}", warn)  # 잘린 자릿수를 남기지 않는다
+
+
 def test_fmt_fundamentals_ttm_failed_when_quarters_short():
     facts = {"quarters": [{"end": "2025-08-31", "rev": 1e10, "eps": 6.0}], "shares": 0}
     field = _norm(fmt_fundamentals(facts, 100.0, None, None)[0])
@@ -1091,14 +1290,267 @@ def test_fmt_sector_partial_quotes():
     out = fmt_sector(quotes)
     assert "엔비디아 (NVDA) 🔻 2.1%" in out  # 한 줄에 한 종목 · 주식명(티커)
     assert "AMD" not in out  # 죽은 종목은 목록에서 빠지되(한 줄이 실패로 도배되지 않게)
-    assert f"(8종 {FAIL})" in out  # 몇 종이 빠졌는지는 꼬리로 남는다
+    assert f"({len(us_digest.SECTOR) - 1}종 {FAIL})" in out  # 몇 종이 빠졌는지는 꼬리로 남는다
     assert "SOX" not in out  # 지수 줄은 렌더에서 빠졌다(값 계산은 index_line 이 유지)
     assert us_digest.index_line(quotes) == f"SOX 🔻 3.2% · SMH {FAIL}"
 
 
 def test_fmt_sector_all_dead():
-    # 9종이 통째로 죽어도 **몇 종이 빠졌는지**는 남아야 한다(빈 줄이면 "오늘은 이게 다"로 읽힌다).
-    assert f"(9종 {FAIL})" in fmt_sector({})
+    # 전종이 통째로 죽어도 **몇 종이 빠졌는지**는 남아야 한다(빈 줄이면 "오늘은 이게 다"로 읽힌다).
+    assert f"({len(us_digest.SECTOR)}종 {FAIL})" in fmt_sector({})
+
+
+# ── 국내장 신규 2블록(2026-08-02) ──────────────────────────────────────────
+def test_fmt_korea_index_shows_both_indexes_with_level_and_change():
+    quotes = {"^KS11": {"price": 3_255.12, "pct": 1.24}, "^KQ11": {"price": 812.4, "pct": -0.51}}
+    out = _norm(fmt_korea_index(quotes))
+    assert "코스피 3,255.12 (🔺 1.24%)" in out
+    assert "코스닥 812.40 (🔻 0.51%)" in out
+    assert "코스피 🔺 1.2% · 코스닥 🔻 0.5%" in out.split("\n")[0]  # ▸ 요약 = index_line
+
+
+def test_fmt_korea_index_dead_side_is_marked_not_hidden():
+    """한쪽을 못 받았으면 **못 받았다고 적는다** — 조용히 빼면 "오늘은 코스피만"으로 읽힌다.
+
+    ⚠️ `in out` 으로 재면 안 된다 — `▸ 요약`(= `index_line`)이 이미 `코스닥 조회 실패` 를
+    품고 있어, 세부 행을 `continue` 로 통째로 빼도 **공허하게 통과한다**(2026-08-02 뮤테이션
+    적발). 세부 행 목록에서 **줄 단위로** 재야 실패 행이 실제로 섰는지가 잡힌다.
+    """
+    lines = _norm(fmt_korea_index({"^KS11": {"price": 3_255.12, "pct": 1.24}})).split("\n")
+    assert f"코스닥 {FAIL}" in lines[1:]  # ▸ 요약 아래 세부 행에 한 줄로 선다
+    assert f"코스닥 {FAIL}" in lines[0]  # 요약 줄에도 남는다(index_line)
+    assert "한쪽을 못 받아" in _closing("\n".join(lines))
+
+
+@pytest.mark.parametrize(
+    ("ks", "kq", "must"),
+    [
+        (1.2, 0.5, "같은 방향"),
+        (-1.2, -0.5, "같은 방향"),
+        (1.2, -0.5, "반대로 갔다"),  # 대형/중소형 자금 이동
+        (0.0, 1.2, "제자리라"),  # 곱셈 부호로는 못 가르는 경계(한쪽 보합)
+        (1.2, 0.0, "제자리라"),
+    ],
+)
+def test_korea_index_closing_follows_the_direction_pair(ks, kq, must):
+    quotes = {"^KS11": {"price": 3_000.0, "pct": ks}, "^KQ11": {"price": 800.0, "pct": kq}}
+    assert must in _closing(fmt_korea_index(quotes))
+
+
+def test_fmt_korea_equip_uses_names_without_tickers():
+    """국내 종목은 **이름만** — `042700.KS` 를 봐도 어느 회사인지 안 나온다(fmt_korea 관례)."""
+    quotes = {s: {"price": 100_000.0 + i, "pct": -1.0} for i, s in enumerate(us_digest.KOREA_EQUIP)}
+    out = _norm(fmt_korea_equip(quotes))
+    assert "한미반도체 100,000원 (🔻 1.0%)" in out
+    for symbol in us_digest.KOREA_EQUIP:
+        assert symbol not in out, symbol  # 티커는 카드에 나오지 않는다
+        assert us_digest.NAMES[symbol] in out  # 한글명은 전부 나온다
+
+
+def test_fmt_korea_equip_partial_and_all_dead():
+    one = {"042700.KS": {"price": 214_500.0, "pct": 2.5}}
+    out = fmt_korea_equip(one)
+    assert "한미반도체" in out
+    assert f"({len(us_digest.KOREA_EQUIP) - 1}종 {FAIL})" in out  # 몇 종이 빠졌는지는 남는다
+    dead = fmt_korea_equip({})
+    assert f"({len(us_digest.KOREA_EQUIP)}종 {FAIL})" in dead
+    assert f"장비·소재 {FAIL}" in dead.split("\n")[0]  # ▸ 요약도 실패를 말한다
+
+
+@pytest.mark.parametrize("intraday", [False, True])
+def test_breadth_closing_is_shared_so_thresholds_cannot_drift(intraday):
+    """섹터와 장비·소재가 **같은 사다리**를 쓴다 — 복제하면 임계값이 조용히 갈린다.
+
+    같은 입력이면 주어(subject)만 다르고 판정은 같아야 한다. **장중 인자가 붙어도 마찬가지다**
+    — 시제가 갈린다고 임계까지 갈리면 같은 종목 구성이 장중/마감에서 다른 진단을 받는다.
+    """
+    mixed = [-1.0, -1.0, 1.0, 1.0]
+    assert breadth_closing(mixed, "반도체", intraday) == breadth_closing(
+        mixed, "장비·소재주", intraday
+    )
+    assert breadth_closing([-1.0] * 4, "반도체", intraday).startswith("반도체가 ")
+    assert breadth_closing([-1.0] * 4, "장비·소재주", intraday).startswith("장비·소재주가 ")
+    # 임계 경계 — 3/4 = 0.75 는 "거의 다", 2/4 = 0.5 는 "섞였다"
+    assert "거의 다 빠졌다" in breadth_closing([-1.0, -1.0, -1.0, 1.0], "장비·소재주", intraday)
+    assert "섞였다" in breadth_closing([-1.0, -1.0, 1.0, 1.0], "장비·소재주", intraday)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        [],
+        [-1.0],
+        [-1.0] * 4,
+        [1.0] * 4,
+        [-1.0] * 3 + [1.0],
+        [-1.0] + [1.0] * 3,
+        [-1.0, -1.0, 1.0, 1.0],
+    ],
+)
+def test_breadth_verdict_is_the_same_only_the_tense_moves(changes):
+    """장중은 **판정이 아니라 어미**만 바꾼다 — `—` 앞(진단)은 두 시제가 글자까지 같아야 한다.
+
+    이 단언이 없으면 장중 분기를 추가하면서 임계값이나 진단 문구가 슬쩍 갈려도 아무도 모른다.
+    """
+    closed = breadth_closing(changes, "장비·소재주")
+    live = breadth_closing(changes, "장비·소재주", True)
+    assert closed.split(" — ")[0] == live.split(" — ")[0]
+    # 하루가 안 끝났으면 "…한 날이다"로 끝내지 않는다(판정이 서는 표본에 한해).
+    if "날이다" in closed or "날로 봐야" in closed:
+        assert live != closed and "날이다" not in live and "날로 봐야" not in live
+        assert "중이다" in live or "중으로 봐야" in live
+
+
+@pytest.mark.parametrize("n", [1, 2])
+def test_breadth_refuses_to_judge_a_sector_from_one_or_two_names(n):
+    """살아남은 1~2종으로 "업종 전체가 밀린 날"을 단정하면 안 된다.
+
+    비율 사다리는 1/1 = 100% 도 "전량"으로 받아들인다 — 4종뿐인 `fmt_korea_equip` 에서
+    3종이 조회 실패하는 날이 실제 위험이다(설·추석 연휴).
+    """
+    out = breadth_closing([-1.0] * n, "장비·소재주")
+    assert "표본이 안 된다" in out
+    assert "전부 같이 빠졌다" not in out and "업종 전체가 밀린 날" not in out
+
+
+def test_breadth_judges_from_the_minimum_sample():
+    # 하한 바로 위(3종)부터는 종전대로 판정한다 — 가드가 판정 자체를 죽이면 안 된다.
+    assert "전부 같이 빠졌다" in breadth_closing([-1.0] * 3, "장비·소재주")
+    assert "전부 같이 올랐다" in breadth_closing([1.0] * 3, "장비·소재주")
+
+
+# ── 거래일 표기 · 장중 문구(2026-08-02) ────────────────────────────────────
+def _dated(price, pct_, day="2026-07-31", intraday=False, **extra):
+    return {"price": price, "pct": pct_, "day": day, "intraday": intraday, **extra}
+
+
+@pytest.mark.parametrize(("intraday", "want"), [(False, "7월 31일 마감"), (True, "7월 31일 장중")])
+def test_korea_blocks_stamp_the_trading_day_on_their_summary(intraday, want):
+    """국내장 3필드는 `▸ 요약` 앞에 **어느 거래일인지**를 달고 나온다.
+
+    카드는 세션 시작 시 1회 도는데 화~금 오전이면 국내장은 장중·미국장은 어제 마감이라
+    한 장에 두 거래일이 섞인다 — 표기가 없으면 읽는 사람이 그걸 가를 수 없다.
+    """
+    index = fmt_korea_index(
+        {
+            "^KS11": _dated(3_255.12, 1.24, intraday=intraday),
+            "^KQ11": _dated(812.4, -0.51, intraday=intraday),
+        }
+    )
+    equip = fmt_korea_equip(
+        {s: _dated(100_000.0, -1.0, intraday=intraday) for s in us_digest.KOREA_EQUIP}
+    )
+    memory = fmt_korea(
+        {
+            "SKHY": {"price": 130.0, "pct": -7.0, "bars": 13, "high": 190.0},
+            "000660.KS": _dated(1_400_000.0, -8.0, intraday=intraday),
+            "005930.KS": _dated(208_500.0, -5.2, intraday=intraday),
+        },
+        None,
+    )
+    assert index.split("\n")[0].startswith(f"▸ {want} · ")
+    assert equip.split("\n")[0].startswith(f"▸ {want} · ")
+    # 🇰🇷 메모리는 `▸` 가 시장 구분자라 **`▸ 한국장` 쪽**에 붙는다(나스닥 줄은 다른 세션이다).
+    assert f"▸ 한국장 ({want})" in memory.split("\n")
+    assert "▸ 나스닥" in memory.split("\n")  # 나스닥 구분자에는 안 붙인다(같은 세션 = 소음)
+
+
+def test_mu_price_stamps_the_trading_day_so_previous_close_has_an_anchor():
+    quote = _dated(823.03, -5.9, day="2026-07-31", w52h=1213.56, w52l=61.54, prev=874.66)
+    out = _norm(fmt_price(quote, None))
+    assert out.split("\n")[0].startswith("▸ 7월 31일 마감 · $823.03 · 어제보다 ")
+    assert "전일 종가 $874.66" in out  # "전일"이 어느 날인지는 위 표기가 말한다
+
+
+def test_blocks_without_a_day_render_exactly_as_before():
+    """`day` 가 없으면(형식 이탈·옛 캐시) 표기를 **지어내지 않고** 종전 요약 그대로 낸다."""
+    out = fmt_korea_index({"^KS11": {"price": 3_255.12, "pct": 1.24}})
+    assert out.split("\n")[0].startswith("▸ 코스피 ")
+    assert fmt_korea_equip({"042700.KS": {"price": 1.0, "pct": -1.0}}).startswith("▸ 1종 중 1종")
+    assert "▸ 한국장" in fmt_korea({}, None).split("\n")
+
+
+@pytest.mark.parametrize(
+    ("ks", "kq", "closed", "live"),
+    [
+        (1.2, 0.5, "움직인 날이다", "움직이는 중이다"),
+        (1.2, -0.5, "옮겨간 날이다", "옮겨가는 중이다"),
+    ],
+)
+def test_korea_index_closing_does_not_call_an_unfinished_day_finished(ks, kq, closed, live):
+    def render(intraday):
+        return _closing(
+            fmt_korea_index(
+                {
+                    "^KS11": _dated(3_000.0, ks, intraday=intraday),
+                    "^KQ11": _dated(800.0, kq, intraday=intraday),
+                }
+            )
+        )
+
+    assert render(False).endswith(closed)
+    assert render(True).endswith(live)
+
+
+def test_equip_and_sector_closings_follow_the_session_state():
+    equip = {s: _dated(1000.0, -1.0, intraday=True) for s in us_digest.KOREA_EQUIP}
+    assert "밀리는 중이다" in _closing(fmt_korea_equip(equip))
+    # 미국장 필드는 날짜를 안 달지만 **어미는 갈린다**(미장 개장 중에 카드를 내면 여기도 미완결).
+    sector = {s: _dated(100.0, -1.0, intraday=True) for s in us_digest.SECTOR}
+    assert "밀리는 중이다" in _closing(fmt_sector(sector))
+    assert "7월 31일" not in fmt_sector(sector)  # 같은 세션 필드에 날짜를 뿌리지 않는다
+
+
+def test_memory_closing_does_not_settle_the_market_gap_mid_session():
+    quotes = {
+        "SKHY": {"price": 130.0, "pct": -7.0, "bars": 13, "high": 190.0},
+        "000660.KS": _dated(1_400_000.0, -7.5, intraday=True),
+        "005930.KS": _dated(208_500.0, -5.2, intraday=True),
+    }
+    assert "아직은 온도차가 없다" in _closing(fmt_korea(quotes, None))
+    quotes["000660.KS"] = _dated(1_400_000.0, -7.5)
+    quotes["005930.KS"] = _dated(208_500.0, -5.2)
+    assert "온도차가 없는 날이다" in _closing(fmt_korea(quotes, None))
+
+
+def test_fmt_korea_equip_one_survivor_states_the_sample_not_the_sector():
+    out = fmt_korea_equip({"042700.KS": {"price": 214_500.0, "pct": -3.0}})
+    assert "업종 전체가 밀린 날" not in out
+    assert "표본이 안 된다" in out
+
+
+def test_breadth_middle_branch_names_its_subject():
+    """¾ 분기도 주어로 갈린다 — 안 그러면 섹터와 장비·소재가 한 카드에서 같은 문장으로 끝난다."""
+    mostly_down = [-1.0] * 3 + [1.0]  # 3/4 = 0.75
+    us, kr = breadth_closing(mostly_down, "반도체"), breadth_closing(mostly_down, "장비·소재주")
+    assert us != kr
+    assert us.startswith("반도체가 ") and kr.startswith("장비·소재주가 ")
+
+
+def test_breadth_summary_denominator_matches_the_lines_below_it():
+    """`▸ N종 중 M종` 의 분모(`changes`)와 안내 줄의 분모가 갈리면 안 된다.
+
+    quote 는 왔는데 `pct` 가 없는 종목(5일 창에 봉이 하나뿐인 연휴)은 **조회 실패가 아니라서**
+    종전엔 아무 표기도 안 붙었다 → 요약은 3종이라는데 종목 줄은 4개가 서는 어긋남이 났다.
+    """
+    quotes: dict[str, dict[str, object] | None] = {
+        s: {"price": 1000.0, "pct": -1.0} for s in us_digest.KOREA_EQUIP
+    }
+    quotes[us_digest.KOREA_EQUIP[0]] = {"price": 1000.0, "pct": None}
+    out = fmt_korea_equip(quotes)
+    total = len(us_digest.KOREA_EQUIP)
+    assert f"{total - 1}종 중 {total - 1}종 하락" in out.split("\n")[0]
+    assert "(1종 값 없음)" in out
+    assert FAIL not in out  # 못 받은 것과 받았는데 값이 없는 것은 **다른 사실**이다
+
+
+def test_sector_separates_failed_lookup_from_missing_value():
+    quotes = {s: {"pct": -1.0} for s in us_digest.SECTOR[:-2]}
+    quotes[us_digest.SECTOR[-2]] = {"pct": None}  # quote 는 있는데 값이 없다
+    out = fmt_sector(quotes)  # 마지막 1종은 아예 없다(조회 실패)
+    valued = len(us_digest.SECTOR) - 2
+    assert f"{valued}종 중 {valued}종 하락" in out.split("\n")[0]
+    assert f"(1종 {FAIL})" in out and "(1종 값 없음)" in out
 
 
 def test_fmt_flows_all_dead():
@@ -1440,22 +1892,31 @@ def _closing(text: str) -> str:
     return text.removesuffix(us_digest._FIELD_GAP).split("\n")[-1]
 
 
+# 임계는 **비율**(0.75)이라 종목이 하나 늘 때마다 어느 칸이 "거의 다"인지가 옮겨간다 →
+# 경계값을 숫자로 박으면 `SECTOR` 에 종목을 추가하는 순간 이 테스트가 거짓말을 한다
+# (2026-08-02 SKHY 추가 때 실제로 걸렸다). 개수·경계를 전부 `SECTOR` 에서 유도한다.
+_SECTOR_N = len(us_digest.SECTOR)
+# `ratio_down >= 0.75` 를 만족하는 **가장 작은** 하락 종목 수. 그 하나 아래는 "섞였다"여야 한다.
+_MOSTLY_DOWN = math.ceil(us_digest._SECTOR_ONE_SIDED * _SECTOR_N)
+# `ratio_down <= 0.25`(= 1-0.75) 를 만족하는 **가장 큰** 하락 종목 수. 그 하나 위는 "섞였다".
+_MOSTLY_UP = math.floor((1 - us_digest._SECTOR_ONE_SIDED) * _SECTOR_N)
+
+
 @pytest.mark.parametrize(
     ("down", "must"),
     [
-        (9, "전부 같이 빠졌다"),  # 전량
-        (8, "거의 다 빠졌다"),  # ← 검수에서 "혼조"로 나오던 자리
-        (7, "거의 다 빠졌다"),  # 7/9=0.78 ≥ 0.75
-        (6, "섞였다"),  # 6/9=0.67 < 0.75 — 경계 반대쪽
-        (3, "섞였다"),
-        (2, "거의 다 올랐다"),  # 2/9 하락 = 0.78 상승
+        (_SECTOR_N, "전부 같이 빠졌다"),  # 전량
+        (_MOSTLY_DOWN, "거의 다 빠졌다"),  # 임계 바로 위 — ← 검수에서 "혼조"로 나오던 자리
+        (_MOSTLY_DOWN - 1, "섞였다"),  # 임계 바로 아래
+        (_MOSTLY_UP + 1, "섞였다"),  # 상승쪽 임계 바로 아래
+        (_MOSTLY_UP, "거의 다 올랐다"),  # 상승쪽 임계 바로 위
         (0, "전부 같이 올랐다"),
     ],
 )
 def test_sector_closing_matches_the_headline_count(down, must):
     quotes = {s: {"pct": -1.0 if i < down else 1.0} for i, s in enumerate(us_digest.SECTOR)}
     out = fmt_sector(quotes)
-    assert f"9종 중 {down}종 하락" in out.split("\n")[0]  # ▸ 요약
+    assert f"{len(us_digest.SECTOR)}종 중 {down}종 하락" in out.split("\n")[0]  # ▸ 요약
     assert must in _closing(out), _closing(out)  # 📌 해석이 그 요약과 어긋나면 안 된다
 
 
@@ -1699,7 +2160,7 @@ def test_card_shows_the_pinned_name_not_a_variant(monkeypatch):
     )
     spec = build_us_digest("2026-07-29")
     assert spec is not None
-    news_field = {n: v for n, v, _i in spec["fields"]}["📰 공시·뉴스"]
+    news_field = {n: v for n, v, _i in spec["fields"]}["🇺🇸 📰 공시·뉴스"]
     assert "마이크론" in news_field and "미크론 " not in news_field.replace("마이크론", "")
 
 
@@ -1781,31 +2242,60 @@ def test_build_us_digest_full_card(monkeypatch):
     spec = build_us_digest("2026-07-29")
     assert spec is not None
     # 제목엔 날짜만 — 시세는 첫 필드가 말한다(사용자 배치).
-    assert spec["title"] == "📈 [2026-07-29] 미국주식"
+    assert spec["title"] == "📈 [2026-07-29] 반도체주식"
     assert spec["color"] == us_digest.COLOR_DOWN
     names = [n for n, _v, _i in spec["fields"]]
     assert names == [
-        "💵 마이크론(MU) 시세",
-        "🎯 시장 기대",
-        "📅 실적",
-        "🏭 펀더멘털(SEC)",
-        "🔄 수급·심리",
-        "📰 공시·뉴스",
-        "🇰🇷 한국 메모리 3사",
-        "🧠 섹터",
+        "🇺🇸 💵 마이크론(MU) 시세",
+        "🇺🇸 🎯 시장 기대",
+        "🇺🇸 📅 실적",
+        "🇺🇸 🏭 펀더멘털(SEC)",
+        "🇺🇸 🔄 수급·심리",
+        "🇺🇸 📰 공시·뉴스",
+        "🇺🇸 🧠 섹터",
+        "🇰🇷 📊 지수",
+        "🇰🇷 🏭 메모리",
+        "🇰🇷 🔧 반도체 장비·소재",
     ]
     values = {n: _norm(v) for n, v, _i in spec["fields"]}
-    # 블록마다 `▸` 한 줄 요약이 맨 위 — 단 🇰🇷 는 예외다(사용자 배치: SKHY 가 먼저 오고
-    # `▸ 한국장` 은 요약이 아니라 코스피 구분자로 쓰인다).
-    korea = "🇰🇷 한국 메모리 3사"
-    assert all(v.startswith("▸ ") for n, v in values.items() if n != korea)
-    assert values[korea].startswith("SK하이닉스 (SKHY)") and "▸ 한국장" in values[korea]
-    assert "원화 환산 1,201,584원" in values["💵 마이크론(MU) 시세"]  # 원화환산(§4-1)
-    assert "상향 0 · 하향 0" in values["🎯 시장 기대"]  # 0 건도 표기(§4-3)
-    assert "내부자 Form 4 2건" in values["🔄 수급·심리"]
-    assert "8-K 없음" in values["📰 공시·뉴스"]  # MU 8-K 는 그날 없었다 → 그 자체가 정보(§4-6)
-    assert "P/E 최근 1년" in values["🏭 펀더멘털(SEC)"] and FAIL not in values["🏭 펀더멘털(SEC)"]
+    assert all(v.startswith("▸ ") for v in values.values())
+    # 🇰🇷 메모리만 `▸` 가 **요약이 아니라 시장 구분자**다 — 필드명의 국기가 "전부 국내장"이라고
+    # 말하는데 첫 세 줄은 나스닥이라, 통화($/원)만으로 가르지 않고 줄로 세워 못 박는다.
+    korea = "🇰🇷 🏭 메모리"
+    memory_lines = values[korea].split("\n")
+    assert memory_lines[0] == "▸ 나스닥"
+    assert memory_lines[1].startswith("SK하이닉스 (SKHY)") and "$" in memory_lines[2]
+    korea_lead = "▸ 한국장 (7월 29일 마감)"  # 국내장 줄이 어느 거래일인지 — 나스닥 줄과 갈린다
+    assert korea_lead in memory_lines
+    assert memory_lines[memory_lines.index(korea_lead) + 1].startswith("SK하이닉스 ")
+    assert "원화 환산 1,201,584원" in values["🇺🇸 💵 마이크론(MU) 시세"]  # 원화환산(§4-1)
+    assert "상향 0 · 하향 0" in values["🇺🇸 🎯 시장 기대"]  # 0 건도 표기(§4-3)
+    assert "내부자 Form 4 2건" in values["🇺🇸 🔄 수급·심리"]
+    assert "8-K 없음" in values["🇺🇸 📰 공시·뉴스"]  # MU 8-K 는 그날 없었다 → 그 자체가 정보(§4-6)
+    assert (
+        "P/E 최근 1년" in values["🇺🇸 🏭 펀더멘털(SEC)"]
+        and FAIL not in values["🇺🇸 🏭 펀더멘털(SEC)"]
+    )
     assert spec["footer"] == ""  # 출처 푸터 삭제(사용자: 혼자 보는 카드)
+
+
+@pytest.mark.usefixtures("net")
+def test_only_the_four_ambiguous_fields_carry_a_trading_day():
+    """거래일 표기는 **거래일이 갈릴 수 있는 4필드**에만 — 나머지는 같은 세션이라 소음이다.
+
+    국내장 3필드(지수·메모리·장비소재) + 미국장 대표 1필드(MU 시세). 이 목록이 늘면 카드가
+    같은 날짜를 열 번 반복하고, 줄면 어느 필드가 어제 값인지 다시 알 수 없어진다.
+    """
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    # `7월 29일` 만으로 재면 안 된다 — `📅 실적` 이 발표일로 같은 날짜를 쓸 수 있다(실제로 쓴다).
+    stamped = {name for name, value, _i in spec["fields"] if "7월 29일 마감" in value}
+    assert stamped == {
+        _US_PRICE_FIELD,
+        "🇰🇷 📊 지수",
+        "🇰🇷 🏭 메모리",
+        "🇰🇷 🔧 반도체 장비·소재",
+    }
 
 
 def test_build_us_digest_no_network_calls_outside_fake(net):
@@ -1828,22 +2318,31 @@ def test_build_us_digest_survives_everything_else_dead(monkeypatch):
     spec = build_us_digest("2026-07-29")
     assert spec is not None
     values = {n: v for n, v, _i in spec["fields"]}
-    assert len(values) == 8
-    assert FAIL not in values["💵 마이크론(MU) 시세"].split("\n")[0]  # 시세 본줄은 살아 있다
-    for name in ("🎯 시장 기대", "🏭 펀더멘털(SEC)", "📰 공시·뉴스", "🧠 섹터"):
+    assert len(values) == _FIELD_COUNT
+    assert FAIL not in values[_US_PRICE_FIELD].split("\n")[0]  # 시세 본줄은 살아 있다
+    for name in (
+        "🇺🇸 🎯 시장 기대",
+        "🇺🇸 🏭 펀더멘털(SEC)",
+        "🇺🇸 📰 공시·뉴스",
+        "🇺🇸 🧠 섹터",
+        "🇰🇷 📊 지수",
+        "🇰🇷 🔧 반도체 장비·소재",
+    ):
         assert FAIL in values[name], name
 
 
 @pytest.mark.parametrize(
     ("blockname", "field"),
     [
-        ("fmt_sector", "🧠 섹터"),
-        ("fmt_korea", "🇰🇷 한국 메모리 3사"),
-        ("fmt_flows", "🔄 수급·심리"),
-        ("fmt_filings", "📰 공시·뉴스"),
-        ("fmt_expectation", "🎯 시장 기대"),
-        ("fmt_earnings", "📅 실적"),
-        ("fmt_price", "💵 마이크론(MU) 시세"),
+        ("fmt_sector", "🇺🇸 🧠 섹터"),
+        ("fmt_korea", "🇰🇷 🏭 메모리"),
+        ("fmt_korea_index", "🇰🇷 📊 지수"),
+        ("fmt_korea_equip", "🇰🇷 🔧 반도체 장비·소재"),
+        ("fmt_flows", "🇺🇸 🔄 수급·심리"),
+        ("fmt_filings", "🇺🇸 📰 공시·뉴스"),
+        ("fmt_expectation", "🇺🇸 🎯 시장 기대"),
+        ("fmt_earnings", "🇺🇸 📅 실적"),
+        ("fmt_price", _US_PRICE_FIELD),
     ],
 )
 @pytest.mark.usefixtures("net")
@@ -1858,7 +2357,7 @@ def test_formatter_exception_degrades_only_its_block(monkeypatch, blockname, fie
     assert spec is not None
     values = {n: v for n, v, _i in spec["fields"]}
     assert values[field] == FAIL
-    assert len([v for v in values.values() if v == FAIL]) == 1  # 나머지 7블록은 멀쩡
+    assert len([v for v in values.values() if v == FAIL]) == 1  # 나머지 블록은 멀쩡
 
 
 @pytest.mark.usefixtures("net")
@@ -1871,19 +2370,19 @@ def test_fundamentals_exception_degrades_only_its_block(monkeypatch):
     spec = build_us_digest("2026-07-29")
     assert spec is not None
     values = {n: v for n, v, _i in spec["fields"]}
-    assert values["🏭 펀더멘털(SEC)"] == f"SEC 재무 {FAIL}"
+    assert values["🇺🇸 🏭 펀더멘털(SEC)"] == f"SEC 재무 {FAIL}"
     assert "⚠️" not in spec["footer"]  # 경고도 함께 비워진다(깨진 계산으로 경고를 내지 않는다)
 
 
 @pytest.mark.parametrize(
     ("drop", "field", "must_fail"),
     [
-        (("targetprice",), "🎯 시장 기대", "목표가"),
-        (("companyfacts",), "🏭 펀더멘털(SEC)", "SEC 재무"),
-        (("daily-index",), "📰 공시·뉴스", "8-K"),
-        (("short-interest",), "🔄 수급·심리", "공매도"),
-        (("/api/v1.0/filter/",), "🔄 수급·심리", "레딧 언급"),
-        (("KRW%3DX",), "💵 마이크론(MU) 시세", "원화 환산"),
+        (("targetprice",), "🇺🇸 🎯 시장 기대", "목표가"),
+        (("companyfacts",), "🇺🇸 🏭 펀더멘털(SEC)", "SEC 재무"),
+        (("daily-index",), "🇺🇸 📰 공시·뉴스", "8-K"),
+        (("short-interest",), "🇺🇸 🔄 수급·심리", "공매도"),
+        (("/api/v1.0/filter/",), "🇺🇸 🔄 수급·심리", "레딧 언급"),
+        (("KRW%3DX",), "🇺🇸 💵 마이크론(MU) 시세", "원화 환산"),
     ],
 )
 def test_single_source_failure_degrades_only_its_block(net, drop, field, must_fail):
@@ -1893,7 +2392,7 @@ def test_single_source_failure_degrades_only_its_block(net, drop, field, must_fa
     values = {n: v for n, v, _i in spec["fields"]}
     assert FAIL in _line(values[field], must_fail) or f"{must_fail} {FAIL}" in values[field]
     # 다른 블록은 멀쩡해야 한다(한 소스 장애가 카드 전체를 실패로 물들이지 않게).
-    assert FAIL not in values["🇰🇷 한국 메모리 3사"]
+    assert FAIL not in values["🇰🇷 🏭 메모리"]
 
 
 def test_form4_count_survives_document_fetch_failure(net):
@@ -1901,7 +2400,7 @@ def test_form4_count_survives_document_fetch_failure(net):
     net.drop = ("f4b.txt",)
     spec = build_us_digest("2026-07-29")
     assert spec is not None
-    flows = _norm({n: v for n, v, _i in spec["fields"]}["🔄 수급·심리"])
+    flows = _norm({n: v for n, v, _i in spec["fields"]}["🇺🇸 🔄 수급·심리"])
     assert "내부자 Form 4 2건" in flows and "?(?)" in flows
 
 
@@ -1960,9 +2459,9 @@ def test_sec_blocks_skipped_without_user_agent(monkeypatch):
     assert spec is not None
     assert not [p for h, p in fake.calls if h in ("www.sec.gov", "data.sec.gov")]
     values = {n: _norm(v) for n, v, _i in spec["fields"]}
-    assert f"SEC 재무 {FAIL}" in values["🏭 펀더멘털(SEC)"]
-    assert f"8-K {FAIL}" in values["📰 공시·뉴스"]
-    assert f"내부자 Form 4 {FAIL}" in values["🔄 수급·심리"]  # 못 받은 것이지 "없음"이 아니다
+    assert f"SEC 재무 {FAIL}" in values["🇺🇸 🏭 펀더멘털(SEC)"]
+    assert f"8-K {FAIL}" in values["🇺🇸 📰 공시·뉴스"]
+    assert f"내부자 Form 4 {FAIL}" in values["🇺🇸 🔄 수급·심리"]  # 못 받은 것이지 "없음"이 아니다
 
 
 def test_sec_facts_cached_per_day(monkeypatch, tmp_path):
@@ -2028,10 +2527,110 @@ def test_card_fits_discord_limits():
     assert _embed_total(spec) <= DISCORD_EMBED_TOTAL_MAX
 
 
+@pytest.mark.usefixtures("net")
+def test_card_splits_into_us_then_korea_by_flag_prefix():
+    """미국장 7 → 국내장 3. 구분은 **필드명 접두 국기**로만 낸다(헤더 필드를 만들지 않는다).
+
+    국내장이 **뒤**라는 것이 계약이다 — 총합 초과 시 어댑터가 뒤부터 버리므로, 이 순서가
+    바뀌면 예산 계산의 전제(무엇이 먼저 잘리는가)도 같이 바뀐다.
+    """
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    names = [n for n, _v, _i in spec["fields"]]
+    assert len(names) == _FIELD_COUNT
+    flags = [n[:2] for n in names]
+    assert flags == [us_digest.FLAG_US] * 7 + [us_digest.FLAG_KR] * 3, names
+    # 국내장 3필드의 정체 — 지수·메모리·장비소재
+    assert names[7:] == ["🇰🇷 📊 지수", "🇰🇷 🏭 메모리", "🇰🇷 🔧 반도체 장비·소재"]
+    # SKHY(나스닥 상장)는 국내장 `메모리` 에 남는다 — 두 시장 온도차 비교가 이 필드 안에 있다.
+    memory = dict(zip(names, [v for _n, v, _i in spec["fields"]], strict=True))["🇰🇷 🏭 메모리"]
+    assert "SKHY" in memory and "SK하이닉스" in memory
+
+
+def test_already_fetched_symbol_keeps_its_special_window(monkeypatch):
+    """`SECTOR` 에 든 SKHY 가 **3개월 창 결과를 유지**한다(재조회 가드 회귀).
+
+    가드가 없으면 시세 루프가 `SECTOR` 를 돌면서 위에서 받아둔 3개월 조회를 기본 창(5d)으로
+    덮어쓴다. `price`·`pct` 는 어느 창이든 같아서 **카드는 멀쩡해 보이는데**, `fmt_korea` 의
+    `[상장 N일차]`(`bars`)와 `고점 대비`(`high`)만 조용히 다른 값이 된다.
+
+    ⚠️ 그래서 두 창에 **다른 몸통**을 물린다 — 같은 응답을 주면 가드를 지워도 통과한다.
+    """
+    assert us_digest.SKHY in us_digest.SECTOR  # 이 가드가 필요한 전제(겹치지 않으면 무의미)
+    monkeypatch.setattr(us_digest, "_sec_ua", lambda: "tester tester@example.com")
+    routes = _routes()
+    # 3개월 창에만 붙는 라우트(구체적인 것을 앞에). 기본 창은 기존 2봉짜리가 받는다.
+    routes.insert(
+        0,
+        (
+            "query1.finance.yahoo.com",
+            "chart/SKHY?range=3mo",
+            _chart([60.0, 45.0, 41.2], symbol="SKHY"),
+        ),
+    )
+    fake = _FakeNet(routes)
+    monkeypatch.setattr(us_digest, "_get", fake)
+
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    # ① 조용히 깨지는 쪽부터 본다 — 값이 먼저 틀리고, 호출 횟수는 그 원인이다.
+    fields = {n: v for n, v, _i in spec["fields"]}
+    memory = fields["🇰🇷 🏭 메모리"]
+    assert "[상장 3일차]" in memory  # bars — 5d 로 덮이면 2일차가 된다
+    assert f"고점 대비 {us_digest.pct(41.2 / 60 * 100 - 100, 1)}" in memory  # high 60.0(3개월 창)
+    # ② 원인 — 같은 심볼을 두 번 받으면 뒤엣것이 이긴다.
+    skhy_calls = [p for h, p in fake.calls if h == "query1.finance.yahoo.com" and "chart/SKHY" in p]
+    assert len(skhy_calls) == 1, skhy_calls
+    assert "range=3mo" in skhy_calls[0]
+    # 같은 종목이 섹터·메모리 두 곳에 나온다(의도) — 값이 서로 어긋나면 카드가 자기모순이다.
+    sector_row = f"{us_digest.label_of(us_digest.SKHY)} {us_digest.pct((41.2 / 45 - 1) * 100, 1)}"
+    assert sector_row in fields["🇺🇸 🧠 섹터"]
+
+
+@pytest.mark.usefixtures("net")
+def test_card_title_matches_the_channel_display_name():
+    """제목 = 채널 표시명(`#반도체주식`). 카드가 미국장만이 아니게 된 이상 "미국주식"은 거짓이다.
+
+    ⚠️ 내부 식별자(`us-digest`·채널 `tag`·모듈명·CLI 플래그)는 표시 문자열이 아니라 그대로다.
+    """
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    assert spec["title"] == "📈 [2026-07-29] 반도체주식"
+    assert bridge.US_DIGEST_NOTIFY_ID == "us-digest"  # 식별자는 개명하지 않는다
+
+
+def test_korean_symbols_all_have_hangul_names():
+    """국내 종목은 티커로 안 읽힌다 — 이름이 없으면 카드에 `042700.KS` 가 그대로 나간다."""
+    for symbol in (*us_digest.KOREA, *us_digest.KOREA_EQUIP):
+        assert us_digest.NAMES.get(symbol), symbol
+    assert us_digest.KOREA_INDEXES == (("^KS11", "코스피"), ("^KQ11", "코스닥"))
+    # 국내 지수를 미국 지수 튜플에 섞으면 `index_line` 한 줄에 통화가 다른 값이 나란히 선다.
+    assert not set(dict(us_digest.INDEXES)) & set(dict(us_digest.KOREA_INDEXES))
+
+
+@pytest.mark.usefixtures("net")
 def test_field_budget_product_stays_under_embed_total():
-    # FIELD_MAXLEN 을 키우거나 필드를 늘릴 때 이 곱을 다시 재라(모듈 상수 주석의 계약).
-    fields = 8
-    assert fields * us_digest.FIELD_MAXLEN + 200 <= DISCORD_EMBED_TOTAL_MAX
+    """**최악값 계약** — 모든 필드가 상한까지 찼을 때도 임베드 총합 6000 을 넘지 않는다.
+
+    ⚠️ 디스코드 총합이 세는 것은 필드 **값**만이 아니다 — 제목 + 필드명 + 값 + footer 다.
+    필드명(국기 접두 2자 x 10)까지 넣어 재야 실제 예산이 나온다. 여기에 어댑터가 생략안내
+    몫으로 미리 떼는 40자를 더한다.
+
+    이 테스트를 약화시켜 통과시키지 말 것 — 초과분은 어댑터가 **뒤쪽 필드부터** 버리므로,
+    사라지는 것은 하필 맨 뒤 국내장 3필드다(조용히).
+    """
+    spec = build_us_digest("2026-07-29")
+    assert spec is not None
+    names = [n for n, _v, _i in spec["fields"]]
+    assert len(names) == _FIELD_COUNT
+    worst = (
+        len(spec["title"])
+        + sum(len(n) for n in names)
+        + _FIELD_COUNT * us_digest.FIELD_MAXLEN
+        + _WORST_FOOTER
+        + DISCORD_OMIT_NOTE_RESERVE
+    )
+    assert worst <= DISCORD_EMBED_TOTAL_MAX, f"최악값 {worst}자 — FIELD_MAXLEN 을 내려라"
 
 
 def test_card_fits_limits_even_with_absurd_upstream_values(monkeypatch):
@@ -2120,7 +2719,7 @@ def test_build_us_digest_never_raises_on_garbage_payloads(monkeypatch):
     garbage.append(("query1.finance.yahoo.com", "/v1/finance/search", {"news": "nope"}))
     monkeypatch.setattr(us_digest, "_get", _FakeNet(garbage))
     spec = build_us_digest("2026-07-29")
-    assert spec is not None and len(spec["fields"]) == 8
+    assert spec is not None and len(spec["fields"]) == _FIELD_COUNT
 
 
 def test_json_returns_none_for_non_json_body(monkeypatch):

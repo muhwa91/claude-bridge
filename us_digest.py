@@ -31,7 +31,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -48,10 +48,29 @@ SEC_CACHE_FILE = LOG_DIR / "us_sec_facts.json"
 # ── 대상 종목(계획서 §2) ───────────────────────────────────────────────────
 TICKER = "MU"  # 보유 종목 — 항상 상세. 이 시세가 없으면 카드를 내지 않는다
 MU_CIK = "723125"  # SEC EDGAR CIK(무패딩) — 일별 인덱스 경로 매칭·companyfacts 조회에 함께 쓴다
+# SKHY 는 **나스닥 상장이지만 국내장 `🏭 메모리` 필드에 남긴다**(2026-08-02 판단, 미국장/국내장
+# 분리 때 재확인). 그 필드에서 SKHY 의 존재 이유는 종목 그 자체가 아니라 `fmt_korea` 끝의
+# `closing` — **같은 SK하이닉스가 나스닥과 코스피에서 몇 %p 다르게 움직였는가**다. 비교 상대인
+# 코스피 SK하이닉스(`000660.KS`)가 이 필드에 있으므로, 상장 시장만 보고 미국장으로 **옮기면**
+# 그 한 줄이 두 필드로 끊겨 **비교 자체가 성립하지 않는다.** 대신 어느 시장 값인지는 줄마다
+# 드러난다 — 나스닥분은 `$` 표기, 코스피분은 `원` 표기 + `▸ 한국장` 구분자 아래.
+# 2026-08-02: 그 위에 **`SECTOR` 에도 추가**(사용자 지시) — 나스닥 반도체 대형주 명단에
+# SK하이닉스가 빠져 있으면 그 명단이 거짓이다. 옮긴 게 아니라 **양쪽에 나오는 것이 의도**이고,
+# 두 자리는 조회 창만 다를 뿐 같은 `quotes[SKHY]` 를 읽어 값이 갈리지 않는다(아래 재조회 가드).
 SKHY = "SKHY"  # SK하이닉스 나스닥 — 2026-07-10 상장이라 기간 비교 금지(§2)
 KOREA = ("000660.KS", "005930.KS")  # 표시 순서 = 사용자 배치(SK하이닉스 먼저)
-SECTOR = ("NVDA", "AMD", "AVGO", "TSM", "ASML", "ARM", "MRVL", "INTC", "SMCI")
+# 표시 순서 = 대형 → 중소. SNDK(샌디스크)는 2025-02 WDC 에서 분사한 NAND 전업사로 MU 와 같은
+# 메모리라 이 블록에 있어야 맞다(여중기님 지적) — 시총이 가장 작아 맨 뒤.
+# **소속 이유는 업종, 자리는 시총**이라는 것이 이 튜플의 규칙이다. SKHY 도 같은 규칙으로 넣었다 —
+# 시총 1.05조달러(2026-08-02 Nasdaq 실측)라 TSM(2.10조)과 ASML(0.63조) 사이가 제자리다.
+SECTOR = ("NVDA", "AMD", "AVGO", "TSM", "SKHY", "ASML", "ARM", "MRVL", "INTC", "SMCI", "SNDK")
 INDEXES = (("^SOX", "SOX"), ("SMH", "SMH"))
+# 국내 지수 — 미국 지수(`INDEXES`)와 **섞지 않는다.** 같은 튜플에 넣으면 `index_line` 한 줄에
+# 통화·거래시간이 다른 값이 나란히 서고, 미국장/국내장 필드 배치가 상수 하나에 묶인다.
+KOREA_INDEXES = (("^KS11", "코스피"), ("^KQ11", "코스닥"))
+# 국내 반도체 장비·소재(HBM 밸류체인). 접미사는 상장 시장(.KS 코스피 / .KQ 코스닥)이라 종목마다
+# 다르다 — 추측으로 쓰지 말고 `fetch_quote` 로 실응답을 확인한 것만 넣는다(2026-08-02 4종 확인).
+KOREA_EQUIP = ("042700.KS", "039030.KQ", "036930.KQ", "058470.KQ")
 # 티커 → 한국에서 통용되는 이름. 티커만으로는 어느 회사인지 안 읽힌다(사용자 지적).
 # **억지 음차 금지** — 원어가 그대로 통용되는 종목(AMD·ASML·ARM)은 넣지 않고 티커로 둔다.
 NAMES = {
@@ -62,19 +81,41 @@ NAMES = {
     "MRVL": "마벨",
     "INTC": "인텔",
     "SMCI": "슈퍼마이크로",
+    "SNDK": "샌디스크",
     "SKHY": "SK하이닉스",
     "005930.KS": "삼성전자",
     "000660.KS": "SK하이닉스",
+    "042700.KS": "한미반도체",
+    "039030.KQ": "이오테크닉스",
+    "036930.KQ": "주성엔지니어링",
+    "058470.KQ": "리노공업",
 }
 FX_SYMBOL = "KRW=X"  # 환율을 빼면 손익이 틀린다(§4-1) — 원화환산의 유일한 재료
 VIX_SYMBOL = "^VIX"
 
 # ── 표시 상수 ─────────────────────────────────────────────────────────────
 LEAD_US = "📈"
+# 필드명 접두 국기 = 미국장/국내장 구분. **별도 헤더 필드를 만들지 않는다** — 헤더 하나가
+# 필드 예산(아래)을 통째로 한 칸 먹는데, 접두 2자면 같은 구분이 공짜로 선다.
+FLAG_US = "🇺🇸"
+FLAG_KR = "🇰🇷"
 FAIL = "조회 실패"
-# 디스코드 field value 한도는 1024, embed 총합은 6000. 필드 8개라 700 x 8 = 5,600 + 제목·footer
-# 로 총합 안에 들어온다. **필드를 늘리거나 이 값을 키울 때는 곱을 다시 재라.**
-FIELD_MAXLEN = 700
+# 디스코드 field value 한도는 1024, embed 총합은 6000. 총합이 세는 것 = 제목 + **필드명** +
+# 필드값 + footer(+ 어댑터가 생략안내 몫으로 미리 떼는 40자, `discord_adapter._OMIT_NOTE_MAXLEN`).
+# 필드 10개(미국장 7 + 국내장 3) 기준 최악값 = 제목 20 + 필드명 103 + 550 x 10 + footer 80
+# + 생략안내 40 = **5,743 / 6,000(여유 257)**.
+# **필드를 늘리거나 이 값을 키울 때는 곱을 다시 재라** — 테스트
+# `test_field_budget_product_stays_under_embed_total` 이 이 계약을 지킨다.
+# 초과분은 어댑터가 **뒤쪽 필드부터** 버리므로, 잘리는 것은 하필 맨 뒤의
+# 국내장 3필드다(조용히 사라진다 — 어댑터 `build_card_embed` docstring 참조).
+# ⚠️ **"잘림 없음"은 실적 스킬 창 **밖** 드라이런 기준이다**(2026-08-02 최장 = 펀더멘털 411자).
+# 창 안(D-0~7)에서는 `📅 실적` 에 LLM 줄 2개(각 최대 `NEWS_LINE_MAXLEN`)가 붙어, 캘린더 3행이
+# 함께 서면 550 에서 LLM 한 줄이 밀려난다(700 이면 안 밀렸다). 밀린 줄은 `fit()` 이
+# `미국주식 필드 N줄 생략` 으로 로그에 남기므로, 의심되면 그 줄부터 본다.
+FIELD_MAXLEN = 550
+# footer(시총 교차검증 경고) 실제 상한 — 예산 계산의 footer 몫과 **같은 값이어야 한다**
+# (테스트 `_WORST_FOOTER` 가 이 상수를 읽는다). 넘치면 `fmt_fundamentals` 가 짧은 문장으로 바꾼다.
+FOOTER_MAXLEN = 80
 COLOR_UP = 0x3ECF85
 COLOR_DOWN = 0xE05A5A
 COLOR_FLAT = 0x5865F2
@@ -392,14 +433,22 @@ def fit(lines: list[str], limit: int = FIELD_MAXLEN) -> str:
     글자 수로 자르면 마크다운 링크·괄호가 중간에서 끊겨 깨진 채 표시된다 → 줄 경계에서만 자른다.
     빈 줄도 **넣은 그대로** 통과시킨다(줄을 걸러내지 않는다). ※ 현재 호출자는 빈 줄을 넣지
     않는다 — 블록 안 빈 줄은 2026-07-31 에 걷어냈고, 띄는 자리는 블록 사이(`_FIELD_GAP`)뿐이다.
+
+    ⚠️ 넘치는 줄은 `break` 가 아니라 `continue` 로 흘린다 — **긴 줄만 골라 사라져** 카드는
+    멀쩡해 보인다(예: LLM 이 2줄을 냈는데 1줄만 낸 것처럼 보인다). 그래서 버린 줄이 있으면
+    **로그로 말한다**: 이 모듈의 태도는 "조용히 죽는 것보다 말하고 죽는 것"이다.
     """
     out: list[str] = []
     total = 0
+    dropped = 0
     for line in lines:
         if total + len(line) + 1 > limit:
+            dropped += 1
             continue
         out.append(line)
         total += len(line) + 1
+    if dropped:
+        log.info("미국주식 필드 %d줄 생략(한도 %d자, 첫 줄 %.30s…)", dropped, limit, lines[0])
     return "\n".join(out)
 
 
@@ -428,19 +477,63 @@ def parse_quote(payload: Any) -> dict[str, Any] | None:
     `chartPreviousClose` 는 **조회 창 직전 종가**라 전일 종가가 아니다(range=1y 면 1년 전 값이
     온다 — 실측). 그래서 전일 대비는 **종가 시계열 마지막 두 개**로 계산한다: 카드가 도는 시각
     (KST 아침)엔 미장이 이미 마감돼 있어 `closes[-1]` 이 직전 정규장 종가다.
+
+    ⚠️ **결측 걸러내기는 여기 한 곳**이다 — `bool` 은 `int` 의 서브클래스라 `isinstance` 만으로는
+    `True` 가 1.0 원(달러)로 통과하고, `json.loads` 는 bare `NaN`/`Infinity` 토큰을 허용한다.
+    `pct()` 가 `math.isfinite` 로 막는 것은 **등락률뿐**이라, 여기서 안 거르면 `코스피 nan` 이
+    가격 줄에 그대로 찍힌다. 포매터마다 가드를 다는 대신 이 한 줄이 전부를 덮는다.
+
+    `day`(마지막 봉의 **거래소 현지 날짜**)·`intraday`(그 봉이 아직 진행 중인 세션인지)도 함께
+    낸다 — 카드는 세션 시작 시 1회 도는데 화~금 오전이면 **국내장 = 오늘 장중 · 미국장 = 어제
+    마감**이 한 장에 섞인다. 날짜가 없으면 읽는 사람이 두 거래일을 가를 수 없다. 구할 수 없으면
+    `day=None`·`intraday=False`(= 마감으로 본다) — 형식 이탈로 시세까지 죽이지 않는다.
     """
     try:
         result = payload["chart"]["result"][0]
         meta = result["meta"]
-        closes = [
-            c for c in result["indicators"]["quote"][0]["close"] if isinstance(c, (int, float))
-        ]
+        raw = result["indicators"]["quote"][0]["close"]
+        stamps = result.get("timestamp")
+        # ⚠️⚠️ **봉 시각은 종가와 짝지어 놓고 거른다.** 아래 필터가 결측 봉을 지우므로
+        # `timestamp[-1]` 을 따로 인덱싱하면 지워진 수만큼 밀린다(오프바이원). 같은 계열 실수로
+        # trading-info 가 2026-07-30 에 코스피 기준가를 전전 거래일로 잡아 등락을 -5.98% →
+        # -16.17% 로 부풀렸다. 길이가 다르면 짝이 성립하지 않으므로 **억지로 맞추지 않고**
+        # 시각을 통째로 버린다(값 계산은 종전 그대로 — 날짜만 없는 것이 틀린 날짜보다 낫다).
+        paired = (
+            list(zip(stamps, raw, strict=True))
+            if isinstance(stamps, list) and len(stamps) == len(raw)
+            else [(None, c) for c in raw]
+        )
     except (KeyError, IndexError, TypeError):
         return None
-    if not closes:
+    bars = [
+        (t, float(c))
+        for t, c in paired
+        if isinstance(c, (int, float)) and not isinstance(c, bool) and math.isfinite(c)
+    ]
+    if not bars:
         return None
-    price = float(closes[-1])
-    prev = float(closes[-2]) if len(closes) >= 2 else None
+    closes = [c for _, c in bars]
+    price = closes[-1]
+    prev = closes[-2] if len(closes) >= 2 else None
+    last = bars[-1][0]
+    last = float(last) if isinstance(last, (int, float)) and not isinstance(last, bool) else None
+    # 거래소 현지 날짜 = epoch + `gmtoffset`(초)을 **UTC 로** 읽은 것(시간대 DB가 필요 없다).
+    # 실측 2026-08-02: `^KS11` 1785456000+32400 → 2026-07-31 09:00(개장), `MU` 1785504600
+    # -14400 → 2026-07-31 09:30(개장). 즉 **일봉의 시각 = 그 세션의 개장 시각**이다.
+    day: str | None = None
+    if last is not None:
+        with contextlib.suppress(OverflowError, OSError, ValueError):
+            offset = _num(meta.get("gmtoffset")) or 0.0
+            day = datetime.fromtimestamp(last + offset, UTC).date().isoformat()
+    # 장중 판정 — **전부 epoch 끼리의 비교**라 시간대 계산이 없다. 마지막 봉이 지금 열려 있는
+    # 정규장 창 안에 있고(위 실측대로 일봉 시각 = 개장 시각) 마감 시각에 아직 안 닿았으면 장중.
+    # 주말·휴장이면 `currentTradingPeriod` 가 **직전 세션**을 가리켜(2026-08-02 일요일 실측)
+    # `now < end` 가 거짓이 되므로 자동으로 마감이다. 필드가 없으면 False(보수적).
+    period = meta.get("currentTradingPeriod")
+    regular = period.get("regular") if isinstance(period, dict) else None
+    regular = regular if isinstance(regular, dict) else {}
+    start, end = _num(regular.get("start")), _num(regular.get("end"))
+    now = _num(meta.get("regularMarketTime"))
     return {
         "symbol": str(meta.get("symbol") or ""),
         "currency": str(meta.get("currency") or ""),
@@ -451,6 +544,15 @@ def parse_quote(payload: Any) -> dict[str, Any] | None:
         "w52l": _num(meta.get("fiftyTwoWeekLow")),
         "high": max(closes),  # 조회 창 안 최고 종가 — 상장 직후 종목의 "고점 대비 낙폭"용
         "bars": len(closes),
+        "day": day,
+        "intraday": (
+            last is not None
+            and start is not None
+            and end is not None
+            and now is not None
+            and start <= last < end
+            and now < end
+        ),
     }
 
 
@@ -458,6 +560,34 @@ def fetch_quote(symbol: str, rng: str = "5d") -> dict[str, Any] | None:
     """Yahoo 차트 1회 → 시세 dict. 지수(`^SOX`)·환율(`KRW=X`)·한국주(`005930.KS`) 동일 경로."""
     path = f"/v8/finance/chart/{urllib.parse.quote(symbol)}?range={rng}&interval=1d"
     return parse_quote(_json("query1.finance.yahoo.com", path))
+
+
+def is_intraday(quotes: list[dict[str, Any] | None]) -> bool:
+    """한 종목이라도 장중이면 그 블록의 결론은 **잠정**이다(보수적 = any). 순수."""
+    return any((quote or {}).get("intraday") for quote in quotes)
+
+
+def day_stamp(quotes: list[dict[str, Any] | None]) -> str:
+    """`7월 31일 마감` · `8월 2일 장중` — 그 블록이 **어느 거래일**의 값인지. 못 구하면 "". 순수.
+
+    붙이는 자리는 "그 필드가 어느 거래일 기준인지 갈릴 수 있는 곳"뿐이다(국내장 3필드 + 미국장
+    대표 1필드). 같은 세션을 쓰는 나머지 필드에 다 붙이면 그건 소음이다.
+    """
+    rows = [quote or {} for quote in quotes]
+    day = next((row["day"] for row in rows if row.get("day")), None)
+    if not day:
+        return ""
+    return f"{ko_date(day, with_year=False)} {'장중' if is_intraday(quotes) else '마감'}"
+
+
+def day_phrase(closed: str, live: str, intraday: bool) -> str:
+    """결론 어미 — 장중이면 하루가 끝난 것처럼 단정하지 않는다(`밀린 날이다` → `밀리는 중이다`).
+
+    ⚠️ **분기는 이 함수 한 곳**이다. 블록마다 `if intraday` 를 복제하면 어느 한 블록만 장중을
+    놓쳐 같은 카드 안에서 두 블록이 서로 다른 시제로 말하게 된다(`breadth_closing` 이 임계값을
+    한 곳에 모아 둔 것과 같은 이유). 판정(`—` 앞)은 시제와 무관하게 같아야 한다.
+    """
+    return live if intraday else closed
 
 
 def _move_word(value: float | None) -> str:
@@ -501,7 +631,12 @@ def fmt_price(quote: dict[str, Any], fx: dict[str, Any] | None) -> str:
         lines.append(f"원화 환산 {FAIL}(환율)")
     moved = f"{abs(change):.2f}% {_move_word(change)}" if change is not None else _move_word(None)
     # 종목명은 필드 제목(`💵 마이크론(MU) 시세`)에 있으므로 요약에서는 뺀다.
+    # 날짜는 **미국장 대표로 여기 한 곳**에만 붙인다 — 안 붙이면 아래 `전일 종가` 의 "전일"이
+    # 실제로 어느 날인지가 카드 어디에도 없다(국내장 값과 하루가 갈리는 아침에 특히).
+    stamp = day_stamp([quote])
     summary = f"${price:,.2f} · 어제보다 {moved}"
+    if stamp:
+        summary = f"{stamp} · {summary}"
     if drop:
         summary += f" (52주 고점 대비 {drop})"
     # 마지막 해석 — 달러 등락과 환율 등락의 **방향 조합**에서 만든다(고정 문구 금지).
@@ -1117,6 +1252,11 @@ def fmt_fundamentals(
             rows.append((f"SEC가 Nasdaq보다 {'높음' if gap > 0 else '낮음'}", f"{abs(gap):.1f}%"))
         if abs(gap) > MCAP_TOLERANCE_PCT:
             warn = f"⚠️ 시총 교차검증 불일치 {abs(gap):.1f}% — 재무 수치 확인 필요"
+            # 상류가 터무니없는 시총을 주면 이 한 줄이 341자까지 부푼다(QA 실측) → footer 예산
+            # 80 을 넘겨 임베드 총합 계약이 깨진다. **자르지 않는다** — 숫자 중간에서 끊으면
+            # 남은 자릿수가 **다른 값**으로 읽힌다(없는 사실을 만들지 않는다는 원칙).
+            if len(warn) > FOOTER_MAXLEN:
+                warn = "⚠️ 시총 교차검증 불일치 — 두 출처 차이가 비정상적으로 크다"
     lines = kv(rows)
     if inventory:
         at = next(i for i, ln in enumerate(lines) if ln.startswith("재고/매출"))
@@ -1651,10 +1791,14 @@ def fmt_filings(
     return block(summary, lines, closing=closing_note(closing))
 
 
-# ── ⑦ 한국 메모리 3사 · ⑧ 섹터 ────────────────────────────────────────────
+# ── ⑦ 섹터(미국장) · ⑧⑨⑩ 국내장(지수·메모리·장비소재) ──────────────────────
 _SKHY_MAX_BARS = 60  # 이 미만이면 상장 직후로 보고 `[상장 N일차]` 를 붙인다
 # 마지막 `📌 해석` 줄의 임계값. **경계에서 틀리면 카드가 거짓을 말한다** — 전부 테스트로 고정.
-_SECTOR_ONE_SIDED = 0.75  # 이 비율 이상이 한쪽이면 "업종 전체가 움직인 날"로 읽는다(8/9 포함)
+# 이 비율 이상이 한쪽이면 "업종 전체가 움직인 날"로 읽는다. 경계는 **종목 수마다 옮겨간다** —
+# `SECTOR` 11종이면 9/11(0.818) 부터가 "거의 다"이고 8/11(0.727)은 "섞였다", `KOREA_EQUIP` 4종이면
+# 3/4(0.75) 가 "거의 다"다. 종목을 늘리면 이 줄의 예시부터 다시 계산하라(테스트는 유도한다).
+_SECTOR_ONE_SIDED = 0.75
+_BREADTH_MIN_SAMPLE = 3  # 이 미만이면 업종 전체 판정을 하지 않는다(살아남은 1종 = 업종이 아니다)
 _MARKET_GAP_MIN = 1.0  # 두 시장 등락 차가 이 %p 미만이면 "온도차 없음"으로 본다
 
 
@@ -1670,6 +1814,9 @@ def fmt_korea(
     # 배치는 사용자이 직접 짜신 것(2026-07-29): **나스닥 상장분(SKHY) 먼저**, 그 다음
     # `▸ 한국장` 을 소제목처럼 두고 코스피 2종. 여기서 `▸` 는 요약이 아니라 **구분자**라
     # 이 블록만 `block()` 을 쓰지 않는다.
+    # 2026-08-02: 앞머리 `▸ 나스닥` 구분자 추가. 필드명이 `🇰🇷 🏭 메모리` 가 되면서 국기가
+    # "이 안은 전부 국내장"이라고 말하는데 **첫 세 줄은 나스닥**이다 — 통화($/원)만으로 가르게
+    # 두면 국기가 거짓이 된다. `▸ 한국장` 과 대칭으로 세워 줄마다 어느 시장인지 남긴다.
     rows: list[tuple[str, str]] = []
     skhy = quotes.get(SKHY)
     if skhy:
@@ -1681,8 +1828,12 @@ def fmt_korea(
             rows.append(("고점 대비", pct(skhy["price"] / skhy["high"] * 100 - 100, 1)))
     else:
         rows.append((label_of(SKHY), FAIL))
-    lines = kv(rows)
-    lines.append(f"{_SUMMARY_LEAD}한국장")
+    lines = [f"{_SUMMARY_LEAD}나스닥", *kv(rows)]
+    # 날짜는 **`▸ 한국장` 쪽에만** 붙인다 — 이 필드에서 거래일이 갈리는 건 국내장 줄이고,
+    # 위 나스닥 줄은 `🇺🇸 💵 마이크론` 필드와 같은 세션이라 거기 한 번이면 족하다.
+    kr_quotes = [quotes.get(symbol) for symbol in KOREA]
+    stamp = day_stamp(kr_quotes)
+    lines.append(f"{_SUMMARY_LEAD}한국장 ({stamp})" if stamp else f"{_SUMMARY_LEAD}한국장")
     kospi: list[tuple[str, str]] = []
     for symbol in KOREA:  # 코스피는 이름만(티커는 한국 종목에선 안 읽힌다)
         quote = quotes.get(symbol)
@@ -1712,7 +1863,14 @@ def fmt_korea(
     else:
         gap = abs(float(nasdaq_pct) - float(kospi_pct))
         closing = (
-            "같은 SK하이닉스가 두 시장에서 거의 같은 폭으로 움직였다 — 온도차가 없는 날이다"
+            # 국내장이 장중이면 이 비교도 아직 안 끝났다 — 같은 필드가 `▸ 한국장 (… 장중)`
+            # 이라고 적어 놓고 결론만 "…한 날이다"로 단정하면 그 한 줄이 서로를 반박한다.
+            day_phrase(
+                "같은 SK하이닉스가 두 시장에서 거의 같은 폭으로 움직였다 — 온도차가 없는 날이다",
+                "같은 SK하이닉스가 두 시장에서 거의 같은 폭으로 움직이는 중이다"
+                " — 아직은 온도차가 없다",
+                is_intraday([skhy, *kr_quotes]),
+            )
             if gap < _MARKET_GAP_MIN
             else (
                 f"같은 SK하이닉스가 두 시장에서 {gap:.1f}%p 다르게 움직였다"
@@ -1725,24 +1883,188 @@ def fmt_korea(
     return fit(lines, FIELD_MAXLEN - len(tail) - 1 - len(_FIELD_GAP)) + f"\n{tail}" + _FIELD_GAP
 
 
-def index_line(quotes: dict[str, dict[str, Any] | None]) -> str:
-    """`SOX 🔻 4.5% · SMH 🔻 3.5%` — 지수 2종 한 줄. 순수.
+def index_line(
+    quotes: dict[str, dict[str, Any] | None],
+    indexes: tuple[tuple[str, str], ...] = INDEXES,
+) -> str:
+    """`SOX 🔻 4.5% · SMH 🔻 3.5%` — 지수 한 줄. 순수.
 
-    ponytail: **지금은 카드에 안 실린다**(사용자 배치에서 빠졌다 — 의도 확인 대기). 값 계산은
-    남겨 두고 렌더만 뺐다 — 되살릴 때 `fmt_sector` 에서 한 줄 insert 하면 된다.
+    ponytail: 미국 지수(기본값 `INDEXES`)는 **지금도 카드에 안 실린다**(사용자 배치에서 빠졌다 —
+    의도 확인 대기). 값 계산은 남겨 두고 렌더만 뺐다 — 되살릴 때 `fmt_sector` 에서 한 줄
+    insert 하면 된다. 국내 지수(`KOREA_INDEXES`)는 `fmt_korea_index` 의 `▸ 요약`으로 쓴다.
     """
     return " · ".join(
         f"{label} {FAIL}"
         if quotes.get(symbol) is None
         else f"{label} {pct((quotes[symbol] or {}).get('pct'), 1)}"
-        for symbol, label in INDEXES
+        for symbol, label in indexes
+    )
+
+
+def breadth_closing(changes: list[float], subject: str, intraday: bool = False) -> str:
+    """오른 종목 / 내린 종목 비율 → 블록 `📌 결론` 한 줄. `fmt_sector`·`fmt_korea_equip` 공용. 순수.
+
+    ⚠️ **임계값 주의**: 종전엔 "전량이 아니면 혼조"라 8/9 하락을 "종목별로 갈렸다"로 읽어
+    같은 블록의 `▸ 9종 중 8종 하락` 과 정면으로 모순됐다(2026-07-29 검수에서 적발).
+    비율로 다시 긋는다 — ¾ 이상이 한쪽이면 그건 업종이 통째로 움직인 것이다.
+
+    두 블록이 같은 사다리를 쓰므로 여기 한 곳에 둔다 — 복제해 두면 임계값이 조용히 갈린다.
+
+    ⚠️ **표본 하한(`_BREADTH_MIN_SAMPLE`)이 먼저다.** `fmt_korea_equip` 은 4종뿐이라 3종이
+    조회 실패하면 **살아남은 1종만 보고 "업종 전체가 밀린 날"** 이라고 단정하게 된다(비율은
+    1/1 = 100%로 성립해 버린다). 종목 수가 적은 블록이 생길 때마다 되풀이될 함정이라 사다리
+    맨 앞에 둔다.
+
+    `intraday` 는 **판정을 바꾸지 않고 어미만 바꾼다**(`day_phrase`) — 하루가 안 끝났는데
+    "…한 날이다"로 끝내면 미완결 값을 완결로 말하게 된다. 임계값은 그대로다.
+    """
+    if not changes:
+        return f"{subject} 시세를 못 받아 오늘 움직임이 종목 문제인지 업종 문제인지 못 가른다"
+    if len(changes) < _BREADTH_MIN_SAMPLE:
+        return (
+            f"{subject} 시세를 {len(changes)}종만 받아 업종 전체 움직임으로 보기엔 표본이 안 된다"
+        )
+    down = sum(1 for c in changes if c < 0)
+    if down == len(changes):
+        return f"{subject}가 전부 같이 빠졌다 — " + day_phrase(
+            "개별 종목 이슈가 아니라 업종 전체가 밀린 날이다",
+            "개별 종목 이슈가 아니라 업종 전체가 밀리는 중이다",
+            intraday,
+        )
+    if down == 0:
+        return f"{subject}가 전부 같이 올랐다 — " + day_phrase(
+            "개별 종목이 아니라 업종 전체가 오른 날이다",
+            "개별 종목이 아니라 업종 전체가 오르는 중이다",
+            intraday,
+        )
+    ratio_down = down / len(changes)
+    # 주어를 빼면 `🇺🇸 🧠 섹터` 와 `🇰🇷 🔧 반도체 장비·소재` 가 한 카드에서 **똑같은 문장**으로
+    # 끝난다(전량 분기는 갈리는데 여기만 안 갈렸다) → 전량 분기와 대칭으로 subject 를 세운다.
+    if ratio_down >= _SECTOR_ONE_SIDED:
+        return f"{subject}가 거의 다 빠졌다 — " + day_phrase(
+            "사실상 업종 전체가 밀린 날로 봐야 한다",
+            "사실상 업종 전체가 밀리는 중으로 봐야 한다",
+            intraday,
+        )
+    if ratio_down <= 1 - _SECTOR_ONE_SIDED:
+        return f"{subject}가 거의 다 올랐다 — " + day_phrase(
+            "사실상 업종 전체가 오른 날로 봐야 한다",
+            "사실상 업종 전체가 오르는 중으로 봐야 한다",
+            intraday,
+        )
+    return "오른 종목과 빠진 종목이 섞였다 — " + day_phrase(
+        "업종 전체가 아니라 종목별로 갈린 날이다",
+        "업종 전체가 아니라 종목별로 갈리는 중이다",
+        intraday,
+    )
+
+
+def coverage_notes(total: int, quoted: int, valued: int) -> list[str]:
+    """`(N종 조회 실패)` · `(N종 값 없음)` 안내 줄. `▸ 요약` 의 분모와 표시 줄 수를 맞춘다. 순수.
+
+    분모는 **`changes`(등락률이 있는 종목) 하나로 통일**한다. quote 는 왔는데 `pct` 가 None 인
+    종목(5일 창에 봉이 하나뿐인 연휴 등)은 조회 실패가 아니라서 종전엔 아무 표기도 안 붙었고,
+    `▸ 3종 중 1종 하락` 아래에 종목 줄이 4개 서는 어긋남이 났다. 두 사유를 **따로** 센다 —
+    "못 받았다"와 "받았는데 값이 없다"는 다른 사실이다.
+    """
+    notes = []
+    if total > quoted:
+        notes.append(f"({total - quoted}종 {FAIL})")
+    if quoted > valued:
+        notes.append(f"({quoted - valued}종 값 없음)")
+    return notes
+
+
+def fmt_korea_index(quotes: dict[str, dict[str, Any] | None]) -> str:
+    """코스피·코스닥. 국내장 영역의 머리 — 개별 종목을 읽기 전에 판 전체가 어땠는지부터 준다.
+
+    ponytail: 미국 지수와 달리 **요약 줄로 올린다**(`index_line`) — 국내장 필드가 3개뿐이라
+    지수를 어디 끼워 넣을 자리가 없고, 지수는 그 자체가 요약이다.
+
+    ⚠️ 지금은 외부 문자열을 하나도 렌더하지 않는다(라벨은 `KOREA_INDEXES` 상수, 값은 숫자
+    포맷) → `plain()` 이 필요 없다. **야후 응답 문자열(예: `quote["symbol"]`·`currency`)을
+    싣는 순간 `plain()` 이 필수**가 된다 — 그게 마크다운·링크 문법이 카드로 들어오는 경로다.
+    """
+    rows: list[tuple[str, str]] = []
+    changes: list[float] = []
+    for symbol, label in KOREA_INDEXES:
+        quote = quotes.get(symbol)
+        if quote is None:
+            rows.append((label, FAIL))
+            continue
+        rows.append((label, f"{float(quote['price']):,.2f} ({pct(quote.get('pct'))})"))
+        if quote.get("pct") is not None:
+            changes.append(float(quote["pct"]))
+    lines = kv(rows)
+    lines.append(note("코스피는 대형주, 코스닥은 중소형·기술주 중심 — 갈리면 돈이 옮겨간 것이다"))
+    # 결론은 **두 지수의 방향 조합**에서 만든다(고정 문구 금지 — 어느 날 거짓이 된다).
+    # 곱의 부호만 보면 어느 쪽이 보합인지 구분을 못 해 "같은 방향"이 거짓이 될 수 있다 → 0 을 따로.
+    picked = [quotes.get(symbol) for symbol, _ in KOREA_INDEXES]
+    live = is_intraday(picked)
+    if len(changes) < len(KOREA_INDEXES):
+        closing = "두 지수 중 한쪽을 못 받아 대형주와 중소형주가 갈렸는지 못 본다"
+    elif changes[0] * changes[1] > 0:
+        closing = day_phrase(
+            "두 지수가 같은 방향이라 특정 종목이 아니라 국내 시장 전체가 움직인 날이다",
+            "두 지수가 같은 방향이라 특정 종목이 아니라 국내 시장 전체가 움직이는 중이다",
+            live,
+        )
+    elif changes[0] * changes[1] < 0:
+        closing = day_phrase(
+            "코스피와 코스닥이 반대로 갔다 — 대형주와 중소형주 사이에서 돈이 옮겨간 날이다",
+            "코스피와 코스닥이 반대로 간다 — 대형주와 중소형주 사이에서 돈이 옮겨가는 중이다",
+            live,
+        )
+    else:
+        closing = "한쪽 지수가 제자리라 국내 시장 전체가 움직였다고 보기는 어렵다"
+    stamp = day_stamp(picked)
+    summary = index_line(quotes, KOREA_INDEXES)
+    return block(f"{stamp} · {summary}" if stamp else summary, lines, closing=closing_note(closing))
+
+
+def fmt_korea_equip(quotes: dict[str, dict[str, Any] | None]) -> str:
+    """국내 반도체 장비·소재(HBM 밸류체인). 메모리 3사가 투자를 늘리면 여기 실적이 먼저 움직인다.
+
+    표기는 **이름만**(티커 생략) — `fmt_korea` 와 같은 이유다. `fmt_sector` 가 `label_of` 로
+    티커를 병기하는 것은 미국 종목이 티커로 통용되기 때문이고, 국내 종목은 `042700.KS` 를 봐도
+    어느 회사인지 안 읽힌다. 대신 종목당 한 줄로 세워 `fmt_sector` 의 세로 비교 태도는 지킨다.
+
+    죽은 종목은 목록에서 빼되 **몇 종이 빠졌는지는 남긴다** — 조용히 줄면 "오늘은 이게 다"로 읽는다.
+
+    ⚠️ `fmt_korea_index` 와 같다 — 지금은 외부 문자열을 렌더하지 않아 `plain()` 이 없다.
+    **야후 응답 문자열(예: `quote["symbol"]`)을 싣게 되면 그 순간 `plain()` 이 필수**다.
+    """
+    rows: list[tuple[str, str]] = []
+    changes: list[float] = []
+    for symbol in KOREA_EQUIP:
+        quote = quotes.get(symbol)
+        if quote is None:
+            continue
+        rows.append(
+            (
+                NAMES.get(symbol, symbol),
+                f"{float(quote['price']):,.0f}원 ({pct(quote.get('pct'), 1)})",
+            )
+        )
+        if quote.get("pct") is not None:
+            changes.append(float(quote["pct"]))
+    lines = kv(rows)
+    lines += coverage_notes(len(KOREA_EQUIP), len(rows), len(changes))
+    down = sum(1 for c in changes if c < 0)
+    summary = f"{len(changes)}종 중 {down}종 하락" if changes else f"장비·소재 {FAIL}"
+    picked = [quotes.get(symbol) for symbol in KOREA_EQUIP]
+    stamp = day_stamp(picked)
+    return block(
+        f"{stamp} · {summary}" if stamp else summary,
+        lines,
+        closing=closing_note(breadth_closing(changes, "장비·소재주", is_intraday(picked))),
     )
 
 
 def fmt_sector(quotes: dict[str, dict[str, Any] | None]) -> str:
-    """지수 2종 + 반도체·AI 9종. **한 줄에 한 종목 · 주식명(티커)** 로 세로 비교가 되게 한다.
+    """지수 2종 + 반도체·AI `SECTOR` 전종. **한 줄에 한 종목 · 주식명(티커)** 로 세로 비교가 되게.
 
-    죽은 종목은 목록에서 빼되 **몇 종이 빠졌는지는 남긴다** — 9종이 조용히 2종으로 줄면 읽는
+    죽은 종목은 목록에서 빼되 **몇 종이 빠졌는지는 남긴다** — 전종이 조용히 2종으로 줄면 읽는
     사람은 "오늘 섹터는 이게 다"로 읽는다.
     """
     rows: list[tuple[str, str]] = []
@@ -1754,31 +2076,16 @@ def fmt_sector(quotes: dict[str, dict[str, Any] | None]) -> str:
         rows.append((label_of(symbol), pct(quote.get("pct"), 1)))
         if quote.get("pct") is not None:
             changes.append(float(quote["pct"]))
-    missing = len(SECTOR) - len(rows)
     # 지수(^SOX·SMH) 줄은 **렌더에서만 뺐다**(사용자 배치에 없다 — 의도 확인 대기).
     # 되돌리려면 이 한 줄: `lines.insert(0, index_line(quotes))`
     lines = kv(rows)
-    if missing:
-        lines.append(f"({missing}종 {FAIL})")
+    lines += coverage_notes(len(SECTOR), len(rows), len(changes))
     down = sum(1 for c in changes if c < 0)
     summary = f"{len(changes)}종 중 {down}종 하락" if changes else f"섹터 {FAIL}"
-    # ⚠️ **임계값 주의**: 종전엔 "전량이 아니면 혼조"라 8/9 하락을 "종목별로 갈렸다"로 읽어
-    # 같은 블록의 `▸ 9종 중 8종 하락` 과 정면으로 모순됐다(2026-07-29 검수에서 적발).
-    # 비율로 다시 긋는다 — ¾ 이상이 한쪽이면 그건 업종이 통째로 움직인 것이다.
-    ratio_down = down / len(changes) if changes else 0.0
-    if not changes:
-        closing = "섹터 시세를 못 받아 오늘 움직임이 종목 문제인지 업종 문제인지 못 가른다"
-    elif down == len(changes):
-        closing = "반도체가 전부 같이 빠졌다 — 개별 종목 이슈가 아니라 업종 전체가 밀린 날이다"
-    elif down == 0:
-        closing = "반도체가 전부 같이 올랐다 — 개별 종목이 아니라 업종 전체가 오른 날이다"
-    elif ratio_down >= _SECTOR_ONE_SIDED:
-        closing = "거의 다 빠졌다 — 사실상 업종 전체가 밀린 날로 봐야 한다"
-    elif ratio_down <= 1 - _SECTOR_ONE_SIDED:
-        closing = "거의 다 올랐다 — 사실상 업종 전체가 오른 날로 봐야 한다"
-    else:
-        closing = "오른 종목과 빠진 종목이 섞였다 — 업종 전체가 아니라 종목별로 갈린 날이다"
-    return block(summary, lines, closing=closing_note(closing))
+    # 날짜 표기는 안 붙인다 — 미국장 필드는 전부 같은 세션이라 `💵 마이크론` 한 곳이면 족하다.
+    # 결론 어미는 갈라야 한다(미장 개장 중에 카드를 내면 여기도 미완결이다).
+    live = is_intraday([quotes.get(symbol) for symbol in SECTOR])
+    return block(summary, lines, closing=closing_note(breadth_closing(changes, "반도체", live)))
 
 
 # ── 조립 ──────────────────────────────────────────────────────────────────
@@ -1811,8 +2118,22 @@ def build_us_digest(today: str) -> dict[str, Any] | None:
 
     # ① 시세 묶음(환율·VIX·한국·섹터). SKHY 만 상장일수·고점이 필요해 3개월 창으로 받는다.
     quotes: dict[str, dict[str, Any] | None] = {SKHY: fetch_quote(SKHY, "3mo")}
-    for symbol in (FX_SYMBOL, VIX_SYMBOL, *KOREA, *(s for s, _ in INDEXES), *SECTOR):
-        quotes[symbol] = fetch_quote(symbol)
+    for symbol in (
+        FX_SYMBOL,
+        VIX_SYMBOL,
+        *KOREA,
+        *(s for s, _ in INDEXES),
+        *SECTOR,
+        *(s for s, _ in KOREA_INDEXES),
+        *KOREA_EQUIP,
+    ):
+        # ⚠️ **이미 받아둔 심볼은 다시 받지 않는다.** 없으면 아래 목록에 겹치는 종목이 위의
+        # 특수 창 조회를 기본 창(5d)으로 덮어쓴다 — SKHY 가 `SECTOR` 에 들어간 순간
+        # `bars`(상장 N일차)·`high`(고점 대비)가 5일치 값으로 바뀌어 `fmt_korea` 가 **조용히**
+        # 다른 말을 한다(카드는 멀쩡해 보인다). SKHY 전용 분기 대신 여기서 한 번에 막는다 —
+        # 다음에 다른 종목을 특수 창으로 받아도 같은 함정에 안 빠진다. 중복 GET 도 덤으로 준다.
+        if symbol not in quotes:
+            quotes[symbol] = fetch_quote(symbol)
     fx = quotes.get(FX_SYMBOL)
 
     # ② Nasdaq — 목표가·컨센서스·서프라이즈·공매도·시총.
@@ -1914,18 +2235,24 @@ def build_us_digest(today: str) -> dict[str, Any] | None:
         log.info("미국주식 펀더멘털 블록 실패(%s)", type(exc).__name__)
         fundamentals, warn = f"SEC 재무 {FAIL}", ""
     change = mu.get("pct")
+    # 필드 순서 = **미국장 7 → 국내장 3**. 구분은 필드명 접두 국기로만 낸다(헤더 필드 없음).
+    # ⚠️ 순서를 바꿀 때는 예산을 다시 재라 — 어댑터는 총합 초과분을 **뒤쪽부터** 버리므로
+    # 맨 뒤 국내장이 먼저 사라진다(`FIELD_MAXLEN` 주석).
     fields = [
-        _field(f"💵 {NAMES.get(TICKER, TICKER)}({TICKER}) 시세", _safe("시세", fmt_price, mu, fx)),
-        _field("🎯 시장 기대", _safe("기대", fmt_expectation, target, forecast)),
         _field(
-            "📅 실적",
+            f"{FLAG_US} 💵 {NAMES.get(TICKER, TICKER)}({TICKER}) 시세",
+            _safe("시세", fmt_price, mu, fx),
+        ),
+        _field(f"{FLAG_US} 🎯 시장 기대", _safe("기대", fmt_expectation, target, forecast)),
+        _field(
+            f"{FLAG_US} 📅 실적",
             _safe(
                 "실적", fmt_earnings, surprise, forecast, calendar, day, option_move, earnings_lines
             ),
         ),
-        _field("🏭 펀더멘털(SEC)", fundamentals),
+        _field(f"{FLAG_US} 🏭 펀더멘털(SEC)", fundamentals),
         _field(
-            "🔄 수급·심리",
+            f"{FLAG_US} 🔄 수급·심리",
             _safe(
                 "수급",
                 fmt_flows,
@@ -1937,15 +2264,21 @@ def build_us_digest(today: str) -> dict[str, Any] | None:
                 str((index or {}).get("day") or ""),
             ),
         ),
-        _field("📰 공시·뉴스", _safe("공시", fmt_filings, index, news, summaries)),
-        _field("🇰🇷 한국 메모리 3사", _safe("한국", fmt_korea, quotes, skhy_forecast)),
-        _field("🧠 섹터", _safe("섹터", fmt_sector, quotes)),
+        _field(f"{FLAG_US} 📰 공시·뉴스", _safe("공시", fmt_filings, index, news, summaries)),
+        _field(f"{FLAG_US} 🧠 섹터", _safe("섹터", fmt_sector, quotes)),
+        _field(f"{FLAG_KR} 📊 지수", _safe("한국지수", fmt_korea_index, quotes)),
+        _field(f"{FLAG_KR} 🏭 메모리", _safe("한국", fmt_korea, quotes, skhy_forecast)),
+        _field(f"{FLAG_KR} 🔧 반도체 장비·소재", _safe("장비소재", fmt_korea_equip, quotes)),
     ]
     # 출처 푸터는 뺐다(사용자: 혼자 보는 카드라 출처 표기가 필요 없다). 남는 것은 시총
     # 교차검증 경고뿐 — 있을 때만 뜬다. 어댑터의 `⚠️N개 필드 생략` 고지 경로는 그대로 산다.
     return {
         # 제목엔 날짜만 — 시세는 첫 필드가 말한다(사용자 배치).
-        "title": f"{LEAD_US} [{today}] 미국주식",
+        # 제목 낱말은 **채널 표시명(`#반도체주식`)과 같은 말로 맞춘다** — 카드가 미국장 7 +
+        # 국내장 3 이 된 이상 "미국주식"은 거짓이고, 채널과 제목이 갈리면 어느 쪽이 정본인지
+        # 다음 세션이 되짚어야 한다. ⚠️ 내부 식별자(`us-digest`·`US_DIGEST_NOTIFY_ID`·
+        # 모듈명·CLI 플래그·채널 `tag`)는 **표시 문자열이 아니므로 그대로 둔다.**
+        "title": f"{LEAD_US} [{today}] 반도체주식",
         "fields": fields,
         "footer": warn,
         "color": COLOR_FLAT if not change else (COLOR_UP if change > 0 else COLOR_DOWN),
@@ -1979,7 +2312,23 @@ def _selftest() -> None:
     assert quote is not None
     assert (quote["price"], quote["prev"]) == (800.0, 900.0)  # 창 직전 종가가 아니라 시계열로
     assert abs(quote["pct"] + 11.111) < 0.01
+    assert quote["day"] is None and quote["intraday"] is False  # timestamp 없음 → 날짜도 없다
     assert parse_quote({"chart": {"result": []}}) is None
+    # 오프바이원 — 결측 봉을 거른 뒤에도 (시각, 종가) 짝이 유지돼야 마지막 봉의 날짜가 맞는다.
+    dated = parse_quote(
+        {
+            "chart": {
+                "result": [
+                    {
+                        "meta": {"symbol": "^KS11", "gmtoffset": 32400},
+                        "timestamp": [1785196800, 1785283200, 1785456000],
+                        "indicators": {"quote": [{"close": [100.0, None, 120.0]}]},
+                    }
+                ]
+            }
+        }
+    )
+    assert dated is not None and dated["day"] == "2026-07-31"  # 한 칸 밀리면 7월 29일이 된다
     # 회계연도 4분기 구멍(10-K 는 연간만 싣는다) → `연간 - 3분기`로 메운다.
     gaap = {
         "X": {
@@ -2035,6 +2384,15 @@ def _selftest() -> None:
     assert parse_llm_output("[뉴스]\n1. 가\n2. 나", 2) == (["가", "나"], None)
     assert parse_llm_output("", 1) == (None, None)
     assert label_of("NVDA") == "엔비디아 (NVDA)" and label_of("AMD") == "AMD (AMD)"
+    # 폭(breadth) 사다리는 섹터·장비소재 공용 — 임계값이 갈리지 않게 한 곳에서만 판정한다.
+    assert "전부 같이 빠졌다" in breadth_closing([-1.0, -2.0, -3.0], "반도체")
+    assert "거의 다 빠졌다" in breadth_closing([-1.0] * 3 + [1.0], "반도체")  # 3/4 = 0.75
+    assert "섞였다" in breadth_closing([-1.0, 1.0, 1.0], "반도체")
+    assert breadth_closing([], "장비·소재주").startswith("장비·소재주 ")
+    # 표본 하한 — 1~2종만 살아남으면 업종 판정을 하지 않는다(4종짜리 장비·소재가 실제 위험).
+    assert "표본이 안 된다" in breadth_closing([-1.0, -2.0], "장비·소재주")
+    # 국내 지수는 미국 지수와 **다른 튜플**을 쓴다(통화·거래시간이 다르다).
+    assert index_line({"^KS11": {"pct": 1.0}}, KOREA_INDEXES) == f"코스피 🔺 1.0% · 코스닥 {FAIL}"
     # 표시 경계 — 링크 문법을 만들 수 없어야 하고, 괄호 든 URL 은 링크가 되면 안 된다.
     assert plain("a[b](c)\nd") == "a(b)(c) d"
     assert safe_url("https://ok.example/a") and not safe_url("https://x/a) [피싱](https://y")

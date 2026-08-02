@@ -304,6 +304,9 @@ log = logging.getLogger("bridge")
 notify_fired: set[tuple[str, str]] = set()  # (id, "YYYY-MM-DD") — 오늘 발송 완료분
 notify_snooze: dict[str, str] = {}  # id -> 재발송 ISO datetime(KST)
 _notify_lock = threading.Lock()
+# opensource_seen.json 의 load→modify→save 보호(mark_seen). writer 가 둘이다 — 다이제스트 워커와
+# 📌 버튼 핸들러(어댑터 이벤트 스레드). tmp 경로까지 공유해 겹치면 파일 전량이 날아갈 수 있다.
+_seen_lock = threading.Lock()
 
 # ③ 버튼 선택지 보류맵 — message_id -> entry dict. entry 필드 정의·의미는 _render_choices 참조.
 # ponytail: 모듈 레벨 in-memory(직렬 워커라 락 불필요). 재시작 시 진행 중 선택은 유실 수용.
@@ -1113,10 +1116,17 @@ _DIGEST_NONE_MARK = "오늘 적용할 것 없음"  # 이 문구가 든 카드엔
 # 이 키 집합이 **판정 낱말의 유일한 정본**이다 — 여기 없는 낱말이면 제목 슬롯이 어긋난 것으로
 # 보고 카드를 만들지 않는다(평문 폴백). `기각` 은 계약상 카드가 되지 않으므로 여기에도 없다.
 DIGEST_COLORS = {"즉시적용": 0x3ECF85, "차용": 0x5865F2, "참조": 0x5865F2, "보류": 0xEEBB4D}
+# **카드가 되는 판정은 이 2종뿐**(계약 2-0절). ⚠️ **DIGEST_COLORS 에서 참조·보류를 지워 이걸
+# 구현하지 마라** — 미등록 낱말 = 카드 포기 = **판정 원문 통째 평문 게시**(2-1절)라 소음이 되레
+# 폭증한다. 낱말 인식은 그대로 두고 게시 단계(_post_digest_cards)에서만 거른다.
+DIGEST_CARD_VERDICTS = frozenset({"즉시적용", "차용"})
 DIGEST_COLOR_DEFAULT = 0x5865F2  # 0건 안내(판정 없는 2층 카드) 전용 색
 # 본문 라벨 → 필드 값 한 줄의 머리표. 항목 하나가 필드 하나라 네 줄이 **한 값 안에** 들어간다.
 _DIGEST_VALUE_LINES = (("내용", ""), ("장점", "👍 "), ("단점", "👎 "), ("적용", "🔧 "))
 _DIGEST_SEQ_RE = re.compile(r"\d{1,2}/\d{1,2}")  # v1 카드 순번 표기(`1/2`) — 와도 흡수해 떼어낸다
+# 제목 **꼬리**의 지표 괄호(`repo (⭐900)` → `repo`). 전각(U+FF08/09)·앞공백 없음도 받는다.
+# ⚠️ `partition("(")` 로 바꾸지 마라 — `Show HN: Foo (a tool) (HN 90p)` 의 앞 괄호까지 잘린다.
+_DIGEST_METRIC_RE = re.compile("\\s*[(\uff08][^)\uff09]*[)\uff09]\\s*$")  # 리터럴 전각은 RUF001
 # 마지막 카드 꼬리 `검토 N건 · 기각 M건`(계약 형식 고정 — `건` 은 있어도 없어도 받는다).
 # **fullmatch 로만 쓴다**: 뒤를 안 묶으면 "검토 12건 중 기각 9건이 중복이었다" 같은 본문 줄까지
 # footer 로 훔쳐 ① 그 줄이 본문에서 사라지고 ② 마지막이 아닌 카드에 footer 가 붙는다(계약 위반).
@@ -1580,9 +1590,12 @@ def filter_digest(
     """
     out: list[dict[str, Any]] = []
     dedup: set[str] = set()
+    # ⚠️ **seen 대조에서 케이스를 접는 것을 떼지 마라** — 저장은 판정 표기 그대로인데 후보 `key`
+    # 는 늘 소문자라, 접지 않으면 대문자가 든 레포가 영영 안 걸린다(근거·실측은 계약 5절).
+    blocked = {s.lower() for s in seen}
     for c in candidates:
         name, key = str(c.get("name", "")), str(c.get("key", ""))
-        if not name or name in dedup or name in seen or key in seen:
+        if not name or name in dedup or name.lower() in blocked or key.lower() in blocked:
             continue
         if key and key in installed:
             continue
@@ -1919,6 +1932,60 @@ def digest_none_card(line: str) -> dict[str, Any]:
     }
 
 
+def digest_footer(stat: str, filtered: int) -> str:
+    """카드 꼬리 집계에 `참조·보류 N건` 을 덧댄다(0이면 그대로). 순수.
+
+    계약 줄(`검토 N건 · 기각 M건`)은 **판정이 쓰고** `_DIGEST_STAT_RE` 가 `fullmatch` 로 잡는다.
+    참조·보류 수는 **브리지가 세어 붙이는 표시용**이라 프롬프트의 출력 계약도 그 정규식도
+    건드리지 않는다(계약 줄을 늘리면 프롬프트·정규식·테스트 3곳이 한꺼번에 걸린다).
+    """
+    return " · ".join(p for p in (stat, f"참조·보류 {filtered}건" if filtered else "") if p)
+
+
+def digest_none_line(stat: str = "") -> str:
+    """`🧩 오늘 적용할 것 없음 (<집계>)` 평문 한 줄. 집계가 비면 괄호도 없다(빈 `()` 방지). 순수."""
+    return f"{LEAD_DIGEST} {_DIGEST_NONE_MARK}" + (f" ({stat})" if stat else "")
+
+
+def split_digest_items(cards: list[str]) -> tuple[list[dict[str, Any]], list[str], str, list[str]]:
+    """카드 원문 → (파싱 항목, 평문으로 나갈 원문, 계약 집계 줄, 걸러진 카드 제목). 순수.
+
+    **라이브(_post_digest_cards)와 드라이런(digest_dry_run)이 공유하는 유일한 판정 파싱 경로.**
+    갈라두면 드라이런이 거짓말을 한다(_digest_gather 를 수집에서 뽑아둔 것과 같은 이유).
+    후보 역매칭·📌 보류맵 등재는 라이브에만 있으므로 여기 넣지 않는다 — 그래서 `filtered` 는
+    이름이 아니라 **제목**을 돌려준다(이름 정규화는 매칭을 가진 라이브 몫).
+    """
+    items: list[dict[str, Any]] = []
+    plains: list[str] = []  # 접을 수 없어 따로 나갈 것(0건 안내 · 형식 이탈 평문)
+    filtered: list[str] = []  # 카드가 안 되는 판정(참조·보류)의 제목
+    footer = ""
+    for raw in cards:
+        # M-3: 계약 이탈로 수십 KB 가 나가지 않게 **파싱 전에** 자른다(상한이 카드 슬롯에도 걸린다).
+        plain = raw[:DIGEST_CARD_MAXLEN]
+        if _DIGEST_NONE_MARK in plain:
+            plains.append(plain)
+            continue
+        item = digest_card(plain)
+        if item is None:  # 형식 이탈 → 평문 1장(그날치를 통째로 날리지 않는다)
+            log.info("다이제스트 카드 형식 이탈 — 평문 폴백")
+            plains.append(plain)
+            continue
+        # footer 는 판정 필터보다 **먼저** — 마지막 카드가 참조여도 계약 집계 줄은 살아야 한다.
+        footer = str(item.get("footer") or "") or footer
+        if item["verdict"] not in DIGEST_CARD_VERDICTS:  # 카드는 즉시적용·차용만(계약 2-0절)
+            filtered.append(str(item["title"]))
+            continue
+        item["plain"] = plain
+        items.append(item)
+    footer = digest_footer(footer, len(filtered))
+    # 0건 안내를 합성하는 조건. ⚠️ 세 항 중 **하나도 빼지 마라**(각각이 막는 오보가 다르다 —
+    # 계약 2-0절 표): `footer` = 실을 집계가 없으면 만들지 않는다 · `any(…NONE_MARK…)` = 판정이
+    # 이미 냈으면 중복하지 않는다 · `not plains` 로 바꾸면 형식 이탈 평문에 안내가 먹힌다.
+    if cards and not items and footer and not any(_DIGEST_NONE_MARK in p for p in plains):
+        plains.append(digest_none_line(footer))
+    return items, plains, footer, filtered
+
+
 def digest_card_marks(card: dict[str, Any] | None, marks: list[str]) -> dict[str, Any] | None:
     """카드 dict 사본의 footer 앞에 결과 마크(📌 백로그 등재 등)를 붙인다. 카드 없으면 None."""
     if card is None or not marks:
@@ -2034,17 +2101,19 @@ def mark_seen(path: Path, names: list[str], value: str) -> None:
 
     **영구는 날짜로 덮지 않는다**(📌 누른 것이 나중 회차 기록에 밀려 다시 올라오지 않게).
     쓰기 실패는 조용히 무시(부수 기록 — append_rejected 와 같은 사상).
+    ⚠️ **락을 떼지 마라** — 📌 버튼 핸들러(다른 스레드)와 겹치면 파일 전량이 날아간다(_seen_lock).
     """
     kept = [n for n in (strip_control_line(str(x))[:_BACKLOG_FIELD_MAXLEN] for x in names) if n]
     if not kept:
         return
-    seen = load_seen(path)
-    for name in kept:
-        if seen.get(name) == _SEEN_FOREVER and value != _SEEN_FOREVER:
-            continue
-        seen[name] = value
-    with contextlib.suppress(OSError):
-        save_seen(path, seen)
+    with _seen_lock:
+        seen = load_seen(path)
+        for name in kept:
+            if seen.get(name) == _SEEN_FOREVER and value != _SEEN_FOREVER:
+                continue
+            seen[name] = value
+        with contextlib.suppress(OSError):
+            save_seen(path, seen)
 
 
 def append_rejected(path: Path, day: str, rejects: list[tuple[str, str]]) -> None:
@@ -2071,9 +2140,10 @@ def _post_digest_cards(
     **형식 이탈 카드·0건 안내는 종전대로 각자 평문/2층 카드 1장**으로 따로 나간다 — 접을 수 없는
     것을 억지로 접으면 그날치 정보가 사라진다(정보 손실 0 원칙).
 
-    **버튼을 다는 조건 = 후보 역매칭 성공한 항목만.** 제목이 어떤 후보와도 안 맞으면 seq 를 주지
-    않는다 — 그런 항목에 📌 를 달면 축·판정이 섞인 제목 문자열이 백로그·seen 에 들어가는데 그
-    값은 어떤 후보와도 매칭되지 않아 아무것도 거르지 못한다(조용한 무효 클릭 + 파일 오염, L-4).
+    **버튼(📌)·백로그·URL 은 후보 역매칭 성공분만.** 제목이 어떤 후보와도 안 맞으면 seq 를 주지
+    않는다 — 그런 항목에 📌 를 달면 축·판정이 섞인 문자열이 백로그에 들어가는데 그 값은 어떤
+    후보와도 매칭되지 않아 아무것도 거르지 못한다(조용한 무효 클릭 + 파일 오염, L-4).
+    **단 30일 쿨다운(seen)은 역매칭에 의존하지 않는다**(아래 `bury`).
     L-5: 중간 send 예외는 로그만 남기고 다음 메시지로 간다. 실패로 되돌리면 다음 틱이 처음부터
     재실행해 이미 나간 것이 **중복 게시**되기 때문 — 호출측은 1장이라도 나갔으면 성공으로 본다.
     """
@@ -2085,33 +2155,27 @@ def _post_digest_cards(
         (c for c in candidates if str(c.get("name", ""))),
         key=lambda c: -len(str(c.get("name", ""))),
     )
-    items: list[dict[str, Any]] = []
-    loners: list[tuple[str, dict[str, Any] | None]] = []  # (평문, 카드 or None) — 따로 나가는 것
-    footer = ""
-    for raw in cards:
-        # plain = 판정이 낸 평문 원문(어댑터 폴백용). M-3: 계약 이탈로 수십 KB 가 나가지 않게
-        # **파싱 전에** 자른다 → 상한이 카드 슬롯에도 그대로 걸린다.
-        plain = raw[:DIGEST_CARD_MAXLEN]
-        if _DIGEST_NONE_MARK in plain:
-            loners.append((plain, digest_none_card(plain)))
-            continue
-        item = digest_card(plain)
-        if item is None:  # 형식 이탈 → 평문 1장(그날치를 통째로 날리지 않는다)
-            log.info("다이제스트 카드 형식 이탈 — 평문 폴백")
-            loners.append((plain, None))
-            continue
-        footer = str(item.get("footer") or "") or footer  # 계약상 마지막 카드에만 붙는다
-        cand = next((c for c in by_len if str(c.get("name", "")) in str(item["title"])), None)
-        item.update(
-            {"plain": plain, "day": today, "added": False, "seq": None, "url": "", "apply": ""}
-        )
+
+    def bury(title: str) -> tuple[dict[str, Any] | None, str]:
+        """제목 → (역매칭 후보, 쿨다운에 매장할 이름).
+
+        ⚠️ **매장 이름을 역매칭 성공에 의존시키지 마라** — 실패 시 빈 이름을 묻으면 쿨다운이
+        통째로 사문화된다(계약 5절).
+        """
+        cand = next((c for c in by_len if str(c.get("name", "")) in title), None)
+        return cand, str(cand["name"]) if cand else _DIGEST_METRIC_RE.sub("", title).strip()
+
+    items, plains, footer, filtered_titles = split_digest_items(cards)
+    for item in items:
+        item.update({"day": today, "added": False, "seq": None, "url": "", "apply": ""})
+        cand, item["name"] = bury(str(item["title"]))
         if cand is not None:
             item["seq"] = seq = next(_digest_seq)
-            item["name"] = str(cand["name"])  # 백로그·seen 이 쓰는 **정규 레포명**(제목과 별개)
             item["url"] = str(cand["url"])
-            item["apply"] = parse_digest_card(plain)[1]
+            item["apply"] = parse_digest_card(str(item["plain"]))[1]
             digest_pending[seq] = item
-        items.append(item)
+    filtered = [bury(t)[1] for t in filtered_titles]
+    loners = [(p, digest_none_card(p) if _DIGEST_NONE_MARK in p else None) for p in plains]
     posted = 0
     if items:
         group = {
@@ -2144,6 +2208,10 @@ def _post_digest_cards(
             log.warning("다이제스트 평문 게시 실패(%s) — 나머지는 계속", type(e).__name__)
             continue
         posted += 1
+    if posted and filtered:
+        # 참조·보류도 30일 쿨다운(정상 판정이 끝난 건). ⚠️ `opensource_rejected.jsonl` 에는 넣지
+        # 마라 — 프롬프트에 "최근 기각 이력"으로 재주입돼 판정이 "참조 = 기각"으로 학습된다.
+        mark_seen(SEEN_FILE, filtered, today)
     return posted
 
 
@@ -2223,7 +2291,7 @@ def run_opensource_digest(adapter: Adapter, channel_id: int, today: str) -> bool
         log.warning("다이제스트 수집 0건 — 조회 실패로 보고 되돌림")
         return False
     if not kept:
-        none_line = f"{LEAD_DIGEST} {_DIGEST_NONE_MARK} (검토 0 · 기각 0)"
+        none_line = digest_none_line("검토 0 · 기각 0")
         adapter.send(channel_id, none_line, None, card=digest_none_card(none_line))
         return True
     data, _prompt, _harness, _readmes = _digest_judge(claude_exe, kept)
@@ -2232,20 +2300,19 @@ def run_opensource_digest(adapter: Adapter, channel_id: int, today: str) -> bool
         return False
     body, rejects = parse_digest_rejects(str(data.get("result", "")))
     cards = split_digest_cards(body)
+    # ⚠️ 재는 것은 **판정 원문에 🧩 줄이 없다**는 것뿐 — "게시할 카드 0장"과 혼동하지 마라.
+    # 후자는 정상이고 _post_digest_cards 가 0건 안내로 끝낸다(되돌리면 매일 3회 헛돈다).
     if not cards:
-        log.warning("다이제스트 카드 0건(형식 이탈) — 되돌림")
+        log.warning("다이제스트 판정 원문에 카드 줄 없음(형식 이탈) — 되돌림")
         return False
-    # **기록·매장은 되돌림 판정 뒤에** — 되돌림이면 상태도 되돌아야 한다(2026-08-01 점검 지적).
-    # 종전엔 이 두 줄이 위 `if not cards` 앞이라, 판정이 `🚫기각:` 줄만 내고 `🧩 …없음` 한 줄을
-    # 빠뜨리면(body="" → cards=[]) 되돌리면서도 기록만 확정됐다 → 재시도 3회를 태우는 동안 후보
-    # 풀은 이미 30일 매장돼 줄고, opensource_rejected.jsonl 엔 같은 건이 3번 쌓인다.
-    # 위 `if not kept` / `is_error` 되돌림도 기록이 없다 — 그 대칭을 맞춘다.
-    append_rejected(REJECTED_FILE, today, rejects)
-    # 기각도 30일 쿨다운 — v1 은 매일 같은 후보를 다시 판정하느라 토큰을 태웠다(영구가 아닌 이유는
-    # active_seen 참조: 보류 사유가 해소되면 다시 올라와야 한다).
-    mark_seen(SEEN_FILE, [name for name, _reason in rejects], today)
     # 1장이라도 나갔으면 성공(L-5) — 전량 실패만 되돌려 다음 틱이 다시 잡게 한다.
-    return _post_digest_cards(adapter, channel_id, today, cards, kept) > 0
+    posted = _post_digest_cards(adapter, channel_id, today, cards, kept)
+    # ⚠️ **기록·매장을 이 위로 올리지 마라** — 게시 전량 실패도 되돌림이라, 앞서면 재시도 3회가
+    # jsonl 에 중복을 쌓고 후보를 조기 매장한다(되돌림 4경로 전부 무기록 — 계약 5절).
+    if posted:
+        append_rejected(REJECTED_FILE, today, rejects)
+        mark_seen(SEEN_FILE, [name for name, _reason in rejects], today)
+    return posted > 0
 
 
 def _revert_digest_fired(item_id: str, today: str, reason: str) -> None:
@@ -2398,7 +2465,7 @@ def digest_dry_run(*, ignore_seen: bool = False, out: Path | None = None) -> int
         emit("card", "(없음)")
     elif not kept:
         # 라이브에서 0건 안내 카드가 나가는 자리(판정 claude 를 아예 부르지 않는다).
-        none_line = f"{LEAD_DIGEST} {_DIGEST_NONE_MARK} (검토 0 · 기각 0)"
+        none_line = digest_none_line("검토 0 · 기각 0")
         emit(
             "prompt",
             f"(건너뜀 — 통과 0건: 수집 {len(cands)}건이 쿨다운·설치됨·⭐하한에 전부 걸림)",
@@ -2425,26 +2492,14 @@ def digest_dry_run(*, ignore_seen: bool = False, out: Path | None = None) -> int
             cards = split_digest_cards(body)
             if not cards:
                 rc = 1
-                emit("card", f"(카드 0건 — 형식 이탈. 판정 원문: {body[:300] or '(빈 응답)'})")
-            # _post_digest_cards 와 같은 갈래: 파싱된 항목은 **임베드 한 통**, 0건 안내·형식
-            # 이탈은 각자 따로 나간다. 버튼·기록만 없을 뿐 채널에 뜰 모양 그대로다.
-            items: list[dict[str, Any]] = []
-            loners: list[tuple[dict[str, Any] | None, str]] = []
-            footer = ""
-            for raw in cards:
-                plain = raw[:DIGEST_CARD_MAXLEN]  # 라이브와 같은 위치에서 자른다(M-3)
-                if _DIGEST_NONE_MARK in plain:
-                    loners.append((digest_none_card(plain), plain))
-                    continue
-                item = digest_card(plain)
-                if item is None:
-                    loners.append((None, plain))
-                    continue
-                footer = str(item.get("footer") or "") or footer
-                items.append(item)
+                emit("card", f"(판정 원문에 카드 줄 없음 — 형식 이탈: {body[:300] or '(빈 응답)'})")
+            # 라이브와 **같은 함수**로 가른다(split_digest_items) — 버튼·기록만 없을 뿐
+            # 채널에 뜰 모양 그대로다. 파싱된 항목은 임베드 한 통, 나머지는 각자 따로.
+            items, plains, footer, _filtered = split_digest_items(cards)
             if items:
                 emit("card", _dryrun_card_text(digest_embed(items, footer), ""))
-            for spec, plain in loners:
+            for plain in plains:
+                spec = digest_none_card(plain) if _DIGEST_NONE_MARK in plain else None
                 emit("card", _dryrun_card_text(spec, plain))
             for name, reason in rejects:
                 emit("reject", f"{name} | {reason}")
@@ -2758,7 +2813,7 @@ _ORACLE_FALLBACK = (
 )
 
 
-def format_oracle_ga_status(runs: list[dict], now: datetime) -> str:
+def format_oracle_ga_status(runs: list[dict[str, Any]], now: datetime) -> str:
     """oci_arm_grabber GitHub Actions 실행목록 → 상태 회신. 순수(now 주입 → 테스트 가능).
 
     running = status 가 진행/대기 중 하나라도 있으면 True. 시작시각은 conclusion 이
@@ -4470,6 +4525,14 @@ def _selftest() -> None:
         "footer": "검토 5 · 기각 5",
         "color": DIGEST_COLOR_DEFAULT,
     }  # 본문·필드·버튼 없는 2층
+    # 카드는 즉시적용·차용만 — 참조·보류는 **낱말로는 인정**(평문 폴백 방지)하되 집계로만 나간다.
+    assert set(DIGEST_COLORS) > DIGEST_CARD_VERDICTS and "참조" not in DIGEST_CARD_VERDICTS
+    assert digest_footer("검토 5건 · 기각 3건", 2) == "검토 5건 · 기각 3건 · 참조·보류 2건"
+    assert digest_footer("검토 5건 · 기각 3건", 0) == "검토 5건 · 기각 3건"  # 0이면 안 붙인다
+    assert digest_footer("", 2) == "참조·보류 2건"  # 계약 줄이 빠져도 집계는 남는다
+    _none_head = f"{LEAD_DIGEST} {_DIGEST_NONE_MARK}"
+    assert digest_none_line("검토 5 · 기각 5") == f"{_none_head} (검토 5 · 기각 5)"
+    assert digest_none_line() == _none_head  # 집계 없으면 빈 괄호도 없다
     assert star_label(999) == "999" and star_label(12_400) == "12.4k"
     _today = date(2026, 7, 27)
     assert age_label("2026-07-15", _today) == "12일"
@@ -4478,6 +4541,11 @@ def _selftest() -> None:
     assert age_label("", _today) == "" and age_label("2027-01-01", _today) == ""  # 이탈·미래
     _c = {"name": "o/x", "key": "x", "source": "gh", "stars": 999, "desc": "d", "points": 0}
     assert filter_digest([_c], {"o/x"}, set()) == []  # seen 제외
+    # 판정이 준 bare 이름은 표기가 원본 그대로인데 후보 key 는 늘 소문자다 — 대조에서 케이스를
+    # 접지 않으면 대문자가 든 레포는 영영 안 걸린다(2026-08-02 라이브 결함).
+    _mixed = {**_c, "name": "Orkas-AI/Orkas-VideoStudio", "key": "orkas-videostudio"}
+    assert filter_digest([_mixed], {"Orkas-VideoStudio"}, set()) == []  # bare·대문자 표기
+    assert filter_digest([_mixed], {"orkas-ai/ORKAS-VideoStudio"}, set()) == []  # full·뒤섞인 표기
     assert filter_digest([_c], set(), {"x"}) == []  # 이미 설치 제외
     assert filter_digest([{**_c, "stars": 10}], set(), set()) == []  # ⭐하한 미달
     assert filter_digest([_c], set(), set()) == [_c]

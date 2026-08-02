@@ -4468,7 +4468,11 @@ def test_gh_candidate_rejects_bad_shapes():
 _CARD1 = (
     "🧩 MCP축 · owner/repo (⭐900) — 차용 1/2\n\n내용 : a\n장점 : b\n단점 : c\n적용 : 훅에 · 30분"
 )
-_CARD2 = "🧩 MCP축 · o/s (HN 90p) — 참조 2/2\n\n적용 : 나중 · 1시간\n검토 5건 · 기각 3건"
+# 판정은 **즉시적용·차용만 카드가 된다**(2026-08-02) — 게시 경로를 타는 표본이라 그 2종을 쓴다.
+# 참조·보류 표본은 아래 "카드 대상 판정" 절이 따로 든다.
+_CARD2 = "🧩 MCP축 · o/s (HN 90p) — 즉시적용 2/2\n\n적용 : 나중 · 1시간\n검토 5건 · 기각 3건"
+_CARD_REF = "🧩 MCP축 · owner/repo (⭐900) — 참조\n\n내용 : a\n적용 : 안 씀 · -"
+_CARD_HOLD = "🧩 훅축 · o/s (HN 90p) — 보류\n\n내용 : b\n적용 : 정보 부족 · -\n검토 7건 · 기각 5건"
 
 
 def test_split_digest_cards_two():
@@ -5400,6 +5404,8 @@ def test_digest_unparsable_card_falls_back_to_plain(monkeypatch):
     monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": off})
     fa = FakeAdapter(secrets=[])
     assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    # 표본에 계약 집계 줄이 없다 = 실을 숫자가 없다 → 0건 안내를 **덧붙이지 않는다**(1통 그대로).
+    # 집계가 있는 날은 뒤에 안내가 한 통 더 붙는다(…_still_keeps_plain_fallback 이 그 짝).
     assert fa.cards == [None] and fa.sent[0][1] == off
 
 
@@ -5986,6 +5992,240 @@ def test_digest_normal_verdict_writes_state(pipeline, monkeypatch):
     assert json.loads((pipeline / "seen.json").read_text(encoding="utf-8"))["o/x"] == "2026-07-15"
 
 
+# ── 카드 대상 판정 = 즉시적용·차용 2종 (2026-08-02) ─────────────────────────
+@pytest.mark.usefixtures("pipeline")
+def test_digest_reference_and_hold_make_no_cards_but_no_revert(monkeypatch):
+    """참조·보류만 온 날 = **정상**(형식 이탈이 아니다) — 카드 0건이어도 0건 안내가 나가고 성공.
+
+    되돌림으로 오판하면 DIGEST_MAX_ATTEMPTS(3)회 재시도를 매일 헛돈다. 되돌림 판정은
+    "판정 원문에 🧩 줄이 하나도 없다"일 때뿐이고, 여기선 줄이 있으므로 되돌리지 않는다.
+    """
+    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand(), _cand2()])
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": False, "result": f"{_CARD_REF}\n\n{_CARD_HOLD}"},
+    )
+    fa = FakeAdapter(secrets=[])
+    assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True  # 되돌리지 않는다
+    assert len(fa.sent) == 1 and fa.sent[0][2] is None  # 0건 안내 1통 · 버튼 없음
+    assert fa.cards[0]["title"] == "🧩 오늘 적용할 것 없음" and "fields" not in fa.cards[0]
+    # 채널엔 안 띄우고 **숫자로만** 보고한다(판정이 쓴 계약 줄 + 브리지가 센 참조·보류 수).
+    assert fa.cards[0]["footer"] == "검토 7건 · 기각 5건 · 참조·보류 2건"
+    assert bridge.digest_pending == {}  # 누를 대상이 없으니 📌 보류맵도 안 만든다
+
+
+def test_digest_reference_gets_cooldown_but_no_reject_log(pipeline, monkeypatch):
+    """참조·보류도 30일 쿨다운 대상(정상 판정이 끝난 건) — 단 `기각` 이력 파일엔 섞지 않는다.
+
+    `opensource_rejected.jsonl` 은 프롬프트에 "최근 기각 이력"으로 재주입된다. 참조를 거기
+    적으면 판정 claude 가 "참조 = 기각당한 것"으로 학습해 판정이 왜곡된다.
+    ⚠️ 이건 **역매칭 성공** 경로만 덮는다(제목이 후보 full name 그대로). 판정이 이름을 줄여
+    쓰는 라이브 경로는 아래 `…_survives_short_name` 두 건이 따로 잠근다 — 그걸 이 테스트가
+    덮는다고 착각해 2026-08-02 결함이 초록불 아래로 지나갔다.
+    """
+    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand(), _cand2()])
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": False, "result": f"{_CARD_REF}\n\n{_CARD_HOLD}"},
+    )
+    assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
+    seen = bridge.load_seen(pipeline / "seen.json")
+    assert seen["owner/repo"] == "2026-07-15" and seen["o/s"] == "2026-07-15"
+    assert not (pipeline / "rejected.jsonl").exists()  # 참조 ≠ 기각
+
+
+def test_digest_reference_cooldown_survives_short_name(pipeline, monkeypatch):
+    """**쿨다운은 역매칭에 의존하지 않는다** — 판정이 이름을 bare `repo` 로 줄여 써도 매장된다.
+
+    라이브 결함(2026-08-02 06:16 발송): 참조·보류 3건이 통째로 seen 에 안 들어가 다음 날 그대로
+    재등장할 상태였다. 역매칭(`후보 name 이 카드 제목의 부분문자열인가`)이 빗나가면 `""` 가
+    담기고 mark_seen 이 그걸 버렸다. 판정은 `owner/repo` 를 bare `repo` 로 줄여 쓰는 일이 잦다
+    (`🚫기각:` 줄이 늘 그렇고, 그날 seen 에 쌓인 13건 중 10건이 bare 였다).
+    ⚠️ 제목에 후보 full name 을 쓰면 **항상 매칭돼 수정 전 코드에서도 통과한다** — 이 테스트가
+    가짜가 되지 않으려면 제목이 bare 여야 한다.
+    """
+    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand()])
+    bare = "🧩 MCP축 · repo (⭐900) — 참조\n내용 : a\n검토 8건 · 기각 5건"
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": bare})
+    assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
+    seen = bridge.load_seen(pipeline / "seen.json")
+    assert seen == {"repo": "2026-07-15"}  # 정규 레포명이 아니어도 판정이 쓴 이름으로 묻는다
+    # 매장이 **실제로 먹히는지**까지 — filter_digest 는 name·key 둘 다 seen 으로 본다.
+    assert bridge.filter_digest([_cand()], bridge.active_seen(seen, date(2026, 7, 16)), set()) == []
+    assert not (pipeline / "rejected.jsonl").exists()  # 참조 ≠ 기각
+
+
+def test_digest_card_cooldown_survives_short_name(pipeline, monkeypatch):
+    """카드로 나간 항목도 같다 — 역매칭 실패면 📌 버튼만 빠지고 **쿨다운은 그대로 걸린다**.
+
+    참조·보류와 같은 `bury()` 를 쓰는 형제 결함이라 함께 잠근다(종전엔 카드도 매장 누락).
+    """
+    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand()])
+    bare = "🧩 MCP축 · repo (⭐900) — 차용\n내용 : a"
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": bare})
+    fa = FakeAdapter(secrets=[])
+    assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    assert fa.sent[0][2] is None and bridge.digest_pending == {}  # L-4: 버튼·백로그는 그대로 제외
+    assert bridge.load_seen(pipeline / "seen.json") == {"repo": "2026-07-15"}
+
+
+@pytest.mark.usefixtures("pipeline")
+def test_digest_judge_none_line_is_not_duplicated(monkeypatch):
+    """판정이 0건 안내를 **직접 냈으면** 브리지가 덧붙이지 않는다 — 참조 카드가 함께 와도 1통.
+
+    집계(`footer`)만 보고 합성하면 여기서 안내가 2통 나간다(리뷰 안의 구멍). `_DIGEST_NONE_MARK`
+    검사가 그걸 막는다 — 두 조건은 각각 다른 오보를 막으므로 **하나도 뺄 수 없다**.
+    """
+    ref = f"{_CARD_REF}\n검토 4건 · 기각 2건"  # 집계 있음(= 합성 조건의 footer 항은 통과)
+    line = f"🧩 MCP축 — {bridge._DIGEST_NONE_MARK} (검토 4 · 기각 2)"
+    monkeypatch.setattr(
+        bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": f"{ref}\n\n{line}"}
+    )
+    fa = FakeAdapter(secrets=[])
+    assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    assert len(fa.sent) == 1 and fa.sent[0][1] == line  # 판정이 낸 안내 그대로 1통
+    assert fa.cards[0]["title"] == f"🧩 {bridge._DIGEST_NONE_MARK}"
+
+
+@pytest.mark.parametrize(
+    ("why", "title"),
+    [
+        ("전각 괄호", "repo （⭐900）"),  # noqa: RUF001 — 전각이 표본의 요점이라 리터럴로 둔다
+        ("앞공백 없음", "repo(⭐900)"),
+        ("괄호 없음", "repo"),
+    ],
+)
+def test_digest_cooldown_strips_any_metric_paren(pipeline, monkeypatch, why, title):
+    """지표 괄호 표기가 무엇이든 이름만 남겨 매장한다 — 하나라도 새면 쿨다운이 다시 사문화된다.
+
+    `partition(" (")` 는 **반각+앞공백**에서만 맞았다. 판정은 전각 문장부호를 쓴 전례가 있고
+    (`_DIGEST_LABEL_SEP_RE`), 08-02 라이브가 "프롬프트 표기를 그대로 베끼지 않는다"를 증명했다.
+    """
+    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand()])
+    card = f"🧩 MCP축 · {title} — 참조\n내용 : a"
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": card})
+    assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
+    seen = bridge.load_seen(pipeline / "seen.json")
+    assert seen == {"repo": "2026-07-15"}, why
+    # 저장만 되고 안 먹히면 의미가 없다 — 다음 날 실제로 차단되는지까지.
+    assert bridge.filter_digest([_cand()], bridge.active_seen(seen, date(2026, 7, 16)), set()) == []
+
+
+def test_digest_bury_keeps_inner_parens(pipeline, monkeypatch):
+    """꼬리 괄호 **하나만** 뗀다 — 이름 안의 괄호까지 자르면 엉뚱한 키가 매장된다(HN 제목 형태).
+
+    ⚠️ 후보 이름을 제목과 맞추면 역매칭이 성공해 **매장 이름 계산을 아예 안 탄다** — 이 테스트가
+    가짜가 되지 않으려면 후보(`o/foo`)와 제목이 어긋나야 한다.
+    """
+    monkeypatch.setattr(
+        bridge, "collect_github", lambda *_a, **_k: [_cand(name="o/foo", key="foo")]
+    )
+    card = "🧩 MCP축 · Show HN: Foo (a tool) (HN 90p) — 참조\n내용 : a"
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": card})
+    assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
+    assert bridge.load_seen(pipeline / "seen.json") == {"Show HN: Foo (a tool)": "2026-07-15"}
+
+
+def test_digest_reject_state_waits_for_a_successful_post(pipeline, monkeypatch):
+    """되돌림 4번째 경로 — **게시 전량 실패**도 되돌림이니 기각 기록·매장이 앞서면 안 된다.
+
+    앞서면 재시도 3회 동안 같은 건이 rejected.jsonl 에 중복 쌓이고 후보 풀이 조기 매장된다
+    (2026-08-01 점검이 잡은 결함의 남은 반쪽 — 그때는 게시 실패 경로가 안 잡혔다).
+    """
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": False, "result": f"{_CARD1}\n🚫기각: o/x|중복"},
+    )
+
+    class _DeadAdapter(FakeAdapter):
+        def send(self, *_a, **_kw):
+            raise RuntimeError("channel gone")
+
+    assert bridge.run_opensource_digest(_DeadAdapter(secrets=[]), 555, "2026-07-15") is False
+    assert not (pipeline / "rejected.jsonl").exists()
+    assert not (pipeline / "seen.json").exists()
+
+
+def test_digest_filtered_cooldown_waits_for_a_successful_post(pipeline, monkeypatch):
+    """참조·보류 매장도 `posted` 를 요구한다 — 계약 5절의 유일한 집행부라 따로 잠근다.
+
+    `if posted and filtered:` 를 `if filtered:` 로 바꿔도 전건 통과하던 구멍(qa 변이 실측).
+    기존 `…_total_post_failure_is_failure` 는 `_CARD1`(차용)만 써서 `filtered` 가 비어
+    **이 분기를 한 번도 타지 않는다** — 참조-only 판정이라야 탄다.
+    """
+    monkeypatch.setattr(
+        bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": _CARD_REF}
+    )
+
+    class _DeadAdapter(FakeAdapter):
+        def send(self, *_a, **_kw):
+            raise RuntimeError("channel gone")
+
+    assert bridge.run_opensource_digest(_DeadAdapter(secrets=[]), 555, "2026-07-15") is False
+    assert not (pipeline / "seen.json").exists()  # 게시가 0통이면 아무것도 묻지 않는다
+
+
+@pytest.mark.usefixtures("pipeline")
+def test_digest_mixed_verdicts_cards_only_actionable(monkeypatch):
+    """섞여 오면 즉시적용·차용 2건만 카드가 되고, 참조는 필드·버튼에서 빠져 집계로만 남는다."""
+    monkeypatch.setattr(
+        bridge, "collect_github", lambda *_a, **_k: [_cand(), _cand2(), _cand(name="o/t", key="t")]
+    )
+    result = "\n\n".join(
+        [
+            "🧩 MCP축 · owner/repo (⭐900) — 즉시적용\n내용 : a",
+            "🧩 훅축 · o/s (HN 90p) — 참조\n내용 : b",
+            "🧩 MCP축 · o/t (⭐900) — 차용\n내용 : c\n검토 9건 · 기각 6건",
+        ]
+    )
+    monkeypatch.setattr(
+        bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": result}
+    )
+    fa = FakeAdapter(secrets=[])
+    assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    assert len(fa.sent) == 1 and fa.cards[0]["title"] == "🧩 오늘의 신흥 2건"
+    assert [n for n, _v, _i in fa.cards[0]["fields"]] == [
+        "1. owner/repo (⭐900) — 즉시적용",
+        "2. o/t (⭐900) — 차용",
+    ]
+    assert [b.label for b in fa.sent[0][2]] == ["📌1", "📌2"]  # 버튼 번호 = 필드 번호
+    assert fa.cards[0]["footer"] == "검토 9건 · 기각 6건 · 참조·보류 1건"
+
+
+@pytest.mark.usefixtures("pipeline")
+def test_digest_reference_only_still_keeps_plain_fallback(monkeypatch):
+    """참조를 걸러내는 것과 **형식 이탈 평문 폴백**은 다른 갈래다 — 이탈분은 그대로 평문 1통.
+
+    회귀 대상 ①: 참조를 `digest_card` 단계에서 None 으로 만들면(=미등록 낱말 취급) 참조 카드
+    전문이 채널에 평문으로 쏟아진다. 걸러내기는 게시 단계에서만 한다.
+    회귀 대상 ②(2026-08-02 점검): **집계 줄이 통째로 유실되던 경로.** 카드가 0장인데 형식 이탈
+    평문이 있으면 0건 안내를 건너뛰어, `참조·보류 N건` 을 실을 곳이 채널에 하나도 없었다 —
+    "나머지는 숫자로만 보고한다"는 목적 자체가 무효가 된다. **표본에 집계 줄이 있어야** 보인다.
+    """
+    off = "🧩 MCP축 owner/repo 차용\n적용 : 훅에 · 30분"
+    ref = f"{_CARD_REF}\n검토 9건 · 기각 8건"  # 집계 줄이 붙은 참조 카드(없으면 유실을 못 본다)
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": False, "result": f"{ref}\n\n{off}"},
+    )
+    fa = FakeAdapter(secrets=[])
+    assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    assert len(fa.sent) == 2  # 이탈 평문 1통 + 집계를 실은 0건 안내 1통
+    assert fa.cards[0] is None and fa.sent[0][1] == off  # 참조 전문은 채널에 안 나온다
+    assert fa.cards[1]["footer"] == "검토 9건 · 기각 8건 · 참조·보류 1건"
+
+
+def test_digest_reference_word_is_still_a_known_verdict():
+    """참조·보류는 `DIGEST_COLORS` 에 남아 있어야 한다 — 지우면 카드가 아니라 **평문**이 된다."""
+    assert {"참조", "보류"} <= set(bridge.DIGEST_COLORS)
+    assert bridge.digest_card(_CARD_REF) is not None  # 파싱은 정상(폴백 신호가 아니다)
+    assert bridge.digest_card(_CARD_REF)["verdict"] == "참조"
+
+
 @pytest.mark.usefixtures("pipeline")
 def test_digest_none_mark_card_gets_no_buttons(monkeypatch):
     # claude 가 "오늘 적용할 것 없음" 한 줄을 낼 때도 버튼·보류맵 등재는 없다(누를 대상이 없다).
@@ -6481,6 +6721,7 @@ def test_digest_parse_failure_still_posts_the_day(off, monkeypatch):
     monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": off})
     fa = FakeAdapter(secrets=[])
     assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    # 세 표본 모두 계약 집계 줄이 없다 → 0건 안내를 덧붙이지 않는다(메시지 1통).
     assert fa.cards == [None]  # 카드 없음 → 어댑터가 평문 경로로
     assert fa.sent[0][1] == off  # 판정 원문 그대로(잘리거나 요약되지 않는다)
 
@@ -6701,6 +6942,17 @@ def test_dry_run_renders_plain_fallback_and_none_line(dry, monkeypatch):
     assert f"[카드]     🧩 {bridge._DIGEST_NONE_MARK}" in out.read_text(encoding="utf-8")
 
 
+def test_dry_run_filters_reference_like_live(dry, monkeypatch):
+    """드라이런도 참조·보류를 라이브와 **같은 갈래**로 뺀다 — 안 그러면 드라이런이 거짓말을 한다."""
+    ref = "🧩 MCP축 · owner/repo (⭐900) — 참조\n내용 : a\n검토 4건 · 기각 3건"
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": ref})
+    out = dry / "dryrun.txt"
+    assert bridge.digest_dry_run(out=out) == 0  # 형식 이탈이 아니므로 종료코드 0
+    text = out.read_text(encoding="utf-8")
+    assert _dry_line(text, "[카드]") == f"[카드]     🧩 {bridge._DIGEST_NONE_MARK}"
+    assert "검토 4건 · 기각 3건 · 참조·보류 1건" in text
+
+
 @pytest.mark.parametrize(
     ("why", "patch", "expect"),
     [
@@ -6713,7 +6965,8 @@ def test_dry_run_renders_plain_fallback_and_none_line(dry, monkeypatch):
         (
             "형식 이탈",
             ("run_claude", lambda *_a, **_k: {"is_error": False, "result": "인사만 하고 끝"}),
-            "(카드 0건 — 형식 이탈.",
+            # "카드 0건"이 아니라 "판정 원문에 카드 줄 없음" — 전부 참조·보류인 정상 0건과 구분한다.
+            "(판정 원문에 카드 줄 없음 — 형식 이탈:",
         ),
     ],
 )

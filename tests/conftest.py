@@ -28,3 +28,15 @@ def _isolate_state_files(monkeypatch, tmp_path_factory):
     state = tmp_path_factory.mktemp("digest_state")
     for attr in _STATE_ATTRS:
         monkeypatch.setattr(bridge, attr, state / getattr(bridge, attr).name)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_review(monkeypatch):
+    """2차 자동 검토를 **기본 통과(passthrough)** 로 만든다 — `_isolate_state_files` 와 같은 사상.
+
+    2026-08-02 부터 `_post_digest_cards` 가 카드 후보마다 검토 claude 를 부른다. 그 패치를
+    빠뜨린 테스트는 **진짜 claude 프로세스를 띄운다**(느리고 비결정적이며 과금된다).
+    검토 자체를 보는 테스트는 `bridge.review_digest_items` 를 원본으로 되돌린 뒤
+    `bridge.review_repo` 만 가짜로 갈아끼운다(test_bridge.py `_REAL_REVIEW_ITEMS`).
+    """
+    monkeypatch.setattr(bridge, "review_digest_items", lambda items: (items, []))

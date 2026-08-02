@@ -674,12 +674,12 @@ def test_build_card_embed_masks_secrets_and_drops_empty_fields():
 def test_send_with_card_renders_single_embed_with_buttons():
     a = _adapter()
     calls = _stub_calls(a, [777])
-    mid = a.send(100, "🧩 평문 폴백", [Button("📌 백로그", "od:add", "3")], card=_CARD_SPEC)
+    mid = a.send(100, "🧩 평문 폴백", [Button("🔍 검토", "od:rev", "3")], card=_CARD_SPEC)
     assert mid == 777
     assert len(calls) == 1  # 카드는 항상 단일 메시지(청킹 없음)
     payload, view = calls[0][2], calls[0][3]
     assert isinstance(payload, discord.Embed) and payload.title == _CARD_SPEC["title"]
-    assert [c.custom_id for c in view.children] == ["od:add:3"]
+    assert [c.custom_id for c in view.children] == ["od:rev:3"]
 
 
 def test_edit_with_card_replaces_embed_and_drops_buttons():

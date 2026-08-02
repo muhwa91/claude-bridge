@@ -2140,9 +2140,9 @@ def _post_digest_cards(
     **형식 이탈 카드·0건 안내는 종전대로 각자 평문/2층 카드 1장**으로 따로 나간다 — 접을 수 없는
     것을 억지로 접으면 그날치 정보가 사라진다(정보 손실 0 원칙).
 
-    **버튼(📌)·백로그·URL 은 후보 역매칭 성공분만.** 제목이 어떤 후보와도 안 맞으면 seq 를 주지
-    않는다 — 그런 항목에 📌 를 달면 축·판정이 섞인 문자열이 백로그에 들어가는데 그 값은 어떤
-    후보와도 매칭되지 않아 아무것도 거르지 못한다(조용한 무효 클릭 + 파일 오염, L-4).
+    **버튼(📌)·백로그·URL 은 후보 역매칭(2단계 — 계약 5-0절) 성공분만.** 어느 후보와도 안 맞거나
+    **모호하면** seq 를 주지 않는다 — 엉뚱한 값이 백로그에 들어가면 아무것도 거르지 못하고,
+    잘못된 링크를 다느니 버튼이 없는 편이 낫다(조용한 무효 클릭 + 파일 오염, L-4).
     **단 30일 쿨다운(seen)은 역매칭에 의존하지 않는다**(아래 `bury`).
     L-5: 중간 send 예외는 로그만 남기고 다음 메시지로 간다. 실패로 되돌리면 다음 틱이 처음부터
     재실행해 이미 나간 것이 **중복 게시**되기 때문 — 호출측은 1장이라도 나갔으면 성공으로 본다.
@@ -2157,13 +2157,26 @@ def _post_digest_cards(
     )
 
     def bury(title: str) -> tuple[dict[str, Any] | None, str]:
-        """제목 → (역매칭 후보, 쿨다운에 매장할 이름).
+        """제목 → (역매칭 후보, 쿨다운에 매장할 이름). 역매칭은 2단계(계약 5절).
 
         ⚠️ **매장 이름을 역매칭 성공에 의존시키지 마라** — 실패 시 빈 이름을 묻으면 쿨다운이
-        통째로 사문화된다(계약 5절).
+        통째로 사문화된다.
+        ⚠️ **② 를 부분문자열로 열지 마라** — `tool` 이 `tool-plus` 를 잡아 **엉뚱한 후보의 URL 이
+        카드에 실리고 백로그에 등재된다**(버튼이 없는 것보다 나쁘다). 동등 비교만.
+        ⚠️ **① 은 케이스를 접지 마라** — 부분문자열이라 접으면 매칭 범위가 넓어져 오탐이 생긴다.
         """
+        bare = _DIGEST_METRIC_RE.sub("", title).strip()
+        # ① full name 부분문자열이 더 확실한 신호라 먼저(긴 이름 우선 = L-3).
         cand = next((c for c in by_len if str(c.get("name", "")) in title), None)
-        return cand, str(cand["name"]) if cand else _DIGEST_METRIC_RE.sub("", title).strip()
+        if cand is None:  # ② 폴백 — 판정이 쓰는 표기는 bare 가 기본이고 케이스도 제각각이다.
+            low = bare.lower()  # key 는 늘 소문자 · full name 은 원본 표기라 양쪽 다 접어서 본다
+            hit = [
+                c
+                for c in by_len
+                if str(c.get("key", "")) == low or str(c.get("name", "")).lower() == low
+            ]
+            cand = hit[0] if len(hit) == 1 else None  # 동명 2개는 어느 쪽인지 모른다 → 안 단다(L-4)
+        return cand, str(cand["name"]) if cand else bare
 
     items, plains, footer, filtered_titles = split_digest_items(cards)
     for item in items:

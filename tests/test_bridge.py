@@ -6036,33 +6036,35 @@ def test_digest_reference_gets_cooldown_but_no_reject_log(pipeline, monkeypatch)
     assert not (pipeline / "rejected.jsonl").exists()  # 참조 ≠ 기각
 
 
-def test_digest_reference_cooldown_survives_short_name(pipeline, monkeypatch):
-    """**쿨다운은 역매칭에 의존하지 않는다** — 판정이 이름을 bare `repo` 로 줄여 써도 매장된다.
+def test_digest_reference_cooldown_survives_match_failure(pipeline, monkeypatch):
+    """**쿨다운은 역매칭에 의존하지 않는다** — 2단계 매칭이 다 빗나가도 제목의 이름으로 묻는다.
 
     라이브 결함(2026-08-02 06:16 발송): 참조·보류 3건이 통째로 seen 에 안 들어가 다음 날 그대로
-    재등장할 상태였다. 역매칭(`후보 name 이 카드 제목의 부분문자열인가`)이 빗나가면 `""` 가
-    담기고 mark_seen 이 그걸 버렸다. 판정은 `owner/repo` 를 bare `repo` 로 줄여 쓰는 일이 잦다
-    (`🚫기각:` 줄이 늘 그렇고, 그날 seen 에 쌓인 13건 중 10건이 bare 였다).
-    ⚠️ 제목에 후보 full name 을 쓰면 **항상 매칭돼 수정 전 코드에서도 통과한다** — 이 테스트가
-    가짜가 되지 않으려면 제목이 bare 여야 한다.
+    재등장할 상태였다. 역매칭이 빗나가면 `""` 가 담기고 mark_seen 이 그걸 버렸다.
+    ⚠️ 제목이 후보와 **조금이라도 맞으면**(full 부분문자열이든 bare 정확일치든) 매칭이 성공해
+    이 분기를 안 탄다 — 후보(`o/other`)와 제목(`repo`)을 **일부러 어긋나게** 둔다.
     """
-    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand()])
+    monkeypatch.setattr(
+        bridge, "collect_github", lambda *_a, **_k: [_cand(name="o/other", key="other")]
+    )
     bare = "🧩 MCP축 · repo (⭐900) — 참조\n내용 : a\n검토 8건 · 기각 5건"
     monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": bare})
     assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
     seen = bridge.load_seen(pipeline / "seen.json")
-    assert seen == {"repo": "2026-07-15"}  # 정규 레포명이 아니어도 판정이 쓴 이름으로 묻는다
+    assert seen == {"repo": "2026-07-15"}  # 정규 레포명을 못 찾아도 판정이 쓴 이름으로 묻는다
     # 매장이 **실제로 먹히는지**까지 — filter_digest 는 name·key 둘 다 seen 으로 본다.
     assert bridge.filter_digest([_cand()], bridge.active_seen(seen, date(2026, 7, 16)), set()) == []
     assert not (pipeline / "rejected.jsonl").exists()  # 참조 ≠ 기각
 
 
-def test_digest_card_cooldown_survives_short_name(pipeline, monkeypatch):
+def test_digest_card_cooldown_survives_match_failure(pipeline, monkeypatch):
     """카드로 나간 항목도 같다 — 역매칭 실패면 📌 버튼만 빠지고 **쿨다운은 그대로 걸린다**.
 
     참조·보류와 같은 `bury()` 를 쓰는 형제 결함이라 함께 잠근다(종전엔 카드도 매장 누락).
     """
-    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand()])
+    monkeypatch.setattr(
+        bridge, "collect_github", lambda *_a, **_k: [_cand(name="o/other", key="other")]
+    )
     bare = "🧩 MCP축 · repo (⭐900) — 차용\n내용 : a"
     monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": bare})
     fa = FakeAdapter(secrets=[])
@@ -6102,8 +6104,12 @@ def test_digest_cooldown_strips_any_metric_paren(pipeline, monkeypatch, why, tit
 
     `partition(" (")` 는 **반각+앞공백**에서만 맞았다. 판정은 전각 문장부호를 쓴 전례가 있고
     (`_DIGEST_LABEL_SEP_RE`), 08-02 라이브가 "프롬프트 표기를 그대로 베끼지 않는다"를 증명했다.
+    후보를 `o/other` 로 어긋내 **역매칭이 성공해버리는 것을 막는다** — 매칭되면 매장 이름이
+    후보 정규명이 되어 정규식이 깨져도 통과한다(추출값이 그대로 묻히는 경로라야 보인다).
     """
-    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: [_cand()])
+    monkeypatch.setattr(
+        bridge, "collect_github", lambda *_a, **_k: [_cand(name="o/other", key="other")]
+    )
     card = f"🧩 MCP축 · {title} — 참조\n내용 : a"
     monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": card})
     assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is True
@@ -6111,6 +6117,86 @@ def test_digest_cooldown_strips_any_metric_paren(pipeline, monkeypatch, why, tit
     assert seen == {"repo": "2026-07-15"}, why
     # 저장만 되고 안 먹히면 의미가 없다 — 다음 날 실제로 차단되는지까지.
     assert bridge.filter_digest([_cand()], bridge.active_seen(seen, date(2026, 7, 16)), set()) == []
+
+
+def _post_bare(monkeypatch, cands, title="repo", verdict="차용"):
+    """bare 제목 카드 1장을 라이브 경로로 게시하고 어댑터를 돌려준다(역매칭 2단계 표본 공용)."""
+    monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: cands)
+    card = f"🧩 MCP축 · {title} (⭐900) — {verdict}\n내용 : a\n적용 : 훅에 · 30분"
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": card})
+    fa = FakeAdapter(secrets=[])
+    assert bridge.run_opensource_digest(fa, 555, "2026-07-15") is True
+    return fa
+
+
+def test_digest_bare_title_matches_single_candidate(pipeline, monkeypatch):
+    """① bare 제목도 후보를 찾는다 — 📌 버튼·seq·URL·보류맵이 붙는다.
+
+    판정은 bare 로 쓰는 게 기본 습성이라(08-02 seen 13건 중 10건) full name 부분문자열만 보면
+    카드가 뜨는 날 **버튼이 조용히 빠진다** — 카드는 멀쩡해 보여 이상 신호도 안 온다.
+    """
+    fa = _post_bare(monkeypatch, [_cand()])  # name=owner/repo · key=repo, 제목은 bare `repo`
+    assert [b.label for b in fa.sent[0][2]] == ["📌1"]
+    entry = next(iter(bridge.digest_pending.values()))
+    assert entry["name"] == "owner/repo"  # 백로그·seen 은 **정규 레포명**으로
+    assert entry["url"] == "https://github.com/owner/repo" and entry["apply"] == "훅에 · 30분"
+    assert bridge.load_seen(pipeline / "seen.json") == {"owner/repo": "2026-07-15"}
+
+
+def test_digest_bare_title_folds_case(pipeline, monkeypatch):
+    """③ 케이스를 접는다 — 판정은 원본 표기(`MyTool`), 후보 `key` 는 늘 소문자(`mytool`)."""
+    fa = _post_bare(monkeypatch, [_cand(name="o/MyTool", key="mytool")], title="MyTool")
+    assert [b.label for b in fa.sent[0][2]] == ["📌1"]
+    assert bridge.load_seen(pipeline / "seen.json") == {"o/MyTool": "2026-07-15"}
+
+
+def test_digest_full_name_title_folds_case(pipeline, monkeypatch):
+    """③-2 full name 을 **다른 케이스로** 써도 찾는다 — ② 의 두 번째 항(`name` 접기).
+
+    ① 은 대소문자 구분 부분문자열이라 `Owner/Repo` 를 못 잡는다. ② 의 `key` 항도 못 잡는다
+    (`owner/repo` ≠ `repo`) — 두 항 사이에 난 구멍이라 `name` 접기가 유일한 통로다.
+    ⚠️ 제목을 bare 로 쓰면 `key` 항에 가려 이 항이 없어도 통과한다(가짜 초록불).
+    """
+    fa = _post_bare(monkeypatch, [_cand()], title="Owner/Repo")  # 후보는 owner/repo · key=repo
+    assert [b.label for b in fa.sent[0][2]] == ["📌1"]
+    entry = next(iter(bridge.digest_pending.values()))
+    assert entry["name"] == "owner/repo"  # seen·백로그는 후보의 정규명(제목 표기가 아니다)
+    assert entry["url"] == "https://github.com/owner/repo"
+    assert bridge.load_seen(pipeline / "seen.json") == {"owner/repo": "2026-07-15"}
+
+
+def test_digest_full_name_match_stays_case_sensitive(pipeline, monkeypatch):
+    """①(부분문자열)은 **케이스를 접지 않는다** — 접으면 매칭 범위가 넓어져 엉뚱한 후보를 잡는다.
+
+    후보 `o/Tool` 하나뿐인데 제목은 `o/tool-plus`(전혀 다른 레포). ① 을 접으면 `o/tool` 이
+    `o/tool-plus` 의 부분문자열이 되어 **남의 URL 이 카드에 실리고 그 후보가 백로그에 등재된다**.
+    ② 는 정확 일치라 여기 안 걸린다(`o/tool-plus` ≠ `o/tool` ≠ `tool`).
+    종전엔 이 불변식이 문서·docstring 의 ⚠️ 로만 지켜져, ① 에 `.lower()` 를 넣어도 전건 통과했다.
+    """
+    fa = _post_bare(monkeypatch, [_cand(name="o/Tool", key="tool")], title="o/tool-plus")
+    assert fa.sent[0][2] is None and bridge.digest_pending == {}
+    assert bridge.load_seen(pipeline / "seen.json") == {"o/tool-plus": "2026-07-15"}
+
+
+def test_digest_bare_title_ambiguous_gets_no_button(pipeline, monkeypatch):
+    """② 동명 후보가 둘이면 **어느 쪽인지 모른다** → 버튼을 달지 않는다(L-4: 잘못된 링크 > 무버튼).
+
+    쿨다운은 bare 로 그대로 걸리므로 손해가 없다.
+    """
+    two = [_cand(name="a/tool", key="tool"), _cand(name="b/tool", key="tool")]
+    fa = _post_bare(monkeypatch, two, title="tool")
+    assert fa.sent[0][2] is None and bridge.digest_pending == {}
+    assert bridge.load_seen(pipeline / "seen.json") == {"tool": "2026-07-15"}
+
+
+def test_digest_bare_title_needs_exact_key(pipeline, monkeypatch):
+    """④ bare 는 **정확 일치만** — 부분 일치로 열면 `tool` 이 `tool-plus` 의 URL 을 달고 나간다.
+
+    그건 버튼이 없는 것보다 나쁘다(엉뚱한 후보가 백로그에 등재된다).
+    """
+    fa = _post_bare(monkeypatch, [_cand(name="o/tool-plus", key="tool-plus")], title="tool")
+    assert fa.sent[0][2] is None and bridge.digest_pending == {}
+    assert bridge.load_seen(pipeline / "seen.json") == {"tool": "2026-07-15"}
 
 
 def test_digest_bury_keeps_inner_parens(pipeline, monkeypatch):

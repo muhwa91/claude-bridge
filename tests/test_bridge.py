@@ -2463,6 +2463,54 @@ def test_dispatch_disabled_session_item_no_digest(digest_env, monkeypatch):
     assert started == [] and digest_env.sent == [] and bridge.notify_fired == set()
 
 
+# ── pending-checks: 미처리 검증 건 리마인더(세션 1회, 시각 항목 요약) ──────────
+# 시각 항목은 `[at, at+grace_min]` 창에 브리지가 떠 있어야 카드가 뜬다 — 그 창에 PC 가 꺼져
+# 있으면 알람이 조용히 지나가 다음 주로 밀린다(`ti-mon-nightfut` 이 8/3 을 그렇게 놓쳤다).
+_PENDING = {"id": bridge.PENDING_CHECKS_NOTIFY_ID, "on": "session", "label": "미처리 검증 건"}
+
+
+def test_pending_checks_summary_lists_time_items():
+    got = bridge.pending_checks_summary([_item(id="a", label="장전 기준가"), _PENDING])
+    assert "`a`" in got and "장전 기준가" in got
+    assert "수" in got and "09:00~09:30" in got  # 요일 + at~at+grace_min
+
+
+def test_pending_checks_summary_excludes_self_and_session_items():
+    items = [_PENDING, _SESSION_ITEM, {"id": "us-digest", "on": "session", "label": "L"}]
+    # 검증 건이 아닌 것(자기 자신·다이제스트)만 남으면 0건 = 빈 문자열이어야 한다.
+    assert bridge.pending_checks_summary(items) == ""
+    got = bridge.pending_checks_summary([*items, _item(id="a")])
+    assert "`a`" in got
+    for excluded in (bridge.PENDING_CHECKS_NOTIFY_ID, "os-digest", "us-digest"):
+        assert excluded not in got
+
+
+def test_pending_checks_summary_broken_at_still_listed():
+    # 시각이 깨진 항목은 발화하지 않지만 **미처리인 것은 사실**이라 목록에는 남는다.
+    assert "시각 미정" in bridge.pending_checks_summary([_item(id="a", at="oops")])
+    assert "매일" in bridge.pending_checks_summary([_item(id="a", days=None)])
+
+
+def test_dispatch_pending_checks_sends_summary_without_buttons(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0931)  # 시각 창 밖 — 세션 항목만 due
+    monkeypatch.setattr(bridge, "read_session_ping", lambda _p: "2026-07-15")
+    bridge.dispatch_notifications(notify_env, [_PENDING, _item(id="a", label="장전 기준가")])
+    assert [c for c, _t, _b in notify_env.sent] == [999]  # #알림 채널 1회
+    _c, text, buttons = notify_env.sent[0]
+    assert "미처리 검증 건" in text and "`a`" in text and "장전 기준가" in text
+    assert buttons is None  # 판정 대상이 아니다 — 누를 게 없는 버튼을 달지 않는다
+
+
+def test_dispatch_pending_checks_silent_when_no_time_items(notify_env, monkeypatch):
+    # 0건이면 발송하지 않는다(다 졸업했는데 빈 카드가 매일 뜨면 그게 소음).
+    _freeze_now(monkeypatch, _WED_0931)
+    monkeypatch.setattr(bridge, "read_session_ping", lambda _p: "2026-07-15")
+    bridge.dispatch_notifications(notify_env, [_PENDING])
+    assert notify_env.sent == []
+    # fired 도 안 찍는다 — 그날 늦게 항목이 추가되면 다음 틱에 다시 잡히게.
+    assert bridge.notify_fired == set()
+
+
 # ---------------------------------------------------------------------------
 # ①(채널 자동생성) — 특수 채널 라우팅 + DM 폐기(재시작완료→#봇-상태)
 # ---------------------------------------------------------------------------
@@ -5958,13 +6006,22 @@ _needs_real_schedules = pytest.mark.skipif(
 # `ti-weekend-nq-off`(토 06:00/grace 30)도 2026-08-01 졸업 — 라이브 관측 통과(05:56 '거래중'+NQ
 # 인라인 있음 → 06:04 '장마감'+인라인 소멸) + trading-info 회귀 케이스('EDT 토 06:00 KST =
 # 금 17:00 ET → 장마감')가 대신 지킨다. 2→1.
-# 남은 1건은 `enabled: false`(일시 정지)지만 베이스라인은 그대로 잰다 — load_schedules 는 거르지
-# 않고(순수 로더) 정지 필터는 dispatch_notifications 몫이라, 꺼져 있어도 요일·시각 계약은 산다.
+# `ti-mon-nightfut`(월 00:00/grace 30)은 2026-08-08 졸업 — 8/1 `enabled: false` 로 껐다가 8/3
+# 월요일을 그냥 놓쳤고(창에 PC 가 꺼져 있었다), 라이브 자정 관측 대신 trading-info 백엔드 회귀
+# 케이스('월 00:30 = 일 밤(비거래일) → 장마감', StockControllerNightFuturesTest)가 대신 지키게
+# 됐다. 1→2 로 **늘어난** 것은 그 사이 검증 항목 2건이 새로 들어왔기 때문이다.
+# `etf-mon-0830` 의 창은 같은 날 13:00/420 → **09:30/840**(→23:30) 으로 넓혔다 — 판정이 지나간
+# 실행 기록 조회라 시간대를 안 타는데, 창이 좁으면 그 시각에 브리지가 안 떠 있을 때 조용히 지나가
+# 다음 주로 밀린다(위 ti-mon-nightfut 이 실제로 그렇게 됐다). 값은 배포본 실물과 대조해 적는다.
 _REAL_BASELINE = {
-    "ti-mon-nightfut": (["mon"], "00:00", 30),
+    "ti-premarket-baseline": (["wed"], "08:50", 10),
+    "etf-mon-0830": (["mon"], "09:30", 840),
 }
 # 핑 값이 무엇이든 시각 알림 판정은 불변이어야 한다(없음·오늘·과거·미래·깨진 문자열).
 _PINGS = (None, "2026-07-15", "2026-07-14", "2026-07-16", "oops", "")
+# 세션 항목(다이제스트 2건 + pending-checks) — 시각 판정 테스트에서 걸러낸다. DIGEST_RUNNERS 로
+# 거르던 것을 `on` 기준으로 넓혔다(러너를 안 타는 세션 항목이 생기면 그 목록으로는 못 거른다).
+_REAL_SESSION_IDS = {it["id"] for it in _REAL_ITEMS if it.get("on") == "session"}
 
 
 @_needs_real_schedules
@@ -5993,16 +6050,22 @@ def test_real_schedules_baseline_fields_unchanged():
         # 빠졌다. 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
         (datetime(2026, 7, 18, 6, 15, tzinfo=_KST), []),
         (datetime(2026, 7, 20, 6, 15, tzinfo=_KST), []),  # 월요일 06:00 대에도 없다
-        # ti-mon-nightfut: 월 00:00 [00:00, 00:30]
-        (datetime(2026, 7, 20, 0, 10, tzinfo=_KST), ["ti-mon-nightfut"]),
-        (datetime(2026, 7, 20, 0, 31, tzinfo=_KST), []),
+        # 월 00:00 대 창도 비었다 — ti-mon-nightfut 이 2026-08-08 졸업(회귀 테스트가 대신 지킨다)
+        # 하며 빠졌다. 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
+        (datetime(2026, 7, 20, 0, 10, tzinfo=_KST), []),
+        # ti-premarket-baseline: 수 08:50 [08:50, 09:00] — 창 안 / 창 밖 1분
+        (datetime(2026, 7, 15, 8, 55, tzinfo=_KST), ["ti-premarket-baseline"]),
+        (datetime(2026, 7, 15, 9, 1, tzinfo=_KST), []),
+        # etf-mon-0830: 월 09:30 [09:30, 23:30] — 넓은 창이라 **끝 경계**가 특히 중요하다
+        (datetime(2026, 7, 20, 10, 0, tzinfo=_KST), ["etf-mon-0830"]),
+        (datetime(2026, 7, 20, 23, 31, tzinfo=_KST), []),
         (datetime(2026, 7, 15, 3, 0, tzinfo=_KST), []),  # 아무 창에도 안 걸리는 시각
     ],
 )
 def test_real_schedules_time_alerts_unaffected_by_session_ping(moment, expected):
     for ping in _PINGS:
         got = [it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), ping)]
-        assert [i for i in got if i not in bridge.DIGEST_RUNNERS] == expected, f"ping={ping!r}"
+        assert [i for i in got if i not in _REAL_SESSION_IDS] == expected, f"ping={ping!r}"
 
 
 @_needs_real_schedules
@@ -6018,18 +6081,16 @@ def test_real_schedules_time_alerts_respect_fired():
         days=bridge._WEEKDAYS.index(days[0]), minutes=grace // 2
     )
     ping = moment.date().isoformat()
-    # 다이제스트도 `days` 가 있으면 그 요일에만 나온다(us-digest = 화~토) → 기준 항목의 요일에
-    # 실제로 나올 것만 센다. days 가 없는 항목(os-digest)은 종전대로 매일.
+    # 세션 항목도 `days` 가 있으면 그 요일에만 나온다(us-digest = 화~토) → 기준 항목의 요일에
+    # 실제로 나올 것만 센다. days 가 없는 항목(os-digest·pending-checks)은 종전대로 매일.
     day = bridge._WEEKDAYS[moment.weekday()]
-    digests = [
-        it
-        for it in _REAL_ITEMS
-        if it["id"] in bridge.DIGEST_RUNNERS and day in it.get("days", [day])
+    session_items = [
+        it for it in _REAL_ITEMS if it.get("on") == "session" and day in it.get("days", [day])
     ]
     alert = [it for it in _REAL_ITEMS if it["id"] == target]
     assert alert, f"{target} 이 배포본에 없다 — 유도한 기준 항목이 죽었다(공허한 통과 방지)"
-    assert due_notifications(_REAL_ITEMS, moment, set(), ping) == alert + digests
-    assert due_notifications(_REAL_ITEMS, moment, {(target, ping)}, ping) == digests
+    assert due_notifications(_REAL_ITEMS, moment, set(), ping) == alert + session_items
+    assert due_notifications(_REAL_ITEMS, moment, {(target, ping)}, ping) == session_items
 
 
 @_needs_real_schedules
@@ -6060,8 +6121,15 @@ def test_real_schedules_digest_needs_session_ping_only():
     # 배포본의 다이제스트 항목 **전부**(오픈소스·미국주식)가 같은 규칙으로 잡혀야 한다.
     # 기준 시각은 **수요일** — us-digest 의 days(화~토) 안이라 요일 필터에 걸리지 않는다.
     moment = datetime(2026, 7, 15, 3, 0, tzinfo=_KST)
-    expected = [it["id"] for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
-    assert expected, "배포본에 다이제스트 항목이 하나도 없다"
+    digests = [it["id"] for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
+    assert digests, "배포본에 다이제스트 항목이 하나도 없다"
+    # 이 시각엔 시각 창에 아무것도 안 걸린다 → due = **세션 항목 전부**(다이제스트 + pending-checks)
+    expected = [
+        it["id"]
+        for it in _REAL_ITEMS
+        if it["id"] in _REAL_SESSION_IDS and "wed" in it.get("days", ["wed"])
+    ]
+    assert set(digests) <= set(expected)
     assert due_notifications(_REAL_ITEMS, moment, set(), None) == []
     assert [
         it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), "2026-07-15")

@@ -77,6 +77,8 @@ OCI_GRABBER_REPO = "muhwa91/oci_arm_grabber"
 # tzdata 미설치 Windows 노트북에서도 import 가 죽지 않게 한다(풀만으로 자동 실행).
 _KST = timezone(timedelta(hours=9))
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+# 카드에 요일을 사람 말로 적을 때만 쓴다(판정은 위 영문 키 그대로 — 스키마 무변경).
+_WEEKDAYS_KO = dict(zip(_WEEKDAYS, "월화수목금토일", strict=True))
 
 # ② session_id(claude 발행 UUID 형태)만 argv 부착 허용 — 손상·주입 값 차단(L-1 방어심층).
 _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
@@ -629,6 +631,56 @@ def due_notifications(
     return out
 
 
+# 미처리 검증 건 리마인더 — notify.json 의 이 id(항목을 지우면 기능이 꺼진다).
+PENDING_CHECKS_NOTIFY_ID = "pending-checks"
+
+
+def pending_checks_summary(items: list[dict[str, Any]]) -> str:
+    """아직 졸업 안 한 **시각 항목**(`on != "session"`) 요약 줄. 0건이면 빈 문자열. 순수.
+
+    시각 항목은 `[at, at+grace_min]` 창에 브리지가 떠 있을 때만 카드가 뜨는데, 브리지는 관리자가
+    세션을 열 때만 기동한다 — 그 창에 PC 가 꺼져 있으면 알람이 조용히 지나가 다음 주로 밀린다
+    (`ti-mon-nightfut` 이 실제로 8/3 월요일을 그렇게 놓쳤다). 그래서 세션 1회 "이런 게 남아 있다"를
+    알린다. 목록에서 빼는 것: 자기 자신 · `on:"session"` 항목(다이제스트는 검증 건이 아니다).
+    `enabled:false` 는 호출측(dispatch)이 이미 걸러 넘겨준다.
+    """
+    lines: list[str] = []
+    for it in items:
+        item_id = it.get("id")
+        if not isinstance(item_id, str) or item_id == PENDING_CHECKS_NOTIFY_ID:
+            continue
+        if it.get("on") == "session":
+            continue
+        days = it.get("days")
+        when = (
+            "·".join(_WEEKDAYS_KO.get(str(d), str(d)) for d in days)
+            if isinstance(days, list) and days
+            else "매일"
+        )
+        lines.append(f"• `{item_id}` {it.get('label', '')} — {when} {_notify_window(it)}".rstrip())
+    return "\n".join(lines)
+
+
+def _notify_window(it: dict[str, Any]) -> str:
+    """`at`~`at+grace_min` 표시 문자열. 깨진 항목은 "시각 미정"(로더와 같은 방어적 태도).
+
+    ponytail: 창이 자정을 넘으면 끝 시각만 다음 날 값으로 보인다(날짜 표기 없음) — 표시 전용이라
+    판정(due_notifications)에는 영향이 없다.
+    """
+    at = it.get("at")
+    grace = it.get("grace_min", 30)
+    if not isinstance(grace, int):
+        grace = 30
+    if not isinstance(at, str) or ":" not in at:
+        return "시각 미정"
+    parts = at.split(":")
+    try:
+        end = datetime(2000, 1, 1, int(parts[0]), int(parts[1])) + timedelta(minutes=grace)
+    except (ValueError, IndexError):
+        return "시각 미정"
+    return f"{at}~{end:%H:%M}"
+
+
 def due_snoozes(snooze: dict[str, str], now_kst: datetime) -> list[str]:
     """재발송 시각(ISO)이 지난 스누즈 id 목록. 순수(부작용 없음)."""
     out: list[str] = []
@@ -953,6 +1005,13 @@ def dispatch_notifications(
             if not isinstance(item_id, str) or not item_id:
                 continue
             text = f"{LEAD_NOTIFY} {it.get('label', '')}\n{it.get('note', '')}".strip()
+            if item_id == PENDING_CHECKS_NOTIFY_ID:
+                summary = pending_checks_summary(items)
+                if not summary:
+                    # 0건이면 아예 안 보낸다 — 다 졸업했는데 빈 카드가 매일 뜨면 그게 소음이다.
+                    # fired 도 안 찍는다: 그날 늦게 항목이 추가되면 다음 틱에 다시 잡히게.
+                    continue
+                text = f"{text}\n{summary}"
             outgoing.append((item_id, text, it))
             notify_fired.add((item_id, today))
             notify_snooze.pop(item_id, None)
@@ -974,7 +1033,10 @@ def dispatch_notifications(
             # 수집·판정이 1~2분 걸려 타이머 스레드를 막으면 다른 알림이 밀린다 → 별도 데몬 스레드.
             _start_digest(adapter, channel, item_id, today)
             continue
-        adapter.send(channel, text, notify_buttons(item_id))  # 역할 채널 1회
+        # 미처리 검증 건 리마인더는 **판정 대상이 아니라 알림**이라 버튼을 안 단다(누를 게 없다 —
+        # 확인시작은 각 항목 카드에서, 졸업도 그 카드에서 한다). 나머지는 종전 3버튼.
+        buttons = None if item_id == PENDING_CHECKS_NOTIFY_ID else notify_buttons(item_id)
+        adapter.send(channel, text, buttons)  # 역할 채널 1회
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -128,9 +128,18 @@ def _insert(access: str, video_id: str) -> str:
 
 
 def _reason(e: Exception) -> str:
-    """실패 사유(비밀값 노출 없이) — HTTPError 는 status, 그 외는 예외 타입만."""
+    """실패 사유(비밀값 노출 없이) — HTTPError 는 status, 그 외는 예외 타입만.
+
+    ⚠️ `FileNotFoundError` 만 따로 문구를 준다 — `.oauth_client.json`·`.oauth_token.json` 은
+    **gitignore 라 `git pull` 로 안 따라온다**(2026-08-08 노트북에서 실제로 발생). 그런데 이 예외는
+    `OSError` 라 `add_video` 의 except 에 삼켜져 **`오류(FileNotFoundError)`** 로만 회신됐고,
+    폰에서 그 문구로는 "네트워크 문제인가 API 문제인가"를 가릴 수 없었다.
+    파일명은 적지 않는다 — 이 회신은 **비인가 서버 멤버도 보는 채널**로 나간다(`_playlist_bypass`).
+    """
     if isinstance(e, urllib.error.HTTPError):
         return f"YouTube API 오류(HTTP {e.code})"
+    if isinstance(e, FileNotFoundError):
+        return "OAuth 자격증명 없음 — 이 PC 에 인증 파일이 설정되지 않았습니다"
     return f"오류({type(e).__name__})"
 
 

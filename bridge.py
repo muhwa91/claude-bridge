@@ -1491,13 +1491,40 @@ def collect_hn(
 
 
 def _harness_json_keys(path: Path, key: str) -> list[str]:
-    """로컬 설정 JSON 의 `raw[key]`(dict) 키 목록, 정렬. 없음·손상·형식이탈은 빈 목록."""
+    """로컬 설정 JSON 의 `raw[key]`(dict) 키 목록, 정렬. 없음·손상·형식이탈은 빈 목록.
+
+    ⚠️ **`utf-8-sig` 를 `utf-8` 로 되돌리지 마라** — 여기서 읽는 파일들(`~/.claude.json`·
+    `<repo>/.mcp.json`·`installed_plugins.json`)은 **Windows 에서 손편집되는 대상**이고,
+    PS 5.1 `Set-Content -Encoding UTF8`·메모장은 BOM 을 붙인다. BOM 이 붙으면 `json.loads` 가
+    `ValueError` 를 내고 아래 `except` 가 그것을 **"파일 없음"과 똑같은 빈 목록으로 흡수**한다
+    → 2026-08-08 중복 추천 사고가 로그 한 줄 없이 그대로 재발한다. `utf-8-sig` 는 BOM 없는
+    UTF-8 도 그대로 읽어 회귀 위험이 없다(같은 이유로 `load_project_labels` 가 이미 이 방식).
+    """
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return []
     node = raw.get(key) if isinstance(raw, dict) else None
     return sorted(k for k in node if isinstance(k, str)) if isinstance(node, dict) else []
+
+
+def _mcp_server_names(home: Path, repo_root: Path) -> set[str]:
+    """등록된 MCP 서버명 — user 스코프 + **프로젝트 스코프** 합집합.
+
+    ⚠️ `<repo>/.mcp.json` 을 빼면 거기 등록된 서버가 "미설치"로 보여 **이미 쓰는 것을 카드로
+    추천한다** — 2026-08-08 실사고(`ChromeDevTools/chrome-devtools-mcp` 발송. `.mcp.json` 에
+    등록돼 있고 루트 settings 의 `enableAllProjectMcpServers: true` 로 활성인데도 통과했다).
+    이 함수를 `installed_names`(1차 거르기)와 `collect_harness`(판정 재료) **양쪽이** 쓴다 —
+    한쪽만 고치면 걸러도 판정문이 중복을 못 보거나 그 반대가 된다.
+
+    ponytail: user + 프로젝트 두 스코프만 본다. `~/.claude.json` 의 **local 스코프**
+    (`projects[<경로>].mcpServers`)는 현재 전부 비어 있어 뺐다 — `claude mcp add -s local` 을
+    쓰기 시작하면 **같은 계열의 누락**이므로 그때 이 집합에 한 소스 더 합친다.
+    """
+    return {
+        *_harness_json_keys(home / ".claude.json", "mcpServers"),
+        *_harness_json_keys(repo_root / ".mcp.json", "mcpServers"),
+    }
 
 
 def harness_model_policy(home: Path | None = None) -> str:
@@ -1538,16 +1565,30 @@ def _harness_dir_names(path: Path, suffix: str = "") -> list[str]:
     return sorted(names)
 
 
-def installed_names(home: Path | None = None) -> set[str]:
+def installed_names(home: Path | None = None, repo_root: Path | None = None) -> set[str]:
     """이미 설치된 MCP 서버·플러그인 이름(런타임 실측 — 하드코딩 목록 금지). 실패는 빈 집합.
 
-    · `~/.claude.json` 의 mcpServers 키(= 서버명)
+    · MCP 서버명 — user(`~/.claude.json`) + 프로젝트(`<repo>/.mcp.json`) 양쪽(`_mcp_server_names`)
     · `~/.claude/plugins/installed_plugins.json` 의 plugins 키(`<플러그인>@<마켓>` → 양쪽 다 등재)
     후보의 레포명(owner/**repo**)을 이 집합과 소문자 대조해 "이미 깔린 것"을 1차에서 거른다.
     읽기 실패(파일 없음·손상·다른 머신)는 빈 집합 폴백 — 거르기만 느슨해지고 죽지 않는다.
     """
     base = home if home is not None else Path.home()
-    out = {n.lower() for n in _harness_json_keys(base / ".claude.json", "mcpServers")}
+    root = repo_root if repo_root is not None else REPO_ROOT
+    out: set[str] = set()
+    for name in _mcp_server_names(base, root):
+        # 후보 `key` 는 **레포명**(`chrome-devtools-mcp`)인데 서버명은 관례상 접미사를 뗀
+        # `chrome-devtools` 다 — 정확일치로는 `.mcp.json` 을 읽어도 안 걸린다(2026-08-08 사고의
+        # 나머지 절반). `filter_digest` 를 건드리지 않으려고 **설치 쪽 집합을 넓힌다**.
+        # ponytail: 접미사를 **붙이는 한 방향만**. 역방향(서버 `foo-mcp` → 레포 `foo`)은 일부러
+        # 뺐다 — 지금 등록된 서버 중 `-mcp` 로 끝나는 게 없어 한 번도 안 쓰이는데, 나중에
+        # `playwright-mcp` 를 등록하면 무관한 `playwright` 를 매장한다. `mcp-` 접두사형
+        # (`mcp-server-fetch`)도 미커버 — 실사고가 나면 그때 `removeprefix` 를 더한다.
+        # 이 휴리스틱은 `git` 서버가 별개 제품 `idosal/git-mcp` 를 거르는 **오탐을 낸다**.
+        # 좁히지 않는 이유: 오탐(카드 못 봄)보다 미탐(쓰는 걸 추천)이 더 비싸다는 게 사고의
+        # 결론이다. 대신 run_opensource_digest 가 제외분을 로그로 남겨 보이게 한다.
+        if lowered := name.lower():
+            out.update((lowered, f"{lowered}-mcp"))
     for key in _harness_json_keys(base / _PLUGINS_REL, "plugins"):
         out.update(part.lower() for part in key.split("@") if part)
     return out
@@ -1648,7 +1689,7 @@ def collect_harness(home: Path | None = None, repo_root: Path | None = None) -> 
     }
     parts = [
         "[내 하네스 — 로컬 실측 정보(신뢰). 파일을 읽을 수단이 없으니 이 정보로만 판정하라]",
-        _harness_line("MCP 서버", _harness_json_keys(base / ".claude.json", "mcpServers")),
+        _harness_line("MCP 서버", sorted(_mcp_server_names(base, root))),
         _harness_line("플러그인", _harness_json_keys(base / _PLUGINS_REL, "plugins")),
         _harness_line("스킬", sorted(skills)),
         _harness_line("에이전트", sorted(agents)),
@@ -1692,7 +1733,7 @@ def filter_digest(
         name, key = str(c.get("name", "")), str(c.get("key", ""))
         if not name or name in dedup or name.lower() in blocked or key.lower() in blocked:
             continue
-        if key and key in installed:
+        if key and key.lower() in installed:
             continue
         if c.get("source") == "gh" and (int(c.get("stars") or 0) < min_stars or not c.get("desc")):
             continue
@@ -2357,7 +2398,13 @@ def _digest_gather(
     )
     cands += collect_hn(DIGEST_TOPICS, int(time.time()) - 14 * 86400)
     cands += collect_awesome(snapshot)
-    passed = filter_digest(cands, seen, installed_names())
+    installed = installed_names()
+    passed = filter_digest(cands, seen, installed)
+    # "이미 설치됨" 제외는 **조용한 절단**이었다 — `installed_names` 의 `-mcp` 휴리스틱이 오탐을
+    # 내면(서버 `git` ↔ 별개 제품 `idosal/git-mcp`) 그 후보가 영영 안 오는데 단서가 0이었다.
+    # 반대로 BOM·경로 문제로 installed 가 통째로 비면 "제외 0건"이 매일 찍혀 그것도 여기 드러난다.
+    if dropped := sorted({k for c in cands if (k := str(c.get("key", "")).lower()) in installed}):
+        log.info("다이제스트 이미 설치로 제외 %d건: %s", len(dropped), ", ".join(dropped))
     kept = passed[:DIGEST_MAX_CANDIDATES]  # 절단은 조용히 하지 않는다(아래 로그)
     if len(passed) > len(kept):
         log.info("다이제스트 후보 절단 %d→%d(신흥·스타순 상위만 판정)", len(passed), len(kept))

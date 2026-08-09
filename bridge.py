@@ -2468,9 +2468,17 @@ def run_opensource_digest(adapter: Adapter, channel_id: int, today: str) -> bool
         return True
     data, _prompt, _harness, _readmes = _digest_judge(claude_exe, kept)
     if data.get("is_error"):
-        log.warning("다이제스트 판정 실패 — 되돌림")
+        # 사유를 버리면 라이브 실패를 로그만 보고 진단할 수 없다(2026-08-09: argv 플래그 하나가
+        # CLI 에서 제거돼 100% 실패했는데 이 줄이 이유를 안 남겨 드라이런까지 가서야 드러났다).
+        # ⚠️ 판정 원문은 **외부 유래**다(README·HN 제목이 섞여 돌아온다) — 평문 줄 포맷 로그에
+        # 개행째로 넣으면 가짜 로그 줄을 심을 수 있다. 한 줄로 접어서 남긴다(strip_control_line).
+        log.warning(
+            "다이제스트 판정 실패 — 되돌림: %s",
+            strip_control_line(str(data.get("result") or ""))[:300],
+        )
         return False
-    body, rejects = parse_digest_rejects(str(data.get("result", "")))
+    # `or ""` — result 가 JSON null 이면 `str()` 이 `"None"` 을 만들어 빈 응답 신호를 지운다.
+    body, rejects = parse_digest_rejects(str(data.get("result") or ""))
     cards = split_digest_cards(body)
     # ⚠️ 재는 것은 **판정 원문에 🧩 줄이 없다**는 것뿐 — "게시할 카드 0장"과 혼동하지 마라.
     # 후자는 정상이고 _post_digest_cards 가 0건 안내로 끝낸다(되돌리면 매일 3회 헛돈다).
@@ -2579,9 +2587,13 @@ def review_repo(item: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
         allowed_tools=REVIEW_TOOLS,
         system_prompt=REVIEW_SYSTEM_PROMPT,
     )
-    body = str(data.get("result", "")).strip()
+    # `or ""` — null 이면 `str()` 이 `"None"` 이 돼 아래 `not body`(응답이 비었다) 신호가 죽는다.
+    body = str(data.get("result") or "").strip()
     if data.get("is_error") or not body:
-        log.warning("검토 실패 %s", name)
+        # 사유를 남긴다(드라이런과 같은 300자 절단) — 빈 문자열이면 "응답 자체가 비었다"는 신호다.
+        # ⚠️ 로그 인자에만 strip_control_line(외부 유래 원문의 개행 = 가짜 로그 줄 삽입 통로).
+        # 반환하는 `body` 는 원문 그대로 둔다 — 카드 렌더·진단이 원문을 쓴다.
+        log.warning("검토 실패 %s: %s", name, strip_control_line(body)[:300])
         return (None, body)
     spec = review_card(body)
     if spec is None:
@@ -2961,6 +2973,22 @@ def _kill_tree(proc: subprocess.Popen[str]) -> None:
         proc.kill()
 
 
+def _warn_context_leak(cwd: Path) -> None:
+    """도구 0개 티어 cwd 에 **훅 차단이 못 막는 컨텍스트**가 생기면 경고만 한다(막지는 않는다).
+
+    `--settings` 는 훅만 끈다 — 상위 `CLAUDE.md` 자동 발견과 auto-memory 는 그대로 살아 있고
+    (카나리 실측), 게다가 settings **키가 오타·개명이면 CLI 는 rc=0·경고 0 으로 넘어간다**.
+    즉 이 티어는 깨져도 조용하다 → 값싼 관측점 하나를 런타임에 남긴다. 판정은 계속 돌아야 하므로
+    차단하지 않는다. ponytail: memory 키는 cwd 문자열 치환 추정(어긋나면 경고를 못 낼 뿐).
+    """
+    key = re.sub(r"[^A-Za-z0-9]", "-", str(cwd))  # cwd → `~/.claude/projects/<키>` 치환 규칙
+    memory = Path.home() / ".claude" / "projects" / key / "memory"
+    leaks = [str(p / "CLAUDE.md") for p in (cwd, *cwd.parents) if (p / "CLAUDE.md").is_file()]
+    leaks += [str(memory)] if any(memory.glob("*")) else []
+    if leaks:
+        log.warning("도구 0개 티어 컨텍스트 유입 경로 — 훅 차단이 못 막는다: %s", leaks[:3])
+
+
 def claude_tool_args(tools: list[str], *, builtin_only: bool = False) -> list[str]:
     """도구 화이트리스트 → claude argv 조각(순수). **빈 목록 = 도구 0개**.
 
@@ -3007,16 +3035,27 @@ def claude_tool_args(tools: list[str], *, builtin_only: bool = False) -> list[st
         if not tools or any("(" in t for t in tools):
             raise ValueError("builtin_only 는 글롭 없는 비-빈 내장 도구 이름만 받는다")
         return ["--strict-mcp-config", "--tools", ",".join(tools), "--allowedTools", *tools]
-    # **도구 0개 티어에만 `--safe-mode`**(2026-08-02 라이브 결함). cwd 를 레포 밖으로 뺀 것은
-    # *프로젝트* 훅·CLAUDE.md 만 막는다 — **사용자 전역(`~/.claude`)·플러그인 훅은 cwd 무관**이라
-    # 그대로 통과한다(실측: 플러그인 SessionStart 훅이 statusLine 추가를 요청하는 문장이 판정
-    # 컨텍스트에 주입돼 검토 보고서에 그대로 언급됐다). safe-mode 는 훅·플러그인·스킬·커스텀
-    # 명령·CLAUDE.md 를 통째로 끈다 — 이 티어는 **그중 필요한 게 하나도 없다**.
-    # ⚠️ 비-빈 티어에 확대하지 마라: 스킬 티어(US_DIGEST_TOOLS)는 safe-mode 로 기능이 죽는다
-    # (ADR-004). 그쪽이 훅을 막아야 하면 `--settings '{"disableAllHooks": true}'` 가 대안이다.
-    # 순서: 값 없는 불리언 플래그라 `--tools ""` 의 fail-closed 순서 계약을 건드리지 않는다.
+    # **도구 0개 티어에만 훅 차단**(2026-08-02 라이브 결함). cwd 를 레포 밖으로 뺀 것은 *프로젝트*
+    # 훅·CLAUDE.md 만 막는다 — **사용자 전역(`~/.claude`)·플러그인 훅은 cwd 무관**이라 그대로
+    # 통과한다(실측: 플러그인 SessionStart 훅이 statusLine 추가를 요청하는 문장이 판정 컨텍스트에
+    # 주입돼 검토 보고서에 그대로 언급됐다).
+    # ⚠️ 종전엔 `--safe-mode` 였다 — **CLI 2.1.138 에 없는 플래그**라(제거됨) argv 파싱 단계에서
+    # `unknown option` 으로 즉사, 판정·검토가 100% 실패했다(2026-08-09 실측). 되살리지 마라.
+    # 대체 `--settings '{"disableAllHooks": true}'` 는 커버리지가 좁다(훅만 끔 vs 종전 훅+플러그인+
+    # 스킬+CLAUDE.md). 이 티어엔 **지금은** 충분하다 — 도구 0개라 Skill 호출이 불가해서다(실측).
+    # ⚠️ 나머지 둘은 **이 플래그가 막아주는 것이 아니다**(2026-08-10 카나리 실측으로 반증):
+    #   · 상위 `CLAUDE.md` 자동 발견은 **살아 있다** — 샌드박스가 temp 라 조상에 홈 디렉터리가 있고,
+    #     거기 파일을 심으면 판정 모델이 그대로 복창했다. 지금 안 붙는 건 그 경로에 파일이 없어서다.
+    #   · auto-memory 도 **꺼지지 않는다** — cwd 로 `projects/<키>/memory` 키가 갈릴 뿐이라
+    #     그 스코프에 파일이 생기면 붙는다(빈 상태라 안 붙을 뿐).
+    #   → 하나라도 생기면 판정 컨텍스트에 외부 텍스트가 실린다. _warn_context_leak 이 경고.
+    # ⚠️ `--bare` 로 바꾸지 마라: OAuth·keychain 을 안 읽어 구독 인증이 끊긴다(실측).
+    # ⚠️ 비-빈 티어에 확대하지 마라(ADR-004) — 스킬 티어(US_DIGEST_TOOLS)는 훅 차단 대상이 아니다.
+    # 순서: 맨 앞에 둬 `--tools ""` 의 fail-closed 순서 계약(strict 가 바로 앞)을 건드리지 않는다.
+    # ※ 값 있는 플래그가 된 뒤로는 값이 소실돼도 fail-open 이 아니다 — 실측상 뒤 플래그를 값으로
+    # 삼켜 `Settings file not found: --strict-mcp-config` 로 **시끄럽게 죽는다**(도구는 안 열린다).
     return [
-        *(["--safe-mode"] if not tools else []),
+        *(["--settings", '{"disableAllHooks": true}'] if not tools else []),
         "--strict-mcp-config",
         *(["--allowedTools", *tools] if tools else ["--tools", ""]),
     ]
@@ -3058,6 +3097,8 @@ def run_claude(
         tools = [*ALLOWED_TOOLS, *PROJECT_EXTRA_TOOLS.get(Path(project_path).name, [])]
     else:
         tools = allowed_tools
+    if not tools:
+        _warn_context_leak(Path(project_path))  # 훅 차단이 못 막는 유입 경로 관측(경고만)
     cmd = [
         claude_exe,
         "-p",
@@ -4856,21 +4897,27 @@ def _selftest() -> None:
     # 빈 목록의 argv 표현 — `--allowedTools` 를 빈 채로 붙이면 CLI 가 죽는다(실측). 내장 도구는
     # `--tools ""`, MCP 도구는 `--strict-mcp-config` 로 함께 꺼야 진짜 0개다.
     # 순서 고정(M-1): strict 가 **앞**. 뒤에 두면 `""` 소실 시 값으로 삼켜져 MCP 가 열린다.
-    # `--safe-mode` 는 **도구 0개 티어에만**(훅·플러그인·스킬·CLAUDE.md 차단 — 2026-08-02 실측:
-    # 없으면 플러그인 SessionStart 훅이 statusLine 요청을 판정 컨텍스트에 주입한다).
-    assert claude_tool_args([]) == ["--safe-mode", "--strict-mcp-config", "--tools", ""]
+    # 훅 차단은 **도구 0개 티어에만**(2026-08-02 실측: 없으면 플러그인 SessionStart 훅이
+    # statusLine 요청을 판정 컨텍스트에 주입한다). 옛 `--safe-mode` 는 CLI 에서 제거돼 즉사한다.
+    assert claude_tool_args([]) == [
+        "--settings",
+        '{"disableAllHooks": true}',
+        "--strict-mcp-config",
+        "--tools",
+        "",
+    ]
     assert "--allowedTools" not in claude_tool_args([])
     # 전 티어 공통 MCP 무로딩 — `--allowedTools` 는 권한 목록일 뿐 가용성 목록이 아니라서,
     # 이게 없으면 게스트(WebSearch 1개)에도 MCP 45개가 스키마에 남는다(실측 75 → 28).
     # ※ `["Read"]` 는 **임의 스코프 예시**다(실제 티어 아님 — 사진은 full 을 쓴다).
     assert claude_tool_args(["Read"]) == ["--strict-mcp-config", "--allowedTools", "Read"]
-    # ⚠️ **비-빈 티어에는 safe-mode 가 붙지 않는다** — 스킬 티어(미국주식)는 그걸 켜면 죽는다.
+    # ⚠️ **비-빈 티어에는 훅 차단이 붙지 않는다**(ADR-004 — 스킬 티어는 대상이 아니다).
     for _tier in (ALLOWED_TOOLS, NOTIFY_CHECK_TOOLS, GUEST_TOOLS, US_DIGEST_TOOLS):
-        assert "--safe-mode" not in claude_tool_args(list(_tier))
-    assert "--safe-mode" not in claude_tool_args(GUEST_TOOLS, builtin_only=True)
-    # 두 러너(🧩 판정 · 🔍 검토)는 도구 0개 = safe-mode 대상. 여기 도구를 넣으면 조용히 풀린다.
-    assert claude_tool_args(DIGEST_TOOLS)[0] == "--safe-mode"
-    assert claude_tool_args(REVIEW_TOOLS)[0] == "--safe-mode"
+        assert "--settings" not in claude_tool_args(list(_tier))
+    assert "--settings" not in claude_tool_args(GUEST_TOOLS, builtin_only=True)
+    # 두 러너(🧩 판정 · 🔍 검토)는 도구 0개 = 훅 차단 대상. 여기 도구를 넣으면 조용히 풀린다.
+    assert claude_tool_args(DIGEST_TOOLS)[0] == "--settings"
+    assert claude_tool_args(REVIEW_TOOLS)[0] == "--settings"
     # 게스트 = 가용성까지 1개(`--tools`). 권한 계층(`--allowedTools`)은 함께 남는다(이중 방어).
     assert claude_tool_args(GUEST_TOOLS, builtin_only=True) == [
         "--strict-mcp-config",

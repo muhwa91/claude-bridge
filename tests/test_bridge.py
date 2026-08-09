@@ -2058,10 +2058,11 @@ def _argv_case(label):
             "chiikawa_dev",
             {"allowed_tools": bridge.DIGEST_TOOLS, "system_prompt": bridge.DIGEST_SYSTEM_PROMPT},
             # strict 가 `--tools ""` **앞**(fail-closed) — 뒤집히면 `""` 소실 시 MCP 가 열린다.
-            # safe-mode = 도구 0개 티어 전용(플러그인·전역 훅 주입 차단, 2026-08-02 실측).
+            # 훅 차단 = 도구 0개 티어 전용(플러그인·전역 훅 주입 차단, 2026-08-02 실측).
             [
                 bridge.DIGEST_SYSTEM_PROMPT,
-                "--safe-mode",
+                "--settings",
+                '{"disableAllHooks": true}',
                 "--strict-mcp-config",
                 "--tools",
                 "",
@@ -4360,9 +4361,7 @@ def test_installed_names_reads_project_scope_mcp_json(tmp_path):
     root.mkdir()
     # `git` 을 **양쪽 스코프에** 둔다 — 합집합 dedup 이 깨지면 아래 collect_harness 카운트가
     # 부풀고, 그 숫자는 판정 claude 가 근거로 읽는 값이다(조용히 틀리면 아무도 못 본다).
-    (home / ".claude.json").write_text(
-        json.dumps({"mcpServers": {"git": {}}}), encoding="utf-8"
-    )
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {"git": {}}}), encoding="utf-8")
     (root / ".mcp.json").write_text(
         json.dumps({"mcpServers": {"chrome-devtools": {}, "git": {}}}), encoding="utf-8"
     )
@@ -5224,8 +5223,96 @@ def test_build_digest_prompt_says_no_tools():
 # ── 도구 0개 argv(실측 고정) ────────────────────────────────────────────────
 def test_claude_tool_args_empty_uses_tools_flag():
     # `--allowedTools` 를 빈 목록으로 붙이면 CLI 가 "argument missing" 으로 죽는다(2026-07-27 실측).
-    assert bridge.claude_tool_args([]) == ["--safe-mode", "--strict-mcp-config", "--tools", ""]
+    assert bridge.claude_tool_args([]) == [
+        "--settings",
+        '{"disableAllHooks": true}',
+        "--strict-mcp-config",
+        "--tools",
+        "",
+    ]
     assert bridge.claude_tool_args(["Read"]) == ["--strict-mcp-config", "--allowedTools", "Read"]
+
+
+# run_claude 가 **조건부로** 붙이는 플래그 — _ARGV_PREFIX·claude_tool_args 어디에도 없어
+# 그냥 두면 감시 집합에서 빠진다(`--resume` 가 제거되면 `#이어서` 가 즉사하는데 초록불).
+_CONDITIONAL_FLAGS = ["--resume"]  # bridge.py `if resume and _SESSION_ID_RE.match(resume)`
+
+
+def test_claude_cli_accepts_every_flag_we_pass():
+    """우리가 넘기는 플래그가 **설치된 CLI 에 실재하는지** `claude --help` 로 1회 확인한다.
+
+    문자열 골든만으로는 못 잡는 결함이 실제로 났다 — `--safe-mode` 는 argv 모양이 계약대로였는데
+    CLI 2.1.138 에서 **제거된 플래그**라 파싱 단계에서 즉사, 🧩 판정과 🔍 검토가 100% 실패했다
+    (2026-08-09). CLI 가 없으면 skip — 이 검사는 개발 머신에서만 의미가 있다.
+
+    ⚠️ **부분문자열 매칭(`f not in help_text`)은 쓰지 마라** — `--bare` 의 **설명문 안**에
+    `--settings`·`--append-system-prompt` 가 등장해, 그 플래그가 옵션 목록에서 **제거돼도 통과**
+    한다(2026-08-10 실측 — 이번에 새로 넣은 `--settings` 가 정확히 그 구멍 안에 있었다).
+    옵션 **정의 줄**에서 토큰만 뽑아 집합으로 대조한다.
+    """
+    exe = shutil.which("claude")
+    if exe is None:
+        pytest.skip("claude CLI 없음")
+    try:
+        help_text = subprocess.run(
+            [exe, "--help"], capture_output=True, text=True, timeout=120, check=False
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:  # pragma: no cover - 환경 의존
+        pytest.skip(f"claude --help 실행 실패: {exc}")
+    # ⚠️ 줄 **머리에서만** 뽑는다 — `, --settings` 같은 토큰이 `--bare` 설명문 **안에** 그대로
+    # 들어 있어(같은 줄), 텍스트 전체에 `,\s*--…` 를 돌리면 산문이 다시 집합에 섞인다(실측).
+    known = {
+        f
+        for line in help_text.splitlines()
+        if (m := re.match(r"\s{2,}(-[\w-]+)(?:,\s*(--[\w-]+))?", line))  # `-p, --print`
+        for f in m.groups()
+        if f
+    }
+    # 티어는 **플래그 집합이 다른 것만**: 비-빈 티어는 서로 같은 argv 모양이라 3번 재도 같은 검사다.
+    argv = [*_ARGV_PREFIX, *_CONDITIONAL_FLAGS]
+    argv += bridge.claude_tool_args(bridge.GUEST_TOOLS, builtin_only=True)
+    argv += [a for t in ([], list(bridge.GUEST_TOOLS)) for a in bridge.claude_tool_args(t)]
+    flags = {a for a in argv if a.startswith("-")}  # `-p` 같은 숏 옵션도 대조 대상
+    # `assert flags` 로는 헛돎을 못 막는다 — _ARGV_PREFIX 만으로도 비지 않아, claude_tool_args 가
+    # 빈 리스트를 돌려주게 망가져도 통과했다. 이번 결함의 당사자 3개를 이름으로 못 박는다.
+    assert {"--settings", "--tools", "--strict-mcp-config"} <= flags, sorted(flags)
+    assert sorted(flags - known) == [], f"CLI 옵션 목록에 없는 플래그: {sorted(flags - known)}"
+
+
+_HOOK_SIGNS = ("Hook SessionStart", "PONYTAIL MODE ACTIVE")
+
+
+def test_live_zero_tools_argv_actually_silences_hooks(tmp_path):
+    """실측: 도구 0개 argv 를 **실제로 1회 띄워** 훅이 하나도 발화하지 않음을 확인한다.
+
+    문자열 골든도, 위의 `--help` 실재 검사도 **`--settings` 키가 오타·개명이면 100% 통과한다** —
+    CLI 는 settings 키를 검증하지 않아 `{"disableAllHooksTYPO": true}` 여도 rc=0·경고 0 으로
+    넘어가고 훅만 조용히 되살아난다(2026-08-10 실측: 이 단언만 빨간불이 된다). 종전 `--safe-mode`
+    는 깨지면 시끄러웠지만(unknown option) 이 수단은 **깨지면 조용해서**, 효과를 재는 관측점이
+    하나는 있어야 한다. 비용은 haiku·프롬프트 1줄 ≈ $0.002 · 약 3초.
+    cwd 는 라이브와 같은 성격(레포 밖 temp)으로 두고, 잡는 것은 **전역·플러그인 훅**이다.
+    """
+    exe = shutil.which("claude")
+    if exe is None:
+        pytest.skip("claude CLI 없음")
+    debug_log = tmp_path / "hooks.log"
+    argv = [exe, "-p", "--debug", "hooks", "--debug-file", str(debug_log), "--model", "haiku"]
+    proc = subprocess.run(
+        [*argv, *bridge.claude_tool_args([])],
+        input="1+1 은? 숫자만 답하라.",
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-500:]  # 실행 실패로 인한 공허한 통과 배제
+    text = debug_log.read_text(encoding="utf-8", errors="replace") if debug_log.exists() else ""
+    assert len(text) > 500, f"디버그 로그가 비었다 = 검사가 헛돈다: {text[:200]!r}"
+    fired = [ln for ln in text.splitlines() if any(s in ln for s in _HOOK_SIGNS)]
+    assert fired == [], fired[:3]
 
 
 @pytest.mark.parametrize(
@@ -5236,7 +5323,7 @@ def test_claude_tool_args_empty_uses_tools_flag():
         bridge.GUEST_TOOLS,
         bridge.NOTIFY_CHECK_TOOLS,
         bridge.ALLOWED_TOOLS,
-        bridge.US_DIGEST_TOOLS,  # 스킬 티어 — safe-mode 가 **붙으면 안 되는** 쪽(ADR-004)
+        bridge.US_DIGEST_TOOLS,  # 스킬 티어 — 훅 차단이 **붙으면 안 되는** 쪽(ADR-004)
         bridge.REVIEW_TOOLS,  # 🔍 검토 — 도구 0개라 붙어야 하는 쪽
     ],
 )
@@ -5250,11 +5337,11 @@ def test_every_tier_disables_mcp(tools):
     이 플래그가 MCP 가용성 자체를 없애 두 번째 축이 된다(실측 75개 → 28개, MCP 0).
     """
     argv = bridge.claude_tool_args(tools)
-    # `--tools ""` 바로 앞이 strict — 그 순서가 fail-closed 계약이다(safe-mode 는 그 앞).
+    # `--tools ""` 바로 앞이 strict — 그 순서가 fail-closed 계약이다(훅 차단은 그 앞).
     assert argv[argv.index("--strict-mcp-config") + 1] in ("--tools", "--allowedTools")
     assert argv.count("--strict-mcp-config") == 1
-    # safe-mode 는 **도구 0개일 때만**(비-빈 티어에 붙으면 스킬 티어가 죽는다).
-    assert ("--safe-mode" in argv) is (not tools)
+    # 훅 차단은 **도구 0개일 때만**(비-빈 티어에 붙으면 스킬 티어의 계약이 바뀐다).
+    assert ("--settings" in argv) is (not tools)
 
 
 def test_guest_tier_narrows_availability_not_just_permission():
@@ -5300,6 +5387,23 @@ def test_run_claude_zero_tools_argv(monkeypatch, tmp_path):
     assert "--allowedTools" not in cmd  # 빈 목록을 그대로 넘기면 CLI 파싱 실패
     assert cmd[cmd.index("--tools") + 1] == ""  # 내장 도구 전부 끔
     assert "--strict-mcp-config" in cmd  # MCP 도구도 끔(--tools "" 만으론 남는다 — 실측)
+
+
+def test_zero_tools_run_warns_when_context_can_leak(tmp_path, caplog, monkeypatch):
+    """훅 차단 플래그가 **못 막는** 유입 경로(상위 CLAUDE.md·auto-memory)를 런타임에 경고한다.
+
+    `--settings` 키가 오타·개명이면 CLI 는 rc=0·경고 0 으로 넘어간다 — 이 티어는 깨져도 조용해서
+    관측점이 필요하다. 경고일 뿐 **판정을 막지 않는다**(경고 났다고 실행이 죽으면 더 나쁘다).
+    """
+    _capture_argv(monkeypatch)
+    deep = tmp_path / "sandbox"
+    deep.mkdir()
+    with caplog.at_level(logging.WARNING, logger=bridge.log.name):
+        run_claude("claude", str(deep), "task", timeout=30, allowed_tools=[])
+        assert "유입 경로" not in caplog.text  # 깨끗한 샌드박스 = 조용
+        (tmp_path / "CLAUDE.md").write_text("규칙", encoding="utf-8")  # 조상에 생기면
+        assert run_claude("claude", str(deep), "task", timeout=30, allowed_tools=[]) is not None
+    assert "CLAUDE.md" in caplog.text
 
 
 @pytest.mark.usefixtures("pipeline")
@@ -5715,6 +5819,45 @@ def test_digest_empty_collection_is_failure(monkeypatch):
 def test_digest_claude_error_is_failure(monkeypatch):
     monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": True, "result": "x"})
     assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is False
+
+
+_INJECTING_RESULT = "🧨 원인\n2026-01-01 00:00:00 WARNING [bridge] 가짜 로그 줄\n" + "가" * 400
+
+
+@pytest.mark.usefixtures("pipeline")
+def test_digest_failure_logs_reason_folded_and_truncated(monkeypatch, caplog):
+    """실패 로그가 ① 사유를 남기고 ② 개행을 접고 ③ 300자에서 자른다.
+
+    ①이 이번 변경의 동기다(2026-08-09: 플래그 하나로 판정이 100% 실패했는데 로그가 이유를 버려
+    드라이런까지 가서야 드러났다) — `%s` 인자를 지워도 초록불이면 재발 방지 장치가 없는 것이다.
+    ②는 판정 원문이 **외부 유래**라서 필요하다: 평문 줄 포맷 로그에 개행이 살아 들어가면 문자열
+    하나로 가짜 로그 줄을 심을 수 있다.
+    """
+    monkeypatch.setattr(
+        bridge, "run_claude", lambda *_a, **_k: {"is_error": True, "result": _INJECTING_RESULT}
+    )
+    with caplog.at_level(logging.WARNING, logger=bridge.log.name):
+        assert bridge.run_opensource_digest(FakeAdapter(secrets=[]), 555, "2026-07-15") is False
+    msg = next(r.getMessage() for r in caplog.records if "판정 실패" in r.getMessage())
+    expected = bridge.strip_control_line(_INJECTING_RESULT)[:300]
+    assert len(expected) == 300 and "\n" not in msg  # 절단 + 개행 접기
+    assert msg.endswith(expected) and "원인" in msg  # 사유를 버리지 않는다
+
+
+@pytest.mark.usefixtures("pipeline")
+def test_review_failure_logs_folded_reason_but_returns_raw(monkeypatch, caplog):
+    """검토 실패도 같은 규칙 — 단 **반환 원문은 접지 않는다**(카드 렌더·진단이 원문을 쓴다)."""
+    monkeypatch.setattr(
+        bridge, "run_claude", lambda *_a, **_k: {"is_error": True, "result": _INJECTING_RESULT}
+    )
+    with caplog.at_level(logging.WARNING, logger=bridge.log.name):
+        spec, body = bridge.review_repo(_cand())
+    msg = next(r.getMessage() for r in caplog.records if "검토 실패" in r.getMessage())
+    assert spec is None and body == _INJECTING_RESULT.strip()  # 원문 그대로(개행 보존)
+    assert "\n" not in msg and msg.endswith(bridge.strip_control_line(_INJECTING_RESULT)[:300])
+    # JSON null 이 `"None"` 으로 둔갑하면 "응답이 비었다"는 신호가 죽는다(`or ""`).
+    monkeypatch.setattr(bridge, "run_claude", lambda *_a, **_k: {"is_error": False, "result": None})
+    assert bridge.review_repo(_cand()) == (None, "")
 
 
 @pytest.mark.usefixtures("pipeline")

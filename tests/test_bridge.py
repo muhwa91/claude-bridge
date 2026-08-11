@@ -2522,6 +2522,29 @@ def test_dispatch_disabled_session_item_no_digest(digest_env, monkeypatch):
 _PENDING = {"id": bridge.PENDING_CHECKS_NOTIFY_ID, "on": "session", "label": "미처리 검증 건"}
 
 
+def test_notify_title_shows_pc_window_for_timed_items():
+    # 그 창에 PC 가 켜져 있어야만 발화한다 — 언제 켜야 하는지가 제목에서 바로 보여야 한다.
+    assert bridge.notify_title(_item(label="장전 기준가", at="08:50", grace_min=10)) == (
+        "⏰ 장전 기준가[ PC활성화 시간 08:50~09:00 ]"
+    )
+    # 깨진 at 도 표기 대상 — "창을 모른다"는 사실이 드러나야 한다.
+    assert bridge.notify_title(_item(at="oops")) == "⏰ L[ PC활성화 시간 시각 미정 ]"
+    assert bridge.notify_title(_item(label="")) == "⏰[ PC활성화 시간 09:00~09:30 ]"
+
+
+def test_notify_title_omits_window_for_session_items():
+    # on:"session" 은 at 이 없다 = "브리지를 켜면 그날 한 번" — 시각으로 답할 수 있는 성질이 아니다.
+    assert bridge.notify_title(_SESSION_ITEM) == "⏰ L"
+    assert bridge.notify_title({"id": "x"}) == "⏰"
+
+
+def test_dispatch_card_title_carries_pc_window(notify_env, monkeypatch):
+    _freeze_now(monkeypatch, _WED_0910)
+    bridge.dispatch_notifications(notify_env, [_item(id="a", label="장전 기준가", at="09:00")])
+    _c, text, _b = notify_env.sent[0]
+    assert text.splitlines()[0] == "⏰ 장전 기준가[ PC활성화 시간 09:00~09:30 ]"
+
+
 def test_pending_checks_summary_lists_time_items():
     got = bridge.pending_checks_summary([_item(id="a", label="장전 기준가"), _PENDING])
     assert "`a`" in got and "장전 기준가" in got

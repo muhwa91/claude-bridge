@@ -681,6 +681,21 @@ def _notify_window(it: dict[str, Any]) -> str:
     return f"{at}~{end:%H:%M}"
 
 
+def notify_title(it: dict[str, Any]) -> str:
+    """알림 카드 제목(`⏰ label[ PC활성화 시간 08:50~09:00 ]`). 순수(부작용 없음).
+
+    시각 항목은 그 창에 브리지가 떠 있을 때만 발화하고, 브리지는 관리자 PC 가 켜져 있는 동안만
+    돈다 — 꺼져 있으면 조용히 다음 주로 밀린다(`ti-mon-nightfut` 이 2026-08-03 을 그렇게 날렸다).
+    그래서 "언제 PC 를 켜야 이 알람을 받는가"를 제목에서 바로 보이게 한다.
+
+    붙이는 판정은 **`at` 키 존재 여부**로 한다(`_notify_window` 반환값이 아니라):
+    `on:"session"` 항목은 `at` 이 없다 = 브리지를 켜면 그날 한 번 오는 것이라 시각으로 답할 수
+    없으니 안 붙이고, 깨진 `at` 은 창을 모른다는 사실이 드러나야 하니 "시각 미정"으로 붙인다.
+    """
+    title = f"{LEAD_NOTIFY} {it.get('label', '')}".rstrip()
+    return f"{title}[ PC활성화 시간 {_notify_window(it)} ]" if "at" in it else title
+
+
 def due_snoozes(snooze: dict[str, str], now_kst: datetime) -> list[str]:
     """재발송 시각(ISO)이 지난 스누즈 id 목록. 순수(부작용 없음)."""
     out: list[str] = []
@@ -1031,7 +1046,7 @@ def dispatch_notifications(
             item_id = it.get("id")
             if not isinstance(item_id, str) or not item_id:
                 continue
-            text = f"{LEAD_NOTIFY} {it.get('label', '')}\n{it.get('note', '')}".strip()
+            text = f"{notify_title(it)}\n{it.get('note', '')}".strip()
             if item_id == PENDING_CHECKS_NOTIFY_ID:
                 summary = pending_checks_summary(items)
                 if not summary:

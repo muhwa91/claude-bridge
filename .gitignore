@@ -56,3 +56,11 @@ _Temp_files/
 Thumbs.db
 .idea/
 .vscode/
+
+# 유튜브 후보 선별 캐시·3일 간격 스탬프·마지막 결과(머신 로컬)
+tools/.yt_cache.json
+tools/.yt_lastrun
+tools/.yt_today.md
+
+# 공개 미러 제외 — 실명 채널에 대한 판정이 들어간다(공개 부적합)
+tools/yt_channel_rep.json

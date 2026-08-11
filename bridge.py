@@ -957,6 +957,32 @@ def save_channel_sessions(path: Path, sessions: dict[int, str]) -> None:
     tmp.replace(path)
 
 
+def resolve_notify_channel(adapter: Adapter, item: dict[str, Any]) -> tuple[int | None, str]:
+    """알림 항목 → (발송 channelID, 표시명). 우선순위: `channel`(역할) → `project` → "알림".
+
+    ② 가 없던 시절엔 `project` 가 라우팅에 안 쓰여 프로젝트 알림이 전부 #알림 으로 몰렸다
+    (설계 누락 — 2026-08-11). 항목마다 `channel` 을 손으로 적는 대신 이미 있는 `project` 를
+    읽는다: 새 알림을 추가할 때 적기를 잊어도 제 채널로 간다.
+
+    - ①`channel` 명시 → 그 **역할** 채널(os-digest→#오픈소스, us-digest→#미국주식).
+    - ②`project` 만 → 그 **프로젝트** 채널(adapter.project_channel — nb:ok 실행 라우팅과 같은 조회).
+    - ③둘 다 없음 → #알림(pending-checks 등).
+
+    ②에서 채널을 못 찾으면(자동생성 전·매핑 없음) **#알림 으로 폴백**한다 — 알림이 통째로
+    사라지는 것보다 엉뚱한 채널에라도 도착하는 편이 낫다. 폴백은 로그로 남긴다.
+    """
+    role = item.get("channel")
+    if isinstance(role, str) and role:
+        return adapter.role_channel(role), f"#{role}"
+    project = item.get("project")
+    if isinstance(project, str) and project:
+        cid = adapter.project_channel(project)
+        if cid is not None:
+            return cid, f"#{project}"
+        log.warning("#%s 채널 미매핑 — 알림 %s 을 #알림 으로 폴백", project, item.get("id"))
+    return adapter.role_channel("알림"), "#알림"
+
+
 def dispatch_notifications(
     adapter: Adapter,
     items: list[dict[str, Any]] | None = None,
@@ -972,8 +998,9 @@ def dispatch_notifications(
     스누즈는 1회 발송 후 해제한다. 날짜가 바뀌면 지난 fired 를 정리한다. 상태 조회·변이는
     _notify_lock 아래에서 원자적으로(타이머 스레드↔워커 경합 방지), 실제 전송은 락 밖에서 한다.
 
-    발송 타겟(§4.4): 항목의 `channel`(없으면 "알림") 역할 채널로 send — 채널 1곳에 1회. 채널
-    매핑이 없으면(자동생성 실패) 그 항목만 스킵한다(디스코드는 채널로만 발송 — 유저별 팬아웃 없음).
+    발송 타겟(§4.4): resolve_notify_channel 이 정한 채널 1곳에 1회 send(`channel` 역할 →
+    `project` 프로젝트 → #알림). 그 채널마저 미매핑이면(자동생성 실패) 그 항목만 스킵한다
+    (디스코드는 채널로만 발송 — 유저별 팬아웃 없음).
     `on:"session"` + id 가 DIGEST_RUNNERS 에 있는 항목만 알림 카드 대신 다이제스트로 간다.
     """
     if items is None:
@@ -1017,11 +1044,10 @@ def dispatch_notifications(
             notify_snooze.pop(item_id, None)
         save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
     for item_id, text, it in outgoing:
-        role = it.get("channel") if isinstance(it.get("channel"), str) else "알림"
-        channel = adapter.role_channel(str(role))
+        channel, target = resolve_notify_channel(adapter, it)
         if channel is None:
             # ponytail: 자동생성 성공 시 역할 채널은 항상 있다. 없으면 degraded — 그 건만 스킵.
-            log.warning("#%s 채널 미매핑 — 알림 %s 발송 스킵", role, item_id)
+            log.warning("%s 채널 미매핑 — 알림 %s 발송 스킵", target, item_id)
             if item_id in DIGEST_RUNNERS:
                 # 다이제스트는 하루 1회뿐이라 여기서 그냥 스킵하면 워커를 안 타 그날치가 재시도
                 # 없이 날아간다. 봇 기동 직후 첫 틱이 on_ready(채널 자동생성) 전일 수 있어 현실적

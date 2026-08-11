@@ -62,11 +62,7 @@ def test_render_view_choice_and_notify_custom_ids():
     from bridge import choice_buttons, notify_buttons
 
     v1 = render_view(notify_buttons("ti-open"))
-    assert [c.custom_id for c in v1.children] == [
-        "nb:ok:ti-open",
-        "nb:done:ti-open",
-        "nb:later:ti-open",
-    ]
+    assert [c.custom_id for c in v1.children] == ["nb:ok:ti-open", "nb:later:ti-open"]
     v2 = render_view(choice_buttons(55, [("유지", "keep"), ("교체", "swap")]))
     assert [c.custom_id for c in v2.children] == ["c:55:0", "c:55:1", "c:55:other"]
 
@@ -81,6 +77,8 @@ def test_render_view_custom_id_within_discord_100_char_limit():
         ("p", "x" * 64),
         ("nb:ok", "y" * 64),
         ("nb:later", "z" * 64),
+        ("nb:handoff", "y" * 64),  # 최장 접두(11B) — 캡 100 안인지 확인
+        ("nb:recheck", "z" * 64),
         ("c", "999999:12"),
     ):
         assert len(encode_callback(action, arg)) <= discord_adapter._CUSTOM_ID_LIMIT
@@ -1940,7 +1938,7 @@ def _kinds():
                     "title": "⏰ 알림",
                 },
             ),
-            ["nb:ok:ti-open", "nb:done:ti-open", "nb:later:ti-open"],
+            ["nb:ok:ti-open", "nb:later:ti-open"],
         ),
         (
             f"{HEADER_CHOICE}\n\n고르세요",

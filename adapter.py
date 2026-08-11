@@ -22,7 +22,7 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|nb:ok|nb:later|nb:done|od:rev + §4.7 델타3(r|rec|fav|…).
+    # 정규화 액션: push|x|p|c|nb:*(_NB_VERBS)|od:rev + §4.7 델타3(r|rec|fav|…).
     action: str
     arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
@@ -191,8 +191,8 @@ def _valid_id(s: object) -> bool:
 
     이 규칙은 callback_data(nb:ok:<id>·nb:later:<id>) 로 왕복하므로 인바운드(parse_callback)와
     아웃바운드(load_schedules→notify_buttons) 양측이 같은 문을 써야 한다. 상한 54 = callback_data
-    캡에서 최장 접두 `nb:later:`(9B)를 뺀 여유. 길면 render 절단으로 왕복이 깨져(탭해도 매칭 실패)
-    방출을 여기서 막는다(근본 차단, 실사용 id 는 전부 짧아 무영향).
+    캡(100)에서 최장 접두(`nb:handoff:`·`nb:recheck:` 11B)를 빼고도 한참 남는 여유. 길면 render
+    절단으로 왕복이 깨져(탭해도 매칭 실패) 방출을 여기서 막는다(근본 차단, 실사용 id 는 짧다).
     """
     return isinstance(s, str) and 0 < len(s) <= 54 and all(c.isalnum() or c in "-_" for c in s)
 
@@ -209,17 +209,26 @@ def _dig(s: str) -> bool:
     return s.isascii() and s.isdigit()
 
 
+# 예약 알림 버튼 액션(nb:*) — 코덱 단일 소스(디코드·인코드가 같은 목록을 쓴다).
+# ok=확인시작 / recheck=다시 확인(판정 불가 재시도, ok 와 동작 동일) / later=스누즈 /
+# done=확인완료 1단계(재확인 카드) / confirm=그 진행 / cancel=그 취소 / handoff=이관처리.
+# ⚠️ 이름을 바꾸면 **이미 나간 카드의 버튼이 깨진다**(od:rev 와 같은 계약).
+_NB_VERBS = ("ok", "recheck", "later", "done", "confirm", "cancel", "handoff")
+_NB_ACTIONS = tuple(f"nb:{v}" for v in _NB_VERBS)
+_NB_PREFIXES = tuple(f"{a}:" for a in _NB_ACTIONS)
+
+
 def parse_callback(data: str) -> tuple[str, str] | None:
     """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
 
     `push`/`x`/`clean:ok` → (그대로, ""), `p:<name>` → ("p", name),
-    `nb:ok:<id>`/`nb:later:<id>`/`nb:done:<id>` → ("nb:ok"/"nb:later"/"nb:done", id). 정확 매칭만.
+    `nb:<verb>:<id>` → ("nb:<verb>", id) — verb 는 _NB_VERBS 화이트리스트. 정확 매칭만.
     """
     if data in ("push", "x", "clean:ok"):
         return (data, "")
     if data.startswith("p:") and len(data) > 2:
         return ("p", data[2:])
-    for prefix in ("nb:ok:", "nb:later:", "nb:done:"):
+    for prefix in _NB_PREFIXES:
         if data.startswith(prefix):
             item_id = data[len(prefix) :]
             # id 는 우리가 발행하지만 callback_data 는 신뢰 경계 밖 — 방출측과 같은 문(_valid_id).
@@ -283,9 +292,7 @@ def encode_callback(action: str, arg: str) -> str:
     # 콜론-join 액션(§1.3 + §4.7 델타3): arg(id·mid·idx·"mid:idx"·"mid:go")를 그대로 이어붙인다.
     _joined = (
         "p",
-        "nb:ok",
-        "nb:later",
-        "nb:done",
+        *_NB_ACTIONS,
         "c",
         "r",
         "rec",

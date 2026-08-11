@@ -5,10 +5,12 @@
       "id": "example-market-open",
       "project": "example_project",
       "days": ["mon", "tue", "wed", "thu", "fri"],
-      "at": "09:00",
+      "at": "08:00",
       "label": "장 개장 점검",
-      "note": "개장 직후 화면이 정상 상태로 전환되는지 example 확인",
-      "grace_min": 30
+      "note": "개장 직후 화면이 정상 상태로 전환되는지 example 확인. at/grace_min 은 '카드가 오는 창'(= 호스트가 켜져 있어야 하는 시간)이고, check_from/check_to 는 '확인시작 버튼이 실제로 유효한 창'이다 — 둘은 다르다. 관측 목표 시각이 있으면 at 을 목표보다 최소 1시간 이르게 잡아 카드를 미리 받고(확인할 시간을 벌고), 창은 목표 시각까지만 늘린다(목표를 지나면 관측 대상이 사라지므로 뒤로는 못 늘린다).",
+      "grace_min": 60,
+      "check_from": "09:00",
+      "check_to": "09:30"
     },
     {
       "id": "example-ticker-check",

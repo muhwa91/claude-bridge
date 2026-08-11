@@ -2620,6 +2620,20 @@ def test_pending_checks_summary_lists_time_items():
     assert "평일 09:00~09:30" in bridge.pending_checks_summary([_item(id="a", days=weekdays)])
 
 
+def test_pending_checks_summary_appends_check_window():
+    # 요일 창(PC 켜둘 시간)과 확인가능 시간은 다르다 — 리마인더만 본 사람이 07:50 에 눌러
+    # ⛔ 만 받던 경로. 표기는 카드(notify_title)와 같은 _check_range 를 쓴다.
+    item = _item(id="a", label="장전 기준가", days=_WEEKDAY_KEYS, at="07:50", grace_min=70)
+    assert bridge.pending_checks_summary([{**item, **_CHECKABLE}]) == (
+        "• `a` 장전 기준가 — 평일 07:50~09:00 (확인 08:30~09:00)"
+    )
+    # 필드가 없으면 종전 형식 그대로(뒤에 아무것도 안 붙는다).
+    assert bridge.pending_checks_summary([item]) == "• `a` 장전 기준가 — 평일 07:50~09:00"
+    # 한쪽만·깨진 값도 게이트 없음 = 종전 형식(_check_range 가 None).
+    for broken in ({"check_from": "08:30"}, {"check_from": "8:xx", "check_to": "09:00"}):
+        assert "확인" not in bridge.pending_checks_summary([{**item, **broken}])
+
+
 def test_pending_checks_summary_excludes_self_and_session_items():
     items = [_PENDING, _SESSION_ITEM, {"id": "us-digest", "on": "session", "label": "L"}]
     # 검증 건이 아닌 것(자기 자신·다이제스트)만 남으면 0건 = 빈 문자열이어야 한다.

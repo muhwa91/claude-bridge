@@ -733,6 +733,11 @@ def pending_checks_summary(items: list[dict[str, Any]]) -> str:
     (`ti-mon-nightfut` 이 실제로 8/3 월요일을 그렇게 놓쳤다). 그래서 세션 1회 "이런 게 남아 있다"를
     알린다. 목록에서 빼는 것: 자기 자신 · `on:"session"` 항목(다이제스트는 검증 건이 아니다).
     `enabled:false` 는 호출측(dispatch)이 이미 걸러 넘겨준다.
+
+    **확인가능 시간을 뒤에 덧붙인다**(2026-08-11): 요일 창은 "언제 PC 를 켜야 카드를 받는가"라
+    확인가능 시간과 다르다 — 리마인더만 본 사람이 07:50 에 눌러도 되는 줄 알고 눌렀다가
+    `⛔ 지금은 확인가능 시간이 아닙니다` 만 받았다. 카드(`notify_title`)와 **같은 `_check_range`**
+    를 쓴다(두 곳이 갈리면 같은 항목이 다른 말을 한다). 그 필드가 없는 항목은 종전 그대로.
     """
     lines: list[str] = []
     for it in items:
@@ -743,7 +748,10 @@ def pending_checks_summary(items: list[dict[str, Any]]) -> str:
             continue
         # days 없음/깨짐 = 요일 제한이 없다 = 매일(여기선 빈 칸으로 두면 줄이 읽히지 않는다).
         when = _weekdays_ko(it.get("days")) or "매일"
-        lines.append(f"• `{item_id}` {it.get('label', '')} — {when} {_notify_window(it)}".rstrip())
+        rng = _check_range(it)
+        gate = f" (확인 {rng[0]}~{rng[1]})" if rng is not None else ""
+        line = f"• `{item_id}` {it.get('label', '')} — {when} {_notify_window(it)}".rstrip()
+        lines.append(line + gate)
     return "\n".join(lines)
 
 

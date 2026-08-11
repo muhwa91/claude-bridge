@@ -635,6 +635,23 @@ def due_notifications(
 PENDING_CHECKS_NOTIFY_ID = "pending-checks"
 
 
+def _weekdays_ko(days: Any) -> str:
+    """`days` → 사람 말 요일(`평일`·`매일`·`월·수`). 리스트가 아니거나 비면 빈 문자열. 순수.
+
+    두 표시 경로(`pending_checks_summary`·`notify_title`)의 **단일 소스**다 — 한쪽만 "평일",
+    다른 쪽만 "월·화·수·목·금"으로 갈리면 같은 항목이 카드마다 다르게 보인다.
+    5일·7일을 묶는 이유는 길이다: "월·화·수·목·금 08:50~09:00"은 제목에서 시각을 밀어낸다.
+    """
+    if not isinstance(days, list) or not days:
+        return ""
+    keys = [str(d) for d in days]
+    if set(keys) == set(_WEEKDAYS):
+        return "매일"
+    if set(keys) == set(_WEEKDAYS[:5]):
+        return "평일"
+    return "·".join(_WEEKDAYS_KO.get(k, k) for k in keys)
+
+
 def pending_checks_summary(items: list[dict[str, Any]]) -> str:
     """아직 졸업 안 한 **시각 항목**(`on != "session"`) 요약 줄. 0건이면 빈 문자열. 순수.
 
@@ -651,12 +668,8 @@ def pending_checks_summary(items: list[dict[str, Any]]) -> str:
             continue
         if it.get("on") == "session":
             continue
-        days = it.get("days")
-        when = (
-            "·".join(_WEEKDAYS_KO.get(str(d), str(d)) for d in days)
-            if isinstance(days, list) and days
-            else "매일"
-        )
+        # days 없음/깨짐 = 요일 제한이 없다 = 매일(여기선 빈 칸으로 두면 줄이 읽히지 않는다).
+        when = _weekdays_ko(it.get("days")) or "매일"
         lines.append(f"• `{item_id}` {it.get('label', '')} — {when} {_notify_window(it)}".rstrip())
     return "\n".join(lines)
 
@@ -682,18 +695,26 @@ def _notify_window(it: dict[str, Any]) -> str:
 
 
 def notify_title(it: dict[str, Any]) -> str:
-    """알림 카드 제목(`⏰ label[ PC활성화 시간 08:50~09:00 ]`). 순수(부작용 없음).
+    """알림 카드 제목(`⏰ label[ PC활성화 시간 평일 08:50~09:00 ]`). 순수(부작용 없음).
 
     시각 항목은 그 창에 브리지가 떠 있을 때만 발화하고, 브리지는 관리자 PC 가 켜져 있는 동안만
     돈다 — 꺼져 있으면 조용히 다음 주로 밀린다(`ti-mon-nightfut` 이 2026-08-03 을 그렇게 날렸다).
     그래서 "언제 PC 를 켜야 이 알람을 받는가"를 제목에서 바로 보이게 한다.
+
+    **요일을 시각 앞에 붙인다**(2026-08-11): 시각만 적혀 있으니 관리자가 "매일 오는 거냐"고
+    물었다 — 주 1회 항목과 평일 항목이 제목에서 구분되지 않았다. 표기는 `_weekdays_ko` 로
+    `pending_checks_summary` 와 공유한다. `days` 가 없거나 깨졌으면 요일 부분은 생략한다
+    (그 항목은 실제로 매일 후보라 시각만으로 오해가 없다).
 
     붙이는 판정은 **`at` 키 존재 여부**로 한다(`_notify_window` 반환값이 아니라):
     `on:"session"` 항목은 `at` 이 없다 = 브리지를 켜면 그날 한 번 오는 것이라 시각으로 답할 수
     없으니 안 붙이고, 깨진 `at` 은 창을 모른다는 사실이 드러나야 하니 "시각 미정"으로 붙인다.
     """
     title = f"{LEAD_NOTIFY} {it.get('label', '')}".rstrip()
-    return f"{title}[ PC활성화 시간 {_notify_window(it)} ]" if "at" in it else title
+    if "at" not in it:
+        return title
+    when = f"{_weekdays_ko(it.get('days'))} {_notify_window(it)}".lstrip()
+    return f"{title}[ PC활성화 시간 {when} ]"
 
 
 def due_snoozes(snooze: dict[str, str], now_kst: datetime) -> list[str]:

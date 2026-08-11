@@ -2525,11 +2525,29 @@ _PENDING = {"id": bridge.PENDING_CHECKS_NOTIFY_ID, "on": "session", "label": "�
 def test_notify_title_shows_pc_window_for_timed_items():
     # 그 창에 PC 가 켜져 있어야만 발화한다 — 언제 켜야 하는지가 제목에서 바로 보여야 한다.
     assert bridge.notify_title(_item(label="장전 기준가", at="08:50", grace_min=10)) == (
-        "⏰ 장전 기준가[ PC활성화 시간 08:50~09:00 ]"
+        "⏰ 장전 기준가[ PC활성화 시간 수 08:50~09:00 ]"
     )
     # 깨진 at 도 표기 대상 — "창을 모른다"는 사실이 드러나야 한다.
-    assert bridge.notify_title(_item(at="oops")) == "⏰ L[ PC활성화 시간 시각 미정 ]"
-    assert bridge.notify_title(_item(label="")) == "⏰[ PC활성화 시간 09:00~09:30 ]"
+    assert bridge.notify_title(_item(at="oops")) == "⏰ L[ PC활성화 시간 수 시각 미정 ]"
+    assert bridge.notify_title(_item(label="")) == "⏰[ PC활성화 시간 수 09:00~09:30 ]"
+
+
+def test_notify_title_abbreviates_weekdays():
+    # 시각만 적혀 있으면 주 1회 항목이 "매일 오는 것"으로 읽힌다(운영자가 실제로 그렇게 물었다).
+    # 5일·7일은 묶는다 — "월·화·수·목·금 08:50~09:00"은 제목에서 시각을 밀어낸다.
+    weekdays = ["mon", "tue", "wed", "thu", "fri"]
+    assert bridge.notify_title(_item(days=weekdays, at="08:50", grace_min=10)) == (
+        "⏰ L[ PC활성화 시간 평일 08:50~09:00 ]"
+    )
+    assert bridge.notify_title(_item(days=[*weekdays, "sat", "sun"])) == (
+        "⏰ L[ PC활성화 시간 매일 09:00~09:30 ]"
+    )
+    assert bridge.notify_title(_item(days=["mon", "wed"])) == (
+        "⏰ L[ PC활성화 시간 월·수 09:00~09:30 ]"
+    )
+    # days 없음/깨짐 = 요일 부분 생략(시각만) — 창은 아는데 요일을 모르는 상태를 지어내지 않는다.
+    assert bridge.notify_title(_item(days=None)) == "⏰ L[ PC활성화 시간 09:00~09:30 ]"
+    assert bridge.notify_title(_item(days=[])) == "⏰ L[ PC활성화 시간 09:00~09:30 ]"
 
 
 def test_notify_title_omits_window_for_session_items():
@@ -2542,13 +2560,17 @@ def test_dispatch_card_title_carries_pc_window(notify_env, monkeypatch):
     _freeze_now(monkeypatch, _WED_0910)
     bridge.dispatch_notifications(notify_env, [_item(id="a", label="장전 기준가", at="09:00")])
     _c, text, _b = notify_env.sent[0]
-    assert text.splitlines()[0] == "⏰ 장전 기준가[ PC활성화 시간 09:00~09:30 ]"
+    assert text.splitlines()[0] == "⏰ 장전 기준가[ PC활성화 시간 수 09:00~09:30 ]"
 
 
 def test_pending_checks_summary_lists_time_items():
     got = bridge.pending_checks_summary([_item(id="a", label="장전 기준가"), _PENDING])
     assert "`a`" in got and "장전 기준가" in got
     assert "수" in got and "09:00~09:30" in got  # 요일 + at~at+grace_min
+    # 요일 표기는 notify_title 과 같은 헬퍼를 쓴다 — 한쪽만 "평일", 다른 쪽만 "월·화·수·목·금"
+    # 으로 갈리면 같은 항목이 카드마다 다르게 보인다.
+    weekdays = ["mon", "tue", "wed", "thu", "fri"]
+    assert "평일 09:00~09:30" in bridge.pending_checks_summary([_item(id="a", days=weekdays)])
 
 
 def test_pending_checks_summary_excludes_self_and_session_items():
@@ -6552,7 +6574,10 @@ _needs_real_schedules = pytest.mark.skipif(
 # 덜 자주 오고 브리지가 떠 있어야만 발화하는 쪽을 남겨둘 이유가 없다. 2→1.
 # 값은 배포본 실물과 대조해 적는다.
 _REAL_BASELINE = {
-    "ti-premarket-baseline": (["wed"], "08:50", 10),
+    # 수 1회 → 평일 매일(2026-08-11 운영자 지시): 창이 08:50~09:00 로 좁아 그날 PC 를 못 켜면
+    # 한 주가 통째로 날아갔다(`ti-mon-nightfut` 이 8/3 을 그렇게 놓친 전례). 결함은 아무 평일에나
+    # 같은 방식으로 드러난다. 주말은 장이 없어 제외 — 그날 오는 카드는 소음이다.
+    "ti-premarket-baseline": (["mon", "tue", "wed", "thu", "fri"], "08:50", 10),
 }
 # 핑 값이 무엇이든 시각 알림 판정은 불변이어야 한다(없음·오늘·과거·미래·깨진 문자열).
 _PINGS = (None, "2026-07-15", "2026-07-14", "2026-07-16", "oops", "")
@@ -6585,6 +6610,9 @@ def test_real_schedules_baseline_fields_unchanged():
         # 그 항목은 2026-08-11 졸업했지만 **화요일로 둔다** — 원래 감시하던 ti-us-open 이 "평일"
         # 22:30 이라 어느 평일에 재도 감시력이 같고, 수요일은 이 프로젝트가 넓은 창 항목을 습관적
         # 으로 놓는 자리라(수: ti-premarket-baseline·etf-antc-missing) 되돌리면 또 덮인다.
+        # 같은 날 ti-premarket-baseline 이 평일 매일로 넓어졌지만 이 줄에는 영향이 없다 —
+        # 그 창은 08:50~09:00 로 좁아 어느 평일에 재든 22:45 와 겹치지 않는다(요일이 아니라
+        # **창 폭**이 문제였다). 넓은 창 항목이 새로 들어오면 그때 다시 이 줄을 볼 것.
         (datetime(2026, 7, 14, 22, 45, tzinfo=_KST), []),  # 화 22:30~23:00
         # 토 00:00 대 창도 비었다 — ti-sat-nightfut 이 2026-08-01 졸업(라이브 관측 통과)하며 빠졌다.
         # 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
@@ -6596,9 +6624,14 @@ def test_real_schedules_baseline_fields_unchanged():
         # 월 00:00 대 창도 비었다 — ti-mon-nightfut 이 2026-08-08 졸업(회귀 테스트가 대신 지킨다)
         # 하며 빠졌다. 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
         (datetime(2026, 7, 20, 0, 10, tzinfo=_KST), []),
-        # ti-premarket-baseline: 수 08:50 [08:50, 09:00] — 창 안 / 창 밖 1분
+        # ti-premarket-baseline: 평일 08:50 [08:50, 09:00] — 창 안 / 창 밖 1분
         (datetime(2026, 7, 15, 8, 55, tzinfo=_KST), ["ti-premarket-baseline"]),
         (datetime(2026, 7, 15, 9, 1, tzinfo=_KST), []),
+        # 2026-08-11 평일화 — 수요일 말고 다른 평일에도 나온다(주 1회면 그날 PC 를 못 켤 때
+        # 한 주가 통째로 날아간다). 월요일 1건으로 "수요일 전용이 아니다"를 고정한다.
+        (datetime(2026, 7, 20, 8, 55, tzinfo=_KST), ["ti-premarket-baseline"]),
+        # 주말은 장이 없어 이 검증이 무의미하다 — 토요일 같은 시각에 오면 그게 소음이다.
+        (datetime(2026, 7, 18, 8, 55, tzinfo=_KST), []),
         # 월 09:30 대 창도 비었다 — etf-mon-0830 이 2026-08-10 졸업(라이브 관측 통과)하며 빠졌다.
         # 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
         (datetime(2026, 7, 20, 10, 0, tzinfo=_KST), []),

@@ -1947,7 +1947,10 @@ def _allowed_tools_argv(cmd):
 
 def test_run_claude_trading_info_adds_narrowed_test_runners(monkeypatch, tmp_path):
     cap = _capture_argv(monkeypatch)
-    run_claude("claude", str(tmp_path / "trading_info"), "task", timeout=30)
+    # 폴더명은 **실제와 같은 하이픈**이라야 한다. 2026-08-12 까지 이 줄이 `trading_info`(옛 이름)
+    # 라서, 키가 개명을 안 따라간 것을 이 테스트가 초록으로 덮고 있었다 — 실제로는 한 번도
+    # 매칭되지 않는 죽은 설정이었다. 언더스코어로 되돌리면 같은 사각이 다시 생긴다.
+    run_claude("claude", str(tmp_path / "trading-info"), "task", timeout=30)
     tools = _allowed_tools_argv(cap["cmd"])
     # 좁힌 테스트 명령 prefix 만 들어간다(인자는 prefix 매칭이 자동 커버).
     assert "Bash(php artisan test:*)" in tools
@@ -2026,15 +2029,17 @@ def _argv_case(label):
                 *bridge.ALLOWED_TOOLS,
             ],
         ),
+        # 폴더명은 **실제와 같은 하이픈**이라야 한다 — 언더스코어로 두면 조회가 영영 안 맞는
+        # 죽은 설정을 테스트가 초록으로 덮는다(2026-08-12 실사고).
         "full_extra": (
-            "trading_info",
+            "trading-info",
             {},
             [
                 bridge.BRIDGE_SYSTEM_PROMPT,
                 "--strict-mcp-config",
                 "--allowedTools",
                 *bridge.ALLOWED_TOOLS,
-                *bridge.PROJECT_EXTRA_TOOLS["trading_info"],
+                *bridge.PROJECT_EXTRA_TOOLS["trading-info"],
             ],
         ),
         "notify": (
@@ -2854,6 +2859,7 @@ def test_button_nb_ok_without_snooze_no_save(notify_env, monkeypatch, tmp_path):
 
 
 def test_button_nb_later_snoozes_and_saves(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [])  # 확인가능 창 조회가 실 파일을 타지 않게
     _freeze_now(monkeypatch, _WED_0910)  # 09:10 → +30분 = 09:40
     _fire(notify_env, _btn(777, "nb:later", "a"), repo_root=tmp_path, target_root=str(tmp_path))
     assert bridge.notify_snooze["a"].startswith("2026-07-15T09:40")
@@ -3228,6 +3234,38 @@ def test_button_nb_recheck_behaves_like_nb_ok(notify_env, monkeypatch, tmp_path)
     assert runs == [1] and "확인가능 시간이 아닙니다" in notify_env.sent[-1][1]
 
 
+def test_button_nb_later_refuses_snooze_past_check_window(notify_env, monkeypatch, tmp_path):
+    # 무한 반복 차단: 창(08:30~09:00)이 정확히 30분이라 창 안에서 누른 나중에는 재발송이 **항상**
+    # 창 밖(⛔ 확인가능 시간 아님)에 떨어진다 → 또 나중에 → 반복. 스누즈를 걸지 않고 끝낸다.
+    _checkable_env(monkeypatch, tmp_path)
+    _freeze_now(monkeypatch, _at(8, 45))  # +30분 = 09:15 > 09:00
+    _fire(notify_env, _btn(777, "nb:later", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert bridge.notify_snooze == {} and notify_env.saves == []
+    assert "확인가능 시간(08:30~09:00) 밖이라 다시 알리지 않습니다" in notify_env.sent[-1][1]
+    # ⚠️ 안내는 별도 메시지 — 08:45 이면 창은 09:00 까지 남아 있다. 카드를 갈아끼우면 그 남은
+    # 창에서 [✅ 확인시작]을 누를 버튼까지 사라진다(nb:ok 창 게이트와 같은 함정).
+    assert notify_env.edited == []
+
+
+def test_button_nb_later_snoozes_when_resend_lands_in_window(notify_env, monkeypatch, tmp_path):
+    # 창 안에 떨어지면 종전대로 스누즈한다(과잉 차단 금지) — 08:25 + 30분 = 08:55.
+    _checkable_env(monkeypatch, tmp_path)
+    _freeze_now(monkeypatch, _at(8, 25))
+    _fire(notify_env, _btn(777, "nb:later", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert bridge.notify_snooze["a"].startswith("2026-08-11T08:55")
+    assert len(notify_env.saves) == 1
+    assert notify_env.edited[-1][2].startswith("⏰")
+
+
+def test_button_nb_later_without_check_window_snoozes_as_before(notify_env, monkeypatch, tmp_path):
+    # check_from/check_to 없는 항목은 _check_range 가 None → 시각 무관 스누즈(무회귀).
+    _write_schedules(monkeypatch, tmp_path, [{"id": "a", "label": "무창"}])
+    _freeze_now(monkeypatch, _at(23, 50))  # 자정 걸침도 창이 없으면 그대로 스누즈
+    _fire(notify_env, _btn(777, "nb:later", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert bridge.notify_snooze["a"].startswith("2026-08-12T00:20")
+    assert len(notify_env.saves) == 1
+
+
 # ── nb:handoff / nb:confirm: 작업일지 기록 + 지정 경로 커밋 ──
 @pytest.fixture
 def record_env(notify_env, monkeypatch, tmp_path):
@@ -3310,22 +3348,44 @@ def test_button_nb_confirm_refuses_expired_observation(record_env, monkeypatch, 
     assert adapter.edited[-1][3] == bridge.notify_buttons("a")
 
 
-def test_button_nb_handoff_ignores_expired_reason(record_env, monkeypatch, tmp_path):
-    # 만료된 사유는 쓰지 않는다(어제 진단이 오늘 이관 줄에 붙지 않게) — 이관 자체는 진행.
-    adapter, nb, _commits = record_env
+def test_button_nb_handoff_refuses_expired_observation(record_env, monkeypatch, tmp_path):
+    # 만료된 관측으로는 이관하지 않는다 — 종전엔 사유만 버리고 기록을 진행해, 진단이 통째로
+    # 유실된 줄을 커밋해 놓고 `기록했습니다 · 커밋됨`(= 거짓 성공 보고)이라 회신했다.
+    adapter, nb, commits = record_env
     _checkable_env(monkeypatch, tmp_path)
     _freeze_now(monkeypatch, _at(10, 0, day=12))
-    _seed_verdict("a", "fail", "어제 사유", when=_at(8, 45, day=12))
+    _seed_verdict("a", "fail", "어제 사유", when=_at(8, 45, day=12))  # 75분 전(TTL 30분)
     _fire(adapter, _btn(777, "nb:handoff", "a"), repo_root=tmp_path, target_root=str(tmp_path))
-    assert nb.read_text(encoding="utf-8").splitlines()[3] == (
-        "- ⏸ **이관(2026-08-12)** — 「장전 기준가 3경로 일치」 예약 점검 실패."
-    )
+    assert adapter.edited[-1][2] == "카드가 만료됐습니다 — 다시 확인해 주세요."
+    assert nb.read_text(encoding="utf-8") == _BOOT_MD  # 미변경
+    assert commits == []
+    assert adapter.edited[-1][3] == bridge.notify_buttons("a")  # 막다른 길 방지
+
+
+def test_button_nb_handoff_refuses_without_fail_observation(record_env, monkeypatch, tmp_path):
+    # 옛 실패 카드로 스크롤해 눌러도 안 된다: 08:35 실패 → 08:50 재확인 통과 뒤 그 카드를 누르면
+    # 종전엔 `예약 점검 실패. 진단: <통과 사유>` 라는 **판정과 사유가 어긋난 줄**이 커밋됐다.
+    adapter, nb, commits = record_env
+    _checkable_env(monkeypatch, tmp_path)
+    _freeze_now(monkeypatch, _at(8, 50))
+    _seed_verdict("a", "pass", "3경로 기준가 일치 확인", when=_at(8, 50))
+    _fire(adapter, _btn(777, "nb:handoff", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert "실패 관측 기록이 없습니다" in adapter.edited[-1][2]
+    assert nb.read_text(encoding="utf-8") == _BOOT_MD
+    assert commits == []
+    assert adapter.edited[-1][3] == bridge.notify_buttons("a")
+    # 관측 기록 자체가 없는 경우(브리지 재기동)도 같은 거부.
+    bridge.notify_verdict.clear()
+    _fire(adapter, _btn(777, "nb:handoff", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert "실패 관측 기록이 없습니다" in adapter.edited[-1][2]
+    assert commits == []
 
 
 def test_button_nb_handoff_without_boot_block_skips(record_env, monkeypatch, tmp_path):
     adapter, nb, commits = record_env
     nb.write_text("# 제목만 있고 세션부팅 블록이 없다\n", encoding="utf-8")
     _checkable_env(monkeypatch, tmp_path)
+    _seed_verdict("a", "fail", "1d 밀림")
     _fire(adapter, _btn(777, "nb:handoff", "a"), repo_root=tmp_path, target_root=str(tmp_path))
     assert nb.read_text(encoding="utf-8") == "# 제목만 있고 세션부팅 블록이 없다\n"  # 미변경
     assert commits == []  # 기록 못 했으면 커밋도 없다
@@ -3336,6 +3396,7 @@ def test_button_nb_handoff_missing_notebook_skips(record_env, monkeypatch, tmp_p
     adapter, nb, commits = record_env
     nb.unlink()
     _checkable_env(monkeypatch, tmp_path)
+    _seed_verdict("a", "fail", "1d 밀림")
     _fire(adapter, _btn(777, "nb:handoff", "a"), repo_root=tmp_path, target_root=str(tmp_path))
     assert not nb.exists()  # 파일을 새로 만들지 않는다
     assert commits == []
@@ -3492,12 +3553,23 @@ def test_build_notify_check_prompt_injects_rest_data_with_guard():
     assert "수정·커밋은 하지 마라" in p
 
 
+def test_build_notify_check_prompt_strips_control_chars_from_note():
+    # note 는 사람이 손으로 붙여넣는 필드 — 다른 외부 텍스트 경로와 같은 잣대로 제어문자를 턴다.
+    p = bridge.build_notify_check_prompt("개장", "등락률\x1b[31m확인​\x00")
+    assert "등락률확인" in p and "\x1b" not in p and "\x00" not in p
+    # 개행은 살린다(여러 줄 note 가 뭉개지면 확인 내용을 못 읽는다) — strip_control_line 이 아니다.
+    assert "1줄\n2줄" in bridge.build_notify_check_prompt("개장", "1줄\n2줄")
+
+
 def test_notify_check_tools_has_no_network_tool():
     # ADR-003 불변식: 예약 점검 도구셋에 curl/네트워크·변경 도구 없음(방식 B — 브리지가 선조회).
     for t in bridge.NOTIFY_CHECK_TOOLS:
         assert "curl" not in t and "://" not in t
     assert "Edit" not in bridge.NOTIFY_CHECK_TOOLS
     assert "Write" not in bridge.NOTIFY_CHECK_TOOLS
+    # Bash 는 0개 — 접두 글롭의 `*` 가 문자열 끝까지 먹어 `git status --porcelain > victim.txt`·
+    # `… && whoami` 가 승인창 없이 실행됐다(2026-08-12 실측). 한 항목이라도 남기면 그게 셸이다.
+    assert not any(t.startswith("Bash") for t in bridge.NOTIFY_CHECK_TOOLS)
 
 
 def test_fetch_rest_probe_rejects_non_api_path(monkeypatch):

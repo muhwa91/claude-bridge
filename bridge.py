@@ -278,8 +278,9 @@ ALLOWED_TOOLS = [
 #   아니라 **문자열 끝까지** 먹어서 리다이렉션·`;`·`&&`·`|` 체이닝이 그대로 붙는다. 즉
 #   "안전한 조회 명령 하나만 허용"은 접두 매칭으로 표현할 수 없는 요구라, 한 항목이라도 남기면
 #   그 항목이 곧 셸이다(DIGEST_TOOLS 주석과 같은 잣대 — 그쪽도 같은 이유로 0개).
-#   기능 손실은 없다: 현행 유일 항목(`ti-premarket-baseline`)은 **probe 응답 판정**이 전부고
-#   `build_notify_check_prompt` 는 `git status` 를 요구하지 않는다. 나중에 코드 검증·상태 조회가
+#   기능 손실은 없다: 2026-08-12 `ti-premarket-baseline` 졸업 이후 **배포본에 시각 알림이 0건**이고,
+#   그 마지막 항목도 **probe 응답 판정**이 전부였다. `build_notify_check_prompt` 는 `git status` 를
+#   요구하지 않는다. 나중에 코드 검증·상태 조회가
 #   필요해지면 이 목록을 넓히지 말고 **방식 B**(브리지가 ruff·pytest·git 을 직접 돌려 출력을
 #   프롬프트에 텍스트 주입)로 간다.
 NOTIFY_CHECK_TOOLS = [
@@ -4575,11 +4576,16 @@ def _handle_notify_record(
     committed = _git_commit_paths(
         repo_root, paths, f"chore(bridge): 예약 알림 확인완료 — {item_id}"
     )
+    # 항목별 불릿(관리자 지시 2026-08-12) — 종전엔 삭제·커밋을 ` · ` 로 한 줄에 붙이고
+    # 원격 안내만 `-#`(디스코드 소문자 subtext)로 뺐다. 결과가 3가지(삭제·커밋·원격)인데
+    # 표기가 셋 다 달라 한눈에 안 들어왔다. 같은 층위면 같은 모양으로 쓴다.
     lines = ["☑️ 확인완료", f"「{label}」"]
-    lines.append(_record_note(True, committed, f"알림 목록 삭제완료 ({before}→{after}건)"))
+    lines.append(f"- 알림 목록 삭제완료 ({before}→{after}건)")
+    # 커밋 실패는 계속 숨기지 않는다(수동 확인이 필요한 상태다) — 불릿만 바뀌었다.
+    lines.append("- 커밋완료" if committed else "- 커밋 실패 — 수동 확인 필요")
     if not recorded:
         lines.append(_SKIP_NOTE)
-    lines.append("-# 원격 반영은 세션에서 푸시할 때 함께")
+    lines.append("- 세션 푸시 시 원격 반영")
     return ("\n".join(lines), None)
 
 
@@ -4725,8 +4731,8 @@ def _handle_button(
                 adapter.send(channel_id, confirm)
     elif action == "nb:later":
         # 스누즈: 30분 뒤 1회 재발송. dispatch_notifications 가 due_snoozes 로 재발송.
-        # ⚠️ **확인가능 창을 넘길 스누즈는 걸지 않는다**: +30분 고정인데 `ti-premarket-baseline` 의
-        # 창은 08:30~09:00(정확히 30분)이라, 창 안에서 누른 나중에는 재발송이 **항상** 창 밖에
+        # ⚠️ **확인가능 창을 넘길 스누즈는 걸지 않는다**: +30분 고정인데 `ti-premarket-baseline`(2026-08-12
+        # 졸업)의 창은 08:30~09:00(정확히 30분)이었다. 창 안에서 누른 나중에는 재발송이 **항상** 창 밖에
         # 떨어졌다 → `⛔ 지금은 확인가능 시간이 아닙니다` → 또 나중에 → 무한 반복. 그럴 땐
         # 스누즈를 걸지 않고 안내만 한다(예약 자체는 내일 다시 발화한다).
         # `check_from`/`check_to` 가 없으면 `_check_range` 가 None → 종전 동작 그대로(무회귀).

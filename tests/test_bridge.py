@@ -3439,8 +3439,9 @@ def test_button_nb_confirm_graduates_records_and_commits(record_env, monkeypatch
     # ⑤ 회신
     assert adapter.edited[0][2] == (
         "☑️ 확인완료\n「장전 기준가 3경로 일치」\n"
-        "알림 목록 삭제완료 (2→1건) · 커밋됨\n"
-        "-# 원격 반영은 세션에서 푸시할 때 함께"
+        "- 알림 목록 삭제완료 (2→1건)\n"
+        "- 커밋완료\n"
+        "- 세션 푸시 시 원격 반영"
     )
     assert adapter.edited[0][3] is None  # 버튼 없음
 
@@ -7272,16 +7273,14 @@ _needs_real_schedules = pytest.mark.skipif(
 # (예약점검 티어에 Bash 가 없어 자동 판정 불가), 같은 로그 판정을 GitHub Actions 워크플로
 # (`etf_morning_watch.yml` + `check_morning_send.py`)가 **평일 매일 · PC 가 꺼져 있어도** 하게 됐다.
 # 덜 자주 오고 브리지가 떠 있어야만 발화하는 쪽을 남겨둘 이유가 없다. 2→1.
+# `ti-premarket-baseline`(평일 07:50/70)은 2026-08-12 졸업 — 라이브 관측 통과(장전 기준가가
+# 3경로에서 일치)로 목적을 다했고 notify.json 에서 빠졌다(커밋 cf27626). 1→0.
 # 값은 배포본 실물과 대조해 적는다.
-_REAL_BASELINE = {
-    # 수 1회 → 평일 매일(2026-08-11 운영자 지시): 창이 08:50~09:00 로 좁아 그날 PC 를 못 켜면
-    # 한 주가 통째로 날아갔다(`ti-mon-nightfut` 이 8/3 을 그렇게 놓친 전례). 결함은 아무 평일에나
-    # 같은 방식으로 드러난다. 주말은 장이 없어 제외 — 그날 오는 카드는 소음이다.
-    # 08:50/10 → 07:50/70 (같은 날 2차 지시): 카드가 08:50 에 오면 09:00 개장까지 10분 안에
-    # 확인시작을 누르고 결과까지 봐야 해 PC 를 켜놓고 있어도 빠듯했다. **앞으로만** 1시간 늘린다 —
-    # 끝 09:00 은 고정이다(개장하면 관측 대상이 사라져 뒤로는 못 늘린다).
-    "ti-premarket-baseline": (["mon", "tue", "wed", "thu", "fri"], "07:50", 70),
-}
+# ⚠️ **지금은 비어 있다** — 배포본에 시각 알림이 한 건도 없고 세션 항목만 남았다. 그래서 이
+# 딕셔너리를 도는 대조는 공회전이고, 그 자리를 아래 "시각 항목이 하나도 없다" 단언이 대신 지킨다
+# (빈 창 트립와이어와 같은 취지의 파일 단위판). 시각 알림이 다시 들어오면 그 항목을 여기 적으면
+# 되고, 그 순간 대조 루프와 아래 respect_fired 가 자동으로 되살아난다.
+_REAL_BASELINE: dict[str, tuple[list[str], str, int]] = {}
 # 핑 값이 무엇이든 시각 알림 판정은 불변이어야 한다(없음·오늘·과거·미래·깨진 문자열).
 _PINGS = (None, "2026-07-15", "2026-07-14", "2026-07-16", "oops", "")
 # 세션 항목(다이제스트 2건 + pending-checks) — 시각 판정 테스트에서 걸러낸다. DIGEST_RUNNERS 로
@@ -7299,6 +7298,10 @@ def test_real_schedules_baseline_fields_unchanged():
         it = by_id[item_id]
         assert (it["days"], it["at"], it["grace_min"]) == (days, at, grace)
         assert "on" not in it  # 기존 항목엔 세션 분기 필드가 붙지 않았다
+    # 베이스라인이 빈 동안에도 이 테스트가 공회전하지 않게 — 배포본에 시각 알림이 **한 건도
+    # 없다**는 현재 사실을 못 박는다(시각 항목 = on 이 없는 항목). 새 시각 알림이 베이스라인
+    # 등재 없이 조용히 들어오면 여기서 빨간불이고, 그때 위 딕셔너리에 값을 적으면 된다.
+    assert {it["id"] for it in _REAL_ITEMS} - _REAL_SESSION_IDS == set(_REAL_BASELINE)
 
 
 @_needs_real_schedules
@@ -7313,9 +7316,9 @@ def test_real_schedules_baseline_fields_unchanged():
         # 그 항목은 2026-08-11 졸업했지만 **화요일로 둔다** — 원래 감시하던 ti-us-open 이 "평일"
         # 22:30 이라 어느 평일에 재도 감시력이 같고, 수요일은 이 프로젝트가 넓은 창 항목을 습관적
         # 으로 놓는 자리라(수: ti-premarket-baseline·etf-antc-missing) 되돌리면 또 덮인다.
-        # 같은 날 ti-premarket-baseline 이 평일 매일 + 07:50~09:00 으로 넓어졌지만 이 줄에는
-        # 영향이 없다 — 아침 창이라 어느 평일에 재든 22:45 와 겹치지 않는다(요일이 아니라
-        # **창 폭**이 문제였다). 넓은 창 항목이 새로 들어오면 그때 다시 이 줄을 볼 것.
+        # (같은 날 평일 매일 + 07:50~09:00 으로 넓어졌던 ti-premarket-baseline 도 이 줄과는
+        # 무관했다 — 아침 창이라 어느 평일에 재든 22:45 와 겹치지 않는다. 요일이 아니라
+        # **창 폭**이 문제였다.) 넓은 창 항목이 새로 들어오면 그때 다시 이 줄을 볼 것.
         (datetime(2026, 7, 14, 22, 45, tzinfo=_KST), []),  # 화 22:30~23:00
         # 토 00:00 대 창도 비었다 — ti-sat-nightfut 이 2026-08-01 졸업(라이브 관측 통과)하며 빠졌다.
         # 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
@@ -7323,24 +7326,21 @@ def test_real_schedules_baseline_fields_unchanged():
         # 토 06:00 대 창도 비었다 — ti-weekend-nq-off 이 2026-08-01 졸업(라이브 관측 통과)하며
         # 빠졌다. 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
         (datetime(2026, 7, 18, 6, 15, tzinfo=_KST), []),
-        # 월요일 06:00 대에도 없다. ⚠️ 이 줄이 ti-premarket-baseline 창의 **가장 가까운 이웃**이다
-        # (07:50 시작까지 95분) — 시작 시각을 더 앞당기면 여기부터 덮인다(2026-08-10 사고 유형).
+        # 월요일 06:00 대에도 없다. 종전엔 "ti-premarket-baseline(평일 07:50) 창의 가장 가까운
+        # 이웃"이라 남긴 줄이었으나 그 항목이 2026-08-12 졸업해 **이제 이웃이 없다**. 그대로
+        # 남기는 이유는 위 토요일 06:15 줄과 같다 — 월요일 이른 아침 창에 새 항목이 조용히
+        # 들어오면 빨간불(주중 첫날 새벽은 이 프로젝트가 야간선물 항목을 놓던 자리다).
         (datetime(2026, 7, 20, 6, 15, tzinfo=_KST), []),
         # 월 00:00 대 창도 비었다 — ti-mon-nightfut 이 2026-08-08 졸업(회귀 테스트가 대신 지킨다)
         # 하며 빠졌다. 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
         (datetime(2026, 7, 20, 0, 10, tzinfo=_KST), []),
-        # ti-premarket-baseline: 평일 07:50 [07:50, 09:00] — 양끝 1분 밖 / 양끝 / 창 안.
-        # 끝 09:00 은 **개장 시각**이라 의미가 있다(그 뒤엔 관측 대상이 사라진다) — 09:01 이
-        # 초록이면 창이 개장 뒤로 새어 카드가 판정 불가 시간대에 살아 있다는 뜻이다.
-        (datetime(2026, 7, 15, 7, 49, tzinfo=_KST), []),
-        (datetime(2026, 7, 15, 7, 50, tzinfo=_KST), ["ti-premarket-baseline"]),
-        (datetime(2026, 7, 15, 8, 55, tzinfo=_KST), ["ti-premarket-baseline"]),
-        (datetime(2026, 7, 15, 9, 0, tzinfo=_KST), ["ti-premarket-baseline"]),
-        (datetime(2026, 7, 15, 9, 1, tzinfo=_KST), []),
-        # 2026-08-11 평일화 — 수요일 말고 다른 평일에도 나온다(주 1회면 그날 PC 를 못 켤 때
-        # 한 주가 통째로 날아간다). 월요일 1건으로 "수요일 전용이 아니다"를 고정한다.
-        (datetime(2026, 7, 20, 8, 55, tzinfo=_KST), ["ti-premarket-baseline"]),
-        # 주말은 장이 없어 이 검증이 무의미하다 — 토요일 같은 시각에 오면 그게 소음이다.
+        # 평일 아침 07:50~09:00 창도 비었다 — ti-premarket-baseline 이 2026-08-12 졸업(라이브
+        # 관측 통과: 장전 기준가가 3경로에서 일치)하며 빠졌다. 같은 이유로 남긴다: 이 창에
+        # 새 항목이 조용히 들어오면 빨간불. 창 양끝(07:50·09:00)과 그 1분 밖을 재던 경계
+        # 케이스는 잴 대상이 사라져 지웠고, 창 한가운데 1건만 트립와이어로 남긴다.
+        (datetime(2026, 7, 15, 8, 55, tzinfo=_KST), []),
+        # 토요일 같은 시각도 비어 있어야 한다. 아침 창은 "평일만"이 규칙이었고(주말은 장이 없어
+        # 그날 오는 카드가 곧 소음), 새 아침 항목이 주말까지 새면 여기서 먼저 걸린다.
         (datetime(2026, 7, 18, 8, 55, tzinfo=_KST), []),
         # 월 09:30 대 창도 비었다 — etf-mon-0830 이 2026-08-10 졸업(라이브 관측 통과)하며 빠졌다.
         # 같은 이유로 남긴다: 이 창에 새 항목이 조용히 들어오면 빨간불.
@@ -7360,6 +7360,12 @@ def test_real_schedules_time_alerts_unaffected_by_session_ping(moment, expected)
 
 
 @_needs_real_schedules
+# 배포본에 시각 알림이 한 건도 없으면(2026-08-12 ti-premarket-baseline 졸업으로 현재 상태)
+# 실물로 잴 대상이 없다 → 그때만 skip. **단언을 무르는 게 아니다** — 같은 계약을 합성 항목으로
+# 잠근 test_due_notifications_dedup_by_fired 가 상시 돌고, 여기 시각 항목이 하나라도 돌아오면
+# _REAL_BASELINE 등재와 동시에 이 테스트가 저절로 되살아난다(등재를 빼먹으면 위
+# baseline_fields_unchanged 가 빨간불).
+@pytest.mark.skipif(not _REAL_BASELINE, reason="배포본에 시각 알림 없음 — 세션 항목만 남았다")
 def test_real_schedules_time_alerts_respect_fired():
     # 무회귀: fired 중복차단도 종전 그대로(핑이 있어도 시각 항목은 재발송 안 됨).
     # 기준 항목을 하드코딩하지 않고 _REAL_BASELINE 첫 항목에서 **유도**한다 — 졸업 때마다

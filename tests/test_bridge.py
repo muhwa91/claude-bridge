@@ -1720,7 +1720,8 @@ def test_guest_channel_web_only_and_isolated_cwd(monkeypatch):
     assert builtin_only is True
     assert task == "리액트란"
     assert proj == str(bridge.GUEST_SANDBOX_DIR)
-    assert "chiikawa_dev" not in proj  # 워크스페이스(레포) 밖 — CLAUDE.md 상위 로드 차단
+    # 워크스페이스(레포) 밖 — CLAUDE.md 상위 로드 차단. 경로 관계로 판정(레포명 리터럴 금지).
+    assert not Path(proj).resolve().is_relative_to(bridge.REPO_ROOT.resolve())
     # L-1: 게스트 전용 최소 프롬프트 — 내부 명칭 미포함(인젝션 노출 차단).
     assert sysprompt == bridge.GUEST_SYSTEM_PROMPT
     assert (
@@ -2076,7 +2077,7 @@ def _argv_case(label):
             ],
         ),
         "digest": (
-            "chiikawa_dev",
+            "digest_sandbox",
             {"allowed_tools": bridge.DIGEST_TOOLS, "system_prompt": bridge.DIGEST_SYSTEM_PROMPT},
             # strict 가 `--tools ""` **앞**(fail-closed) — 뒤집히면 `""` 소실 시 MCP 가 열린다.
             # 훅 차단 = 도구 0개 티어 전용(플러그인·전역 훅 주입 차단, 2026-08-02 실측).

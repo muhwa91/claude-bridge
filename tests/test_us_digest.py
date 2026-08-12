@@ -2120,7 +2120,8 @@ def test_us_digest_opens_exactly_one_tool_and_os_digest_none():
     assert bridge.US_DIGEST_TOOLS == ["Skill"]
     assert bridge.DIGEST_TOOLS == []  # 한쪽 완화가 다른 쪽으로 번지지 않는다
     assert bridge.US_DIGEST_SANDBOX_DIR != bridge.DIGEST_SANDBOX_DIR  # cwd 도 분리
-    assert "chiikawa_dev" not in str(bridge.US_DIGEST_SANDBOX_DIR)  # 레포 밖(보안 설계 유지)
+    # 레포 밖(보안 설계 유지) — 경로 관계로 판정한다(레포명 리터럴은 개명 시 조용히 무효).
+    assert not bridge.US_DIGEST_SANDBOX_DIR.resolve().is_relative_to(bridge.REPO_ROOT.resolve())
 
 
 def test_prepare_skill_copies_only_the_skill_file(tmp_path):

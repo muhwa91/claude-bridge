@@ -4479,7 +4479,7 @@ def _boot_write(path: Path | None, *, insert: str, drop_label: str | None = None
 def _git_commit_paths(root: Path, paths: list[Path], message: str) -> bool:
     """지정 경로**만** stage → commit. 성공 True. push 는 하지 않는다(브리지는 로컬 커밋까지).
 
-    ⚠️ `git add -A`·`git add .` 금지 — chiikawa_dev 는 공유 레포라 다른 세션의 미커밋 변경이
+    ⚠️ `git add -A`·`git add .` 금지 — 이 워크스페이스는 공유 레포라 다른 세션의 미커밋 변경이
     한 커밋에 섞인다(헌법 공통 운영 규칙 14). 여기선 인자로 받은 경로만 `--` 뒤에 붙인다.
 
     ⚠️ **`commit` 에도 pathspec 을 붙인다**(2026-08-11 리뷰·보안 게이트 실증): `add -- <경로>` 는
@@ -4731,8 +4731,9 @@ def _handle_button(
                 adapter.send(channel_id, confirm)
     elif action == "nb:later":
         # 스누즈: 30분 뒤 1회 재발송. dispatch_notifications 가 due_snoozes 로 재발송.
-        # ⚠️ **확인가능 창을 넘길 스누즈는 걸지 않는다**: +30분 고정인데 `ti-premarket-baseline`(2026-08-12
-        # 졸업)의 창은 08:30~09:00(정확히 30분)이었다. 창 안에서 누른 나중에는 재발송이 **항상** 창 밖에
+        # ⚠️ **확인가능 창을 넘길 스누즈는 걸지 않는다**: +30분 고정인데 졸업한
+        # `ti-premarket-baseline`(2026-08-12)의 창은 08:30~09:00(정확히 30분)이었다.
+        # 창 안에서 누른 나중에는 재발송이 **항상** 창 밖에
         # 떨어졌다 → `⛔ 지금은 확인가능 시간이 아닙니다` → 또 나중에 → 무한 반복. 그럴 땐
         # 스누즈를 걸지 않고 안내만 한다(예약 자체는 내일 다시 발화한다).
         # `check_from`/`check_to` 가 없으면 `_check_range` 가 None → 종전 동작 그대로(무회귀).
@@ -5950,9 +5951,9 @@ def _selftest() -> None:
     assert not _guest_bypass(_ge("질문", kind="photo"))  # 사진 제외
     assert not _guest_bypass(_ge("질문", role="간단처리"))  # 다른 채널
     assert GUEST_TOOLS == ["WebSearch"]  # WebSearch 만(WebFetch SSRF 차단·파일·bash·git 없음)
-    assert "chiikawa_dev" not in str(
-        GUEST_SANDBOX_DIR
-    )  # cwd 격리 = 레포 밖(CLAUDE.md 상위로드 차단)
+    # cwd 격리 = 레포 밖(CLAUDE.md 상위로드 차단). 이름이 아니라 경로 관계로 판정한다 —
+    # 레포명 리터럴은 레포를 개명하면 조용히 무효가 된다.
+    assert not GUEST_SANDBOX_DIR.resolve().is_relative_to(REPO_ROOT.resolve())
     # ⑥ 사진 보류 소비 — TTL 안이면 ref, 만료·없음이면 None(+정리·pop).
     pending_photos.clear()
     pending_photos[1] = ("ref", time.monotonic())

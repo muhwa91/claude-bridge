@@ -2797,7 +2797,7 @@ def test_get_does_not_follow_redirects():
         # UnicodeEncodeError 를 내고 `_get` 이 그걸 삼켜 SEC 블록 3개가 매일 조용히 죽는다.
         # 여기서 ""(미설정)로 떨어뜨려 경고를 남긴다.
         ('SEC_USER_AGENT="홍길동 me@example.com"\n', ""),
-        ("SEC_USER_AGENT=yeo junggi me@example.com\n", "yeo junggi me@example.com"),
+        ("SEC_USER_AGENT=gildong hong me@example.com\n", "gildong hong me@example.com"),
         ("SEC_USER_AGENT=me@example.com\n", "me@example.com"),
         ("OTHER=1\nSEC_USER_AGENT = spaced@example.com \n", "spaced@example.com"),
         ("OTHER=1\n", ""),  # 미설정 → SEC 블록만 건너뜀

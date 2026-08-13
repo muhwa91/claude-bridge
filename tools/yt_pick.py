@@ -140,7 +140,7 @@ def clean(s: str | None, n: int = 120) -> str:
     제목·채널에 적용돼도 무해하다.
     """
     s = re.sub(r"\s+", " ", CTRL_RE.sub(" ", s or "")).replace('"', "'").strip()
-    # 계정명 — 세그먼트는 **경로 구분자에서만** 끊는다. 공백에서 끊으면 `C:\Users\Jung Ki\` 의
+    # 계정명 — 세그먼트는 **경로 구분자에서만** 끊는다. 공백에서 끊으면 `C:\Users\Test User\` 의
     # 성이 남고, UNC(`\\NAS01\Users\…`)는 아예 안 걸린다. 커밋되는 파일이라 과다 마스킹이
     # 안전한 방향이다(제목·채널에 오탐이 나도 무해).
     s = re.sub(r"(?i)([a-z]:[\\/]users[\\/]|[\\/]{1,2}users[\\/]|/home/)[^\\/]+", r"\1<user>", s)
@@ -546,20 +546,20 @@ def selftest() -> int:
     assert clean("가" * 40, 10) == "가" * 10 + "…" and clean(None) == ""
     # 예외 문자열을 타고 커밋 대상 로그(error.md)까지 흘러가는 것들
     assert (
-        clean(r'No such file: "C:\Users\JungKi\cookies.txt"')
+        clean(r'No such file: "C:\Users\TestUser\cookies.txt"')
         == r"No such file: 'C:\Users\<user>\cookies.txt'"
-    ), clean(r'"C:\Users\JungKi\c.txt"')
+    ), clean(r'"C:\Users\TestUser\c.txt"')
     # 계정명에 공백이 있어도 성이 남지 않는다(세그먼트는 경로 구분자에서만 끊는다)
     assert (
-        clean(r"cannot open C:\Users\Jung Ki\cookies.txt")
+        clean(r"cannot open C:\Users\Test User\cookies.txt")
         == r"cannot open C:\Users\<user>\cookies.txt"
-    ), clean(r"C:\Users\Jung Ki\c.txt")
+    ), clean(r"C:\Users\Test User\c.txt")
     assert (
-        clean(r"WinError 5: \\NAS01\Users\JungKi\c.txt")
+        clean(r"WinError 5: \\NAS01\Users\TestUser\c.txt")
         == r"WinError 5: \\NAS01\Users\<user>\c.txt"
-    ), clean(r"\\NAS01\Users\JungKi\c.txt")  # UNC
-    assert clean("/home/jung ki/.cache/x") == "/home/<user>/.cache/x", clean("/home/jung ki/x")
-    assert clean("/Users/jungki/Library/x") == "/Users/<user>/Library/x", clean("/Users/jungki/x")
+    ), clean(r"\\NAS01\Users\TestUser\c.txt")  # UNC
+    assert clean("/home/test user/.cache/x") == "/home/<user>/.cache/x", clean("/home/test user/x")
+    assert clean("/Users/testuser/Library/x") == "/Users/<user>/Library/x", clean("/Users/testuser/x")
     assert (
         clean("ProxyError(proxy=http://user:s3cr3t@10.0.0.5:8080)")
         == "ProxyError(proxy=http://<redacted>@10.0.0.5:8080)"

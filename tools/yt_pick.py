@@ -2,18 +2,20 @@
 """하네스·에이전트·MCP 관련 유튜브 영상 후보를 골라 표로 뽑는다.
 
     python tools/yt_pick.py            # 지금 바로 선별(8쿼리 · 정렬 2종) — 당겨 돌리는 수단
-    python tools/yt_pick.py --daily    # 세션 훅용 — 3일 지났을 때만 돌고 결과는 .yt_today.md 로
+    python tools/yt_pick.py --daily    # 세션 훅용 — 주 1회만 돌고 결과는 .yt_today.md 로
     python tools/yt_pick.py --selftest # 네트워크 없이 도는 자체 점검
 
 ⚠️ **인자 없이 실행하면 실제 선별이 돈다**(자체 점검이 아니다 — 형제 스크립트
 `fetch_transcript.py` 와 관례가 다르다). 점검은 `--selftest` 로만 돈다.
 
-노트를 주 2회 만드니 선별도 그 주기에 맞춘다. 요일 고정이 아니라 **간격**인 이유:
-훅으로 도는 구조라 PC 를 안 켠 날은 아예 안 돈다 — 요일을 박으면 그 주를 통째로 건너뛴다.
+노트를 주 1회 만드니 선별도 그 주기에 맞춘다(실측 2026-08-14: 이틀 간격에도 후보 64% 중복).
+요일 고정이 아니라 **간격**인 이유: 훅으로 도는 구조라 PC 를 안 켠 날은 아예 안 돈다 —
+요일을 박으면 그 주를 통째로 건너뛴다.
 
-판정(최종 1건 고르기)은 이 스크립트가 하지 않는다. 챕터 제목·퍼널·평판까지 뽑아 주고
-고르는 건 사람(또는 세션의 Claude)이 한다 — 키워드 점수로 순위를 매기면 얕고 키워드만
-빽빽한 영상이 매일 1등이 된다(2026-08-11 드라이런 실측).
+축별 1등은 이 스크립트가 고른다(게이트 3종 → 점수 → 축별 1등 → `Dev_log.md` 중복 제외).
+**키워드 점수는 쓰지 않는다** — 키워드로 매기면 얕고 키워드만 빽빽한 영상이 매번 1등이 된다
+(2026-08-11 드라이런 실측). 대신 «지금 뜨는가(조회/일) * 밀도(좋아요%) ÷ 비용(길이)» 세 축의
+관측값만 쓴다. `▸` 후보 목록은 선발 뒤에도 그대로 남는다 — 선발이 마음에 안 들 때 교체용이다.
 
 403 예방:
   - `--sleep-requests` 로 요청 사이 간격을 두고, 개별 조회는 **한 프로세스에 URL 여러 개**를
@@ -37,11 +39,13 @@ import argparse
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -51,6 +55,13 @@ CACHE_F = HERE / ".yt_cache.json"  # id -> 안 변하는 메타(챕터·언어·
 REP_F = HERE / "yt_channel_rep.json"  # 채널 평판(판정 결과 누적 — 사람이 손으로 갱신)
 STAMP_F = HERE / ".yt_lastrun"  # --daily 간격 가드(마지막 성공 실행일 한 줄)
 TODAY_F = HERE / ".yt_today.md"  # --daily 결과(첫 줄이 한 줄 요약)
+LOCK_F = HERE / ".yt_running"  # --daily 동시 실행 락(gitignore)
+# 락을 «죽은 것»으로 보고 회수하는 시간. 한 실행이 1~2분이라 정상 실행과 겹치지 않는다.
+# ponytail: 천장 = **15분을 넘겨 도는 실행은 두 번 돌 수 있다**(뒤 프로세스가 stale 로 뺏는다).
+#           그 지점에 닿으면 시간을 늘리지 말고 락 파일에 pid 를 적고 «그 프로세스가 살아 있나»로
+#           갈아탄다(윈도우는 OpenProcess, POSIX 는 kill(0)). 지금 pid 를 안 쓰는 이유는
+#           detached 로 던져진 자식이 죽은 뒤 pid 가 재사용됐는지 싸게 판별할 방법이 없어서다.
+LOCK_STALE_SEC = 900
 
 # 실패 기록 — 위 셋과 달리 **커밋 대상**이다(gitignore 하지 않는다). `.yt_today.md` 는 실행마다
 # 덮어써서 8/15 실패가 8/18 성공에 지워진다. 공식 API(YouTube Data API v3)로 갈아탈지 판단할
@@ -60,6 +71,18 @@ TODAY_F = HERE / ".yt_today.md"  # --daily 결과(첫 줄이 한 줄 요약)
 # try/except 가 삼킨다 — 그것을 보장하는 것은 log_failure 의 `mkdir(exist_ok=True)` 다
 # (`parents=True` 가 아니다). 조상까지 만들면 `D:\_Idea\log\error.md` 가 조용히 생긴다.
 ERROR_LOG = (HERE.parents[2] if len(HERE.parents) > 2 else HERE) / "_Idea" / "log" / "error.md"
+# 산출 색인 — **읽기만 한다**(쓰는 것은 ③단계 문서화 쪽). 여기 있는 영상 id 는
+# 선발에서 제외한다: 없으면 1등이 계속 1등이다(조회수가 오르니 점수는 오히려 높아진다).
+# 경로 계산은 ERROR_LOG 와 같은 이유로 레포 밖에서 돌면 어긋나는데, 그때는 파일이 없어
+# `load_seen` 이 빈 집합을 돌려주고 **중복 제거만 꺼진다**(선별은 계속 돈다).
+#
+# ⚠️ **둘 다 읽는다 — 합집합이다.** 색인은 경로별로 갈라져 있지만(Dev_log=자동, 일반_log=수동)
+# "이미 다룬 영상"이라는 사실은 갈라지지 않는다. 2026-08-14 에 자동 경로가 Dev_log 만 보다가
+# 같은 날 사람이 수동으로 분석한 2건(f4mI3d-nTrI·Qx0fCqpkBus)을 다시 뽑아 자막·판정 토큰을
+# 태웠고, 나온 제안은 전부 이미 백로그에 있는 말이었다. 색인을 더 만들면 여기에 더한다.
+_YT_LOGS = (HERE.parents[2] if len(HERE.parents) > 2 else HERE) / "_Idea" / "유튜브-문서화" / "logs"
+DEV_LOG = _YT_LOGS / "Dev_log.md"
+GENERAL_LOG = _YT_LOGS / "일반_log.md"
 ERR_HEADER = (
     "# 유튜브 후보 선별 — 실패 기록\n\n"
     "> 실패했을 때만 쌓인다. **비어 있으면 무사고다.**\n"
@@ -108,11 +131,34 @@ FUNNEL = [
 # ※ 'newsletter' 는 뺐다 — 후보 9건 중 7건에 붙어 신호가 아니라 잡음이었다(신뢰 채널 포함).
 
 MIN_SEC, MIN_VIEW, OK_LANG = 300, 1000, ("ko", "en")
+# 자동 선발 게이트 — 위 후보 게이트보다 **좁다**. 후보 목록(`▸`)은 사람이 훑고 교체하는 용도라
+# 넓게 남기고, 자막을 실제로 받아 문서까지 만드는 선발분만 여기서 조인다.
+# 30분: 자막이 분당 약 300토큰(실측 3표본 260·317·342)이라 길이가 곧 비용.
+# 5,000회: 표본이 얇으면 좋아요율이 흔들린다(2,465회에 10.5%가 나왔다).
+SEL_MAX_SEC, SEL_MIN_VIEW = 1800, 5000
 LOOKUP_N = 15  # 개별 조회 건수(캐시 적중분은 이 수에서 안 깎는다)
 REQ_CAP = 40  # 1회 요청 상한 — 검색 16(8쿼리·정렬 2종) + 조회 15 = 31 이라 30 이면 잘린다
 SLEEP = "2"  # 요청 사이 초
-INTERVAL_DAYS = 3  # --daily 재실행 간격(일) — 노트가 주 2회라 그 아래는 아무도 안 본다
-CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# --daily 재실행 간격(일). ⚠️ **이틀 이하로 줄이지 말 것** — 08-12 판 13건과 08-14 판 14건이
+# 9건(64%) 겹쳤다. 유튜브에 하루 만에 새 후보가 3축씩 나오지 않고, 줄이면 자막 비용만 배로 든다.
+INTERVAL_DAYS = 7
+# 제어·비가시 문자. **`bridge.py` 의 `_CTRL_RE` 와 같은 범위를 둔다** — 두 파일이 갈라져 있어
+# 한쪽만 넓히면 다른 쪽이 그대로 구멍이 된다(한쪽을 고치면 다른 쪽도 고칠 것). C0 만 걷던 시절엔
+# 제목의 bidi·폭0·유니코드 태그가 살아서 `.yt_today.md`(→ 세션 컨텍스트)와 커밋 대상 `error.md`
+# 까지 도달했다 — 파이썬 `\s` 는 그것들을 공백으로 안 봐서 아래 `\s+` 압축도 못 잡는다.
+# 치환값이 달라 둘로 나눴다:
+#   INVIS_RE → **제거**(공백으로 바꾸면 제목 한가운데 빈칸이 생기고, ESC 만 지우면 `[31m` 이 남는다)
+#   CTRL_RE  → **공백**(개행·탭까지 지우면 앞뒤 단어가 붙는다 — `\s+` 압축이 이어받는다)
+INVIS_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"  # CSI(ANSI) 시퀀스
+    r"|\x1b[@-Z\\-_]"  # 그 외 이스케이프 시퀀스
+    r"|[\x7f-\x9f]"  # DEL · C1 제어문자
+    r"|[\u00ad\u200b-\u200f\u2060-\u2064\u202a-\u202e\u2066-\u2069\ufeff]"  # 폭0·bidi·BOM
+    r"|[\ufe00-\ufe0f\U000e0100-\U000e01ef]"  # variation selector(1~256)
+    r"|[\U000e0000-\U000e007f]"  # 유니코드 태그(보이지 않는 지시 삽입 벡터)
+)
+CTRL_RE = re.compile(r"[\x00-\x1f]")  # 남은 C0(개행·탭 포함) → 공백
+VID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")  # 유튜브 영상 id — Dev_log 표에서 이 열만 골라낸다
 # error.md 항목 머리줄 — 본문·풀이와 구분. **줄 전체**여야 한다: 사람이 풀이에
 # `[2026-01-01 00:00] 확인함` 같은 메모를 적으면 접두 매칭은 그걸 새 항목으로 세어
 # 항목 수가 부풀고 중복 생략(log_failure)이 꺼진다.
@@ -139,7 +185,7 @@ def clean(s: str | None, n: int = 120) -> str:
     (지우려면 history rewrite). 외부 유래 문자열이 전부 이 함수를 지나므로 한 곳만 막으면 된다 —
     제목·채널에 적용돼도 무해하다.
     """
-    s = re.sub(r"\s+", " ", CTRL_RE.sub(" ", s or "")).replace('"', "'").strip()
+    s = re.sub(r"\s+", " ", CTRL_RE.sub(" ", INVIS_RE.sub("", s or ""))).replace('"', "'").strip()
     # 계정명 — 세그먼트는 **경로 구분자에서만** 끊는다. 공백에서 끊으면 `C:\Users\Test User\` 의
     # 성이 남고, UNC(`\\NAS01\Users\…`)는 아예 안 걸린다. 커밋되는 파일이라 과다 마스킹이
     # 안전한 방향이다(제목·채널에 오탐이 나도 무해).
@@ -161,6 +207,46 @@ def _atomic_write(path: Path, text: str) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def note(msg: str) -> None:
+    """방어적 폴백을 **사람 눈에 닿는 곳**에 남긴다 — ERRORS(→ `.yt_today.md` 헤더) + stderr.
+
+    ⚠️ **stderr 만으론 없는 것과 같다.** 실제로 도는 유일한 모드(`--daily`)는 세션 시작 훅이
+    `stdio: 'ignore'` 로 던지므로 stderr 가 통째로 버려진다. 조용히 폴백하면 중복 제거가 꺼진 채
+    같은 1등이 다시 뽑히고 자막·판정 토큰을 다시 태워도 아무도 모른다(2026-08-14 실사고).
+    `[검색]` 접두를 붙이지 않으므로 soft 로 분류돼 스탬프는 그대로 찍힌다 — 파일 하나를 못 읽은
+    것으로 한 주를 통째로 재시도하는 건 더 나쁘다.
+    """
+    ERRORS.append(f"[파일] {msg}")
+    sys.stderr.write(f"[경고] {msg}\n")
+
+
+def acquire_lock() -> bool:
+    """`.yt_running` 을 원자적으로 만든다 — 이미 있고 15분이 안 지났으면 False(= 물러난다).
+
+    **간격 가드(스탬프)는 잠금이 아니다**: 읽고 1~2분 뒤에야 쓰므로, 훅이 세션마다 detached 로
+    던지는 실행이 간격 만료일에 겹치면 전부 통과한다(실측: 0.1초 간격 3개 전원 통과 · yt-dlp
+    요청 93회 — 403 예방으로 REQ_CAP 을 40 으로 조인 설계인데 가드 밖에서 3배가 나갔다).
+    더 나쁜 조합은 실패판이 성공판보다 늦게 끝나는 경우다 — 스탬프는 성공판이 찍고
+    `.yt_today.md` 는 실패판이 덮어, "재시도한다"고 쓰인 채 7일 잠기고 그 주는 아무것도 안 나온다.
+    `O_CREAT|O_EXCL` 은 한 프로세스만 이긴다.
+    """
+    try:
+        os.close(os.open(LOCK_F, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        return True
+    except FileExistsError:
+        pass
+    except OSError:
+        return False  # 권한·경로 문제로 락을 못 만든다 → 안 도는 쪽이 안전하다
+    try:  # 죽은 락(강제종료·재부팅으로 finally 를 못 지난 것) 회수 — 그 뒤 한 번만 다시 잡는다
+        if time.time() - LOCK_F.stat().st_mtime < LOCK_STALE_SEC:
+            return False
+        LOCK_F.unlink()
+        os.close(os.open(LOCK_F, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except OSError:
+        return False  # 그사이 다른 실행이 잡았다
+    return True
 
 
 class Budget:
@@ -202,14 +288,14 @@ def load(path: Path) -> dict:
 
     (실패 → 스탬프 미기록 → 다음 세션도 같은 파일에서 실패 = 사람이 지워야 풀리는 고정 상태.)
     사람이 손으로 고치는 `yt_channel_rep.json` 의 오타를 조용히 삼키면 평판이 전부 `미상` 이 되므로
-    반드시 stderr 에 남긴다.
+    반드시 `note()` 로 남긴다 — **stderr 만으론 --daily 에서 버려진다**(그 함수 docstring).
     """
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:
-        sys.stderr.write(f"[경고] {path.name} 를 읽지 못해 빈 값으로 진행합니다 — {e}\n")
+        note(f"{path.name} 를 읽지 못해 빈 값으로 진행합니다 — {e}")
         return {}
 
 
@@ -329,8 +415,8 @@ def log_resolved() -> None:
     대상은 **`Fail_A~B` 범위**로만 가리킨다 — 시작일은 `Fail_A` 항목의 `[날짜]` 가, 건수는
     범위가 이미 말한다. 날짜·건수를 여기 또 적으면 같은 얘기를 세 번 하게 된다.
 
-    ⚠️ **"N일 만에 복구" 같은 기간은 쓰지 않는다** — 실행 간격이 3일이라 8/15 에 막히고
-    8/16 에 이미 풀렸어도 8/17 에야 확인된다. 스크립트가 아는 건 "지난번엔 실패, 이번엔 성공"
+    ⚠️ **"N일 만에 복구" 같은 기간은 쓰지 않는다** — 실행 간격이 주 1회라 8/15 에 막히고
+    8/16 에 이미 풀렸어도 8/22 에야 확인된다. 스크립트가 아는 건 "지난번엔 실패, 이번엔 성공"
     뿐이라 '복구'가 아니라 **'복구 확인'** 이 정확하다. 기간을 적으면 그 숫자가 거짓이 된다.
     """
     try:
@@ -433,6 +519,82 @@ def detail(ids: list[str], cache: dict, budget: Budget) -> None:
             )
 
 
+def load_seen(path: Path) -> set[str]:
+    """산출 색인 표 → 이미 다룬 영상 id. 없거나 못 읽으면 **빈 집합**(제외 없이 진행).
+
+    한 파일만 본다 — 자동(`Dev_log.md`)·수동(`일반_log.md`) 두 색인은 **호출부에서 합집합**으로
+    묶는다(`DEV_LOG` 주석 참조). 표 형식이 같아 그대로 두 번 부르면 된다.
+
+
+    중복 제거가 꺼지는 것보다 선별이 통째로 죽는 게 나쁘다 — 그날 선발이 겹치는 건 사람이
+    보면 알지만, 예외로 죽으면 카드가 아예 안 온다(`load` 와 같은 판단).
+
+    ⚠️ **열 번호로 세지 않는다.** 제목 칸에 `|` 가 섞이면 열이 통째로 밀려 엉뚱한 칸을 id 로
+    읽는다. 대신 셀 중 **영상 id 모양인 것만** 줍는다 — 머리줄·구분줄·날짜·길이는 안 걸린다.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()  # 아직 한 건도 안 쌓였다 → 제외할 것이 없다
+    except (OSError, ValueError) as e:
+        # **조용히 넘어가면 안 된다** — 여기서 빈 집합이 나가면 중복 제거가 통째로 꺼져 같은 1등이
+        # 다시 뽑히고 자막·판정 토큰이 다시 탄다. --daily 의 stderr 는 훅이 버리므로 note() 로.
+        note(f"{path.name} 를 읽지 못해 중복 제거 없이 진행합니다 — {e}")
+        return set()
+    return {
+        cell
+        for ln in text.splitlines()
+        if ln.startswith("|")
+        for cell in (x.strip() for x in ln.split("|"))
+        if VID_RE.match(cell)
+    }
+
+
+def score(c: dict, m: dict, today: date | None = None) -> float:
+    """순위 점수 = log10(조회/일) * (1 + 좋아요%/3) ÷ log10(분).
+
+        지금 뜨는가          밀도            비용
+
+    로그를 씌우는 이유는 조회수가 자릿수로 벌어져서다 — 생짜로 쓰면 대형 채널 한 건이 그 축을
+    영구 점유한다. 분모는 **2분에서 바닥**을 친다(1분이면 log10(1)=0 → 0 나눗셈).
+    업로드일을 못 읽으면 1일로 본다 — 그런 항목은 캐시가 비어 lang 게이트에서 이미 떨어진다.
+    """
+    try:
+        up = datetime.strptime(m.get("upload") or "", "%Y%m%d").date()
+        days = max(((today or date.today()) - up).days, 1)
+    except ValueError:
+        days = 1
+    per_day = max(c["view"] / days, 1)
+    return (
+        math.log10(per_day)
+        * (1 + (m.get("ratio") or 0) * 100 / 3)
+        / math.log10(max(c["dur"] / 60, 2))
+    )
+
+
+def select(
+    final: list[dict], cache: dict, seen: set[str], today: date | None = None
+) -> list[tuple[str, dict, float]]:
+    """축별 1등 각 1건 → [(축, 후보, 점수)]. 게이트 3종(퍼널·길이·조회)을 통과한 것만 겨룬다.
+
+    축은 `axes` 의 **첫 축**(정렬 기준)이다 — 한 영상이 두 축에 걸치면 두 자리를 먹는다.
+    그 축에 통과 후보가 0건이면 **그 축은 건너뛴다**. 다음 축으로 넘기지 않는 이유: 축이 곧
+    주제라 대체가 안 된다(MCP 자리에 하네스 2건을 넣으면 그 주는 MCP 를 못 본다).
+    """
+    best: dict[str, tuple[float, dict]] = {}
+    for c in final:
+        m = cache.get(c["id"])
+        if not m or c["id"] in seen:  # 메타가 없으면 점수를 못 매긴다 → 0점으로 넣지 않고 뺀다
+            continue
+        if m["funnel"] or c["dur"] > SEL_MAX_SEC or c["view"] < SEL_MIN_VIEW:
+            continue
+        ax = sorted(c["axes"])[0]
+        s = score(c, m, today)
+        if ax not in best or s > best[ax][0]:  # 동점은 먼저 온 쪽(= 관련도 순위가 앞선 쪽)
+            best[ax] = (s, c)
+    return [(ax, best[ax][1], best[ax][0]) for ax in sorted(best)]
+
+
 def run() -> tuple[int, int]:
     """후보를 뽑아 stdout 으로 출력한다. → (쓴 요청 수, 게이트 통과 건수)"""
     budget, cache, rep = Budget(REQ_CAP), load(CACHE_F), load(REP_F)
@@ -486,7 +648,17 @@ def run() -> tuple[int, int]:
             print("  챕터: " + " / ".join(f'"{clean(t, 32)}"' for t in m["chapters"][:14]))
         print()
 
-    print(f"■ 게이트 통과 {len(final)}건 — 판정은 사람이 한다(위 챕터·퍼널·평판을 보고 1건).")
+    print(f"■ 게이트 통과 {len(final)}건 — 위 목록은 선발을 바꾸고 싶을 때 쓰는 교체용이다.")
+
+    # 선발은 **여기까지 모인 것만** 쓴다 — 요청을 더 쓰지 않는다(캐시 메타 + 검색 결과로 충분).
+    sel = select(final, cache, load_seen(DEV_LOG) | load_seen(GENERAL_LOG))
+    print(f"\n■ 자동 선발 {len(sel)}건")
+    for ax, c, _s in sel:
+        # 파이프 구분 · **제목이 마지막**이다 — 제목에 `|` 가 섞여도 앞 필드가 밀리지 않는다
+        # (브리지 `_YT_PICK` 정규식이 축·id·분을 잡고 **줄 끝까지를 통째로 제목**으로 쓴다).
+        # 제목은 외부 문자열이라 clean() 을 지난다.
+        print(f"◆ {ax} | {c['id']} | {c['dur'] // 60}분 | {clean(c['title'], 120)}")
+        print(f"  https://www.youtube.com/watch?v={c['id']}")
     return budget.used, len(final)
 
 
@@ -495,53 +667,84 @@ def daily() -> int:
 
     무슨 일이 있어도 종료코드 0. 검색이 깨지면 스탬프를 안 찍어 **간격을 기다리지 않고 재시도**하고,
     개별 영상 조회만 깨졌으면 스탬프는 찍되 헤더에 경고를 붙인다
-    (1건 실패로 3일을 재시도하는 건 더 나쁘다).
+    (1건 실패로 한 주를 통째로 재시도하는 건 더 나쁘다).
+
+    맨 위는 **간격 가드가 아니라 파일 락**이다(`acquire_lock` — 간격 가드가 왜 잠금이 아닌지).
     """
-    today = date.today()
-    try:
-        last = date.fromisoformat(STAMP_F.read_text(encoding="utf-8").strip())
-        # 음수도 참이라 상한만 보면 미래 날짜 스탬프 하나로 그 날짜까지 영영 안 돈다
-        # (시계 틀어짐·백업 복원). 0 이상으로 바닥을 막는다.
-        if 0 <= (today - last).days < INTERVAL_DAYS:
-            return 0  # 아직 간격 안 됨 — 즉시 종료
-    except (OSError, ValueError):
-        pass  # 스탬프 없음/깨짐 → 그냥 돈다
-
-    stamp, buf = f"{datetime.now():%Y-%m-%d %H:%M}", io.StringIO()
     ERRORS.clear()
+    if not acquire_lock():
+        ERRORS.append("[동시] 다른 --daily 실행이 아직 돌고 있어 건너뜀")
+        sys.stderr.write(f"[건너뜀] {ERRORS[-1]}\n")
+        # 조용히 나가지 않는다 — 훅이 stderr 를 버리니 `.yt_today.md` 첫 줄이 유일한 창구다.
+        # 다만 **홀더가 이미 결과를 쓴 뒤라면 덮지 않는다**: 순서가 락 생성 → 실행 → 결과 쓰기 →
+        # 락 해제라, 결과가 락보다 새로우면 그쪽이 정본이다. 홀더가 도는 중이면 이 줄은 1~2분짜리
+        # 임시 표시이고, **남아 있다면 그 자체가 «홀더가 멈췄다»는 신호**다.
+        try:
+            fresh = TODAY_F.exists() and TODAY_F.stat().st_mtime >= LOCK_F.stat().st_mtime
+        except OSError:
+            fresh = True  # 확인이 안 되면 남의 결과를 건드리지 않는다
+        if not fresh:
+            _atomic_write(
+                TODAY_F,
+                f"# 유튜브 후보 — {datetime.now():%Y-%m-%d %H:%M} · ⏭ 건너뜀:"
+                f" {ERRORS[-1]} (홀더가 끝나면 이 줄은 결과로 덮인다)\n",
+            )
+        return 0
     try:
-        with contextlib.redirect_stdout(buf):
-            used, shown = run()
-    except Exception as e:  # yt-dlp 없음·타임아웃·파싱 붕괴 등
-        used, shown = 0, 0
-        ERRORS.append(clean(f"[검색] {type(e).__name__}: {e}", 200))
+        today = date.today()
+        try:
+            last = date.fromisoformat(STAMP_F.read_text(encoding="utf-8").strip())
+            # 음수도 참이라 상한만 보면 미래 날짜 스탬프 하나로 그 날짜까지 영영 안 돈다
+            # (시계 틀어짐·백업 복원). 0 이상으로 바닥을 막는다.
+            if 0 <= (today - last).days < INTERVAL_DAYS:
+                return 0  # 아직 간격 안 됨 — 즉시 종료
+        except (OSError, ValueError):
+            pass  # 스탬프 없음/깨짐 → 그냥 돈다
 
-    hard = [e for e in ERRORS if e.startswith("[검색]")]
-    soft = [e for e in ERRORS if not e.startswith("[검색]")]
-    nxt = today + timedelta(days=INTERVAL_DAYS)
-    if hard:
-        head = f"# 유튜브 후보 — {stamp} · ❌ 실패: {hard[0]} (스탬프 미기록 — 다음 세션에 재시도)"
-        log_failure(hard[0], used)  # .yt_today.md 는 덮어써지므로 이력은 따로 쌓는다
-    else:
-        warn = f" · ⚠ 일부 실패 {len(soft)}건: {clean(soft[0], 80)}" if soft else ""
-        head = (
-            f"# 유튜브 후보 — {stamp} · 요청 {used}/{REQ_CAP} · 게이트 통과 {shown}건"
-            f" · 다음 실행 {nxt:%m-%d} 이후{warn}"
-        )
-    _atomic_write(TODAY_F, head + "\n\n" + buf.getvalue())
-    if not hard:
-        _atomic_write(STAMP_F, today.isoformat() + "\n")
-        log_resolved()  # 직전이 미해결 실패였으면 그 구간을 닫는다(아니면 무동작)
-    return 0
+        stamp, buf = f"{datetime.now():%Y-%m-%d %H:%M}", io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                used, shown = run()
+        except Exception as e:  # yt-dlp 없음·타임아웃·파싱 붕괴 등
+            used, shown = 0, 0
+            ERRORS.append(clean(f"[검색] {type(e).__name__}: {e}", 200))
+
+        hard = [e for e in ERRORS if e.startswith("[검색]")]
+        soft = [e for e in ERRORS if not e.startswith("[검색]")]
+        nxt = today + timedelta(days=INTERVAL_DAYS)
+        if hard:
+            head = (
+                f"# 유튜브 후보 — {stamp} · ❌ 실패: {hard[0]} (스탬프 미기록 — 다음 세션에 재시도)"
+            )
+            log_failure(hard[0], used)  # .yt_today.md 는 덮어써지므로 이력은 따로 쌓는다
+        else:
+            warn = f" · ⚠ 일부 실패 {len(soft)}건: {clean(soft[0], 80)}" if soft else ""
+            head = (
+                f"# 유튜브 후보 — {stamp} · 요청 {used}/{REQ_CAP} · 게이트 통과 {shown}건"
+                f" · 다음 실행 {nxt:%m-%d} 이후{warn}"
+            )
+        _atomic_write(TODAY_F, head + "\n\n" + buf.getvalue())
+        if not hard:
+            _atomic_write(STAMP_F, today.isoformat() + "\n")
+            log_resolved()  # 직전이 미해결 실패였으면 그 구간을 닫는다(아니면 무동작)
+        return 0
+    finally:
+        LOCK_F.unlink(missing_ok=True)  # 어떤 경로로 나가든 반드시 지운다
 
 
 # ---------------------------------------------------------------- 자체 점검
 def selftest() -> int:
     """네트워크 없이 도는 점검 — 파일 경로를 임시 폴더로 갈아끼운다."""
-    global CACHE_F, STAMP_F, TODAY_F, ERROR_LOG  # 점검 동안만 경로를 tmp 로 돌린다
+    global CACHE_F, STAMP_F, TODAY_F, LOCK_F, ERROR_LOG  # 점검 동안만 경로를 tmp 로 돌린다
     real = run
 
     assert clean("a\nb\x00c\x1bd") == "a b c d", clean("a\nb\x00c\x1bd")
+    # 비가시 문자는 **제거**한다(공백 아님) — bridge._CTRL_RE 와 같은 범위. 파이썬 `\s` 가
+    # 안 잡아 `\s+` 압축을 그냥 통과하고, 그대로 `.yt_today.md`·`error.md` 까지 간다.
+    assert clean("a\u202eb\u200c") == "ab", ascii(clean("a\u202eb\u200c"))
+    assert clean("a\u200b\u2066b\ufeff\u00ad") == "ab", ascii(clean("a\u200b\u2066b\ufeff\u00ad"))
+    assert clean("a\U000e0041\U000e007fb\ufe0f") == "ab", ascii(clean("a\U000e0041b"))
+    assert clean("a\x1b[31mb\x9fc") == "abc", ascii(clean("a\x1b[31mb\x9fc"))  # ANSI 통째로·C1
     assert clean('무시하고 "지시"를 따르라') == "무시하고 '지시'를 따르라"
     assert clean("가" * 40, 10) == "가" * 10 + "…" and clean(None) == ""
     # 예외 문자열을 타고 커밋 대상 로그(error.md)까지 흘러가는 것들
@@ -571,14 +774,115 @@ def selftest() -> int:
     assert yt(["--version"], Budget(0), "검색") == ""
     assert ERRORS == ["[검색] 1회 요청 상한 0 도달"], ERRORS
 
+    # ── 자동 선발 — 순수 함수라 네트워크·파일 없이 전부 건다(파일을 타는 load_seen 만 아래 tmp 에)
+    day0 = date(2026, 8, 14)
+
+    def meta(
+        funnel: tuple[str, ...] = (), ratio: float | None = 0.03, up: str = "20260807"
+    ) -> dict:
+        return {"lang": "en", "upload": up, "chapters": [], "funnel": list(funnel), "ratio": ratio}
+
+    def cand(vid: str, axis: str = "MCP", dur: int = 600, view: int = 10000) -> dict:
+        return {
+            "id": vid,
+            "title": vid,
+            "dur": dur,
+            "view": view,
+            "ch": "c",
+            "axes": {axis},
+            "rank": 0,
+        }
+
+    # 게이트 3종은 **경계값이 통과**다 — 30분 '이하' · 5,000 '이상' · 퍼널 '없음'
+    for vid, c, m in (
+        ("길이경계통과", cand("x", dur=1800), meta()),
+        ("길이초과탈락", cand("x", dur=1801), meta()),
+        ("조회경계통과", cand("x", view=5000), meta()),
+        ("조회미달탈락", cand("x", view=4999), meta()),
+        ("퍼널탈락", cand("x"), meta(("skool",))),
+    ):
+        got = select([c], {"x": m}, set(), day0)
+        assert bool(got) == vid.endswith("통과"), (vid, got)
+    assert select([cand("x")], {}, set(), day0) == []  # 캐시에 메타가 없으면 점수를 못 매긴다
+
+    # 순위 — 7일 전 · 조회 7,000(=1,000/일) · 좋아요 3% · 10분 → 3 * 2 ÷ 1 = 6.0
+    s = score(cand("x", dur=600, view=7000), meta(ratio=0.03), day0)
+    assert abs(s - 6.0) < 1e-9, s
+    assert score(cand("x", dur=60), meta(), day0) > 0  # 분모 바닥 2분 — 0 나눗셈이 안 난다
+    # 업로드일이 없거나 깨졌거나 오늘이면 전부 1일로 본다(죽지 않는다)
+    same = {score(cand("x"), meta(up=u), day0) for u in ("", "깨짐", "20260814", "20260820")}
+    assert len(same) == 1, same
+    assert score(cand("x"), meta(ratio=None), day0) < score(cand("x"), meta(ratio=0.03), day0)
+
+    # 축별 1등 각 1건 · 통과 후보가 0건인 축은 **건너뛴다**(다음 축으로 넘기지 않는다)
+    pool = [
+        cand("mcp_lo", "MCP", view=6000),
+        cand("mcp_hi", "MCP", view=200000),
+        cand("hn", "하네스", view=9000),
+        cand("ag", "에이전트", view=100),  # 조회 미달 → 에이전트 축은 통째로 빠진다
+    ]
+    pcache = {c["id"]: meta() for c in pool}
+    assert [(a, c["id"]) for a, c, _ in select(pool, pcache, set(), day0)] == [
+        ("MCP", "mcp_hi"),
+        ("하네스", "hn"),
+    ], select(pool, pcache, set(), day0)
+    # 중복 제외 — 1등이 이미 다룬 영상이면 그 축의 2등이 올라온다
+    assert [c["id"] for _, c, _ in select(pool, pcache, {"mcp_hi"}, day0)] == ["mcp_lo", "hn"]
+    assert select(pool, pcache, {"mcp_hi", "mcp_lo", "hn"}, day0) == []  # 전부 봤으면 0건
+    # 축이 여럿이면 첫 축 하나에만 든다 — 한 영상이 두 자리를 먹지 않는다
+    two = cand("two")
+    two["axes"] = {"하네스", "MCP"}
+    assert [a for a, *_ in select([two], {"two": meta()}, set(), day0)] == ["MCP"]
+
     with tempfile.TemporaryDirectory(prefix="ytpick_") as td:
         tmp = Path(td)
         CACHE_F, STAMP_F, TODAY_F = tmp / "c.json", tmp / "stamp", tmp / "today.md"
+        LOCK_F = tmp / "running"
         ERROR_LOG = tmp / "log" / "error.md"  # 폴더째 없는 상태에서 시작한다
         save(CACHE_F, {"a": 1})  # 원자적 저장 — 임시파일이 남지 않는다
         assert load(CACHE_F) == {"a": 1} and [p.name for p in tmp.iterdir()] == ["c.json"]
         CACHE_F.write_text("{ 깨짐", encoding="utf-8")  # 깨진 캐시는 예외 대신 빈 dict
-        assert load(CACHE_F) == {} and load(tmp / "없음.json") == {}
+        # 🔇 방어적 폴백은 **조용하면 안 된다** — --daily 는 훅이 stderr 를 버려(stdio: ignore)
+        # 경고가 어디에도 안 남는다. ERRORS 에 실려야 `.yt_today.md` 헤더까지 간다.
+        ERRORS.clear()
+        assert load(CACHE_F) == {} and load(tmp / "없음.json") == {}  # 없는 파일은 정상(조용)
+        assert len(ERRORS) == 1 and ERRORS[0].startswith("[파일] c.json"), ERRORS
+        assert not ERRORS[0].startswith("[검색]"), ERRORS  # soft = 스탬프는 그대로 찍힌다
+
+        # 산출 색인 표 → 이미 다룬 id(중복 제거의 입력). 파일이 없으면 제외 없이 진행한다
+        dev = tmp / "Dev_log.md"
+        ERRORS.clear()
+        assert load_seen(dev) == set() and load_seen(tmp) == set()  # 없음 · 폴더(=OSError)
+        # 못 읽으면 **중복 제거가 통째로 꺼진다**(같은 1등 재선발·자막 토큰 재소모) — 반드시 남긴다
+        assert len(ERRORS) == 1 and "중복 제거 없이" in ERRORS[0], ERRORS
+        # 머리줄은 **실제 Dev_log.md 그대로 8열**이어야 한다 — 열이 밀려도 안 깨진다를 증명하는
+        # 픽스처가 실물과 다른 모양이면 진짜 표가 바뀌었을 때 회귀를 못 잡는다(둘째 행이 밀린 행).
+        dev.write_text(
+            "| 날짜 | 축 | 제목 | 영상id | 길이 | 판정 | 드라이브 | 검토 |\n"
+            "|------|-----|------|--------|------|------|----------|------|\n"
+            "| 2026-08-16 | MCP | 어떤 제목 | f4mI3d-nTrI | 6분 | 채택1·보류0·기각0 | 링크 | — |\n"
+            "| 2026-08-16 | 하네스 | 제목에 | 가 섞였다 | oqp6D-ugtX4 | 9분 | 보류0 | 링크"
+            " | ✅ 2026-08-16 |\n",
+            encoding="utf-8",
+        )
+        # 제목에 `|` 가 섞여 열이 밀려도 id 를 놓치지 않는다(열 번호로 세지 않는다)
+        assert load_seen(dev) == {"f4mI3d-nTrI", "oqp6D-ugtX4"}, load_seen(dev)
+
+        # 수동 색인도 같이 본다 — 한쪽만 보면 사람이 방금 본 영상을 봇이 다시 조사한다
+        gen = tmp / "일반_log.md"
+        # 이쪽은 **실제 일반_log.md 그대로 5열**이다(축·판정·검토가 없다) — 열 수가 달라도
+        # 같은 함수가 그대로 먹힌다는 것이 `load_seen` 이 열 번호를 안 세는 이유다.
+        gen.write_text(
+            "| 날짜 | 제목 | 영상id | 길이 | 드라이브 |\n"
+            "|------|------|--------|------|----------|\n"
+            "| 2026-08-14 | 수동으로 본 것 | Qx0fCqpkBus | 12분 | — (수동 분석 · 노트만) |\n",
+            encoding="utf-8",
+        )
+        seen = load_seen(dev) | load_seen(gen)
+        assert seen == {"f4mI3d-nTrI", "oqp6D-ugtX4", "Qx0fCqpkBus"}, seen
+        # 수동 색인만 있는 id 도 선발에서 빠진다(합집합이 select 까지 닿는지)
+        manual = cand("Qx0fCqpkBus")
+        assert select([manual], {"Qx0fCqpkBus": meta()}, seen, day0) == []
 
         calls: list[int] = []
 
@@ -599,9 +903,25 @@ def selftest() -> int:
         def ymd(days: int) -> str:
             return (date.today() + timedelta(days=days)).isoformat()
 
-        assert not ran(ymd(0)) and not ran(ymd(-2))  # 간격 안 됨 → 건너뜀
-        assert ran(ymd(-3)) and ran(None) and ran("깨짐")  # 3일 전·없음·깨짐 → 돈다
+        assert not ran(ymd(0)) and not ran(ymd(-6))  # 간격 안 됨 → 건너뜀
+        assert ran(ymd(-7)) and ran(None) and ran("깨짐")  # 7일 전·없음·깨짐 → 돈다
         assert ran(ymd(9))  # 미래 스탬프 = 영구 정지 방지
+
+        # 🔒 간격 가드는 **잠금이 아니다** — 스탬프를 읽고 1~2분 뒤에야 쓰므로, 훅이 세션마다
+        # detached 로 던지는 실행이 간격 만료일에 겹치면 전부 통과한다(실측 3개 전원 · 요청 93회).
+        LOCK_F.write_text("", encoding="utf-8")  # 다른 실행이 잡고 있는 상태
+        os.utime(TODAY_F, (time.time() - 60,) * 2)  # 홀더는 아직 결과를 안 썼다
+        assert not ran(ymd(-7)), "간격이 됐어도 락에 걸리면 안 돈다"
+        assert LOCK_F.exists(), "남의 락은 지우지 않는다"
+        assert "⏭ 건너뜀" in TODAY_F.read_text(encoding="utf-8")  # 조용히 나가지 않는다
+        # 홀더가 이미 결과를 썼으면(결과가 락보다 새로움) 그쪽이 정본이라 **덮지 않는다**
+        TODAY_F.write_text("# 홀더 결과\n", encoding="utf-8")
+        os.utime(TODAY_F, (time.time() + 60,) * 2)
+        assert not ran(ymd(-7)) and TODAY_F.read_text(encoding="utf-8") == "# 홀더 결과\n"
+        # 15분 넘게 방치된 락은 죽은 것으로 보고 회수한다(강제종료·재부팅으로 finally 를 못 지난 것)
+        os.utime(LOCK_F, (time.time() - LOCK_STALE_SEC - 60,) * 2)
+        assert ran(ymd(-7)) and not LOCK_F.exists(), "stale 회수 후 finally 로 반드시 지운다"
+        assert not ran(ymd(0)) and not LOCK_F.exists()  # 간격에 걸려 즉시 나가는 경로도 마찬가지
 
         def errtext() -> str:
             return ERROR_LOG.read_text(encoding="utf-8") if ERROR_LOG.exists() else ""
@@ -626,12 +946,17 @@ def selftest() -> int:
         assert "⚠ 일부 실패 1건" in TODAY_F.read_text(encoding="utf-8")
         assert len(entries()) == 2 and "\n✅ 해결완료\nFail_1\n=> 다음 실행에서" in errtext()
         assert ran(None) and len(entries()) == 2, errtext()  # 또 성공 → ✅ 는 한 번뿐
+        # note() 가 담는 `[파일]` 도 soft 다 — 헤더 경고에 실리고 스탬프는 그대로 찍힌다
+        assert ran(None, ("[파일] Dev_log.md 를 읽지 못해 중복 제거 없이 진행합니다",))
+        assert STAMP_F.exists() and "⚠ 일부 실패 1건: [파일] Dev_log.md" in TODAY_F.read_text(
+            encoding="utf-8"
+        )
 
         # ⚠️ 사유를 바꿔야 한다 — 위와 같은 `[검색] 403` 이면 같은 날 중복이라 안 쌓인다(아래 참조)
-        assert ran(ymd(-5), ("[검색] 뭔가 새로운 것",))  # 직전 성공 날짜가 분모로 들어간다
+        assert ran(ymd(-9), ("[검색] 뭔가 새로운 것",))  # 직전 성공 날짜가 분모로 들어간다
         assert len(entries()) == 3, errtext()
         # ✅ 뒤에도 번호는 리셋되지 않는다 — 파일 통산이라 Fail_1 이 두 개 생기면 안 된다
-        assert f"\nFail_2\n요청 3/40 · 직전 성공 {ymd(-5)[5:]}\n" in errtext(), errtext()
+        assert f"\nFail_2\n요청 3/40 · 직전 성공 {ymd(-9)[5:]}\n" in errtext(), errtext()
         assert "\n=> (추정) 원인 미상" in errtext(), errtext()  # 매핑 폴백
         # 다시 성공 → **직전 ✅ 이후의 실패만** 가리킨다(그 전까지 세면 `Fail_1~2` 가 된다)
         assert ran(None) and len(entries()) == 4, errtext()

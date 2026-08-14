@@ -61,7 +61,8 @@ Thumbs.db
 .idea/
 .vscode/
 
-# 유튜브 후보 선별 캐시·3일 간격 스탬프·마지막 결과(머신 로컬)
+# 유튜브 후보 선별 캐시·간격 스탬프·마지막 결과·동시 실행 락(머신 로컬)
 tools/.yt_cache.json
 tools/.yt_lastrun
 tools/.yt_today.md
+tools/.yt_running

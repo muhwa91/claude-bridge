@@ -19,6 +19,11 @@ LIVE_PATHS = {
     "PROJECT_LABELS": bridge.REPO_ROOT / "_Core" / "project_labels.json",
     "SEEN_FILE": bridge.SEEN_FILE,
     "YT_TODAY_F": bridge.YT_TODAY_F,
+    # 유튜브 산출 색인 — `BACKLOG_FILE` 과 **같은 부류의 위험**이다. 이 경로가 어긋나도
+    # `append_yt_dev_log` 의 `mkdir(parents=True)` 가 엉뚱한 곳에 유령 파일을 만들며 조용히
+    # 성공하고, 그 사이 `tools/yt_pick.py` 는 진짜 색인을 읽어 **중복 제거가 영구히 꺼진다**
+    # (이미 다룬 영상을 계속 다시 뽑아 자막·판정 토큰을 태운다).
+    "YT_DEV_LOG": bridge.YT_DEV_LOG,
 }
 
 # 다이제스트가 **실제로 쓰는** 상태 파일. 모듈 상수를 직접 읽는 함수(mark_seen·append_rejected·
@@ -33,6 +38,11 @@ _STATE_ATTRS = (
     # YT_TODAY_F 는 읽기 전용이지만, 격리해야 테스트가 라이브 선별 결과에 좌우되지 않는다.
     "YT_POSTED_F",
     "YT_TODAY_F",
+    # YT_DEV_LOG 도 `append_yt_dev_log` 가 **모듈 상수를 직접 읽어** 추가(append)하는 라이브
+    # 파일이라 같은 성질이다 — monkeypatch 를 빠뜨린 테스트가 실색인에 가짜 행을 남기면
+    # yt_pick 의 중복 제거가 그 영상을 영구히 후보에서 뺀다.
+    # ⚠️ 실경로가 필요한 테스트는 `LIVE_PATHS["YT_DEV_LOG"]` 를 쓴다(여기서 tmp 로 덮인다).
+    "YT_DEV_LOG",
 )
 
 
@@ -55,11 +65,6 @@ def _isolate_state_files(monkeypatch, tmp_path_factory):
     state = tmp_path_factory.mktemp("digest_state")
     for attr in _STATE_ATTRS:
         monkeypatch.setattr(bridge, attr, state / getattr(bridge, attr).name)
-    # 보류맵도 비운다(2026-08-13) — 모듈 전역이라 앞 테스트의 항목이 그대로 남는다.
-    # 남으면 `sorted(yt_pending)` 이 **이번 테스트가 만든 seq 가 아닌 옛 것**을 먼저 집어
-    # 엉뚱한 그룹을 토글한다(실제로 그렇게 한 건 실패했다). 라이브에는 없는 문제다 —
-    # 프로세스가 하나뿐이고 카드가 실제로 그 항목들을 가리키기 때문.
-    monkeypatch.setattr(bridge, "yt_pending", {})
 
 
 @pytest.fixture(autouse=True)

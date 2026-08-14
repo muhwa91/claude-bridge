@@ -387,6 +387,12 @@ pending_photos: dict[int, tuple[str, float]] = {}
 # ponytail: in-memory — 재시작하면 옛 카드 버튼은 "만료" 안내로 떨어진다(유실 수용).
 digest_pending: dict[int, dict[str, Any]] = {}
 _digest_seq = itertools.count(1)
+_yt_seq = itertools.count(1)
+# 유튜브 후보 보류맵 — seq → 항목. 다이제스트 `digest_pending` 과 같은 수명(프로세스 메모리).
+# 재기동하면 비므로 **옛 카드의 버튼은 죽는다** — `#오픈소스` 가 이미 그 성질로 운영 중이라
+# 새로 감수하는 위험이 아니다. 죽은 버튼은 안내만 주고 끝난다(아래 핸들러).
+yt_pending: dict[int, dict[str, Any]] = {}
+YT_MAX_BUTTONS = 24  # 디스코드 버튼 한도 25 - [보내기] 1
 # 다이제스트 실패 되돌림 횟수 {(id, "YYYY-MM-DD"): n} — **id 별로** 센다. 키가 날짜뿐이면
 # 같은 틱에 함께 도는 다른 다이제스트가 예산을 나눠 써, 한쪽이 3번 실패하면 다른 쪽은 한 번도
 # 시도되지 못하고 그날 포기된다. 오늘 것만 남긴다(_revert_digest_fired 가 갱신 시 정리).
@@ -599,6 +605,39 @@ def digest_buttons(items: list[dict[str, Any]]) -> list[Button]:
         for i, it in enumerate(items, start=1)
         if it.get("seq") is not None and not it.get("added")
     ]
+
+
+def yt_buttons(items: list[dict[str, Any]]) -> list[Button]:
+    """[✅1][⬜2]… + [📤 보내기 (N건)] — **여러 개를 골라 한 번에** 보내는 다중 선택.
+
+    다이제스트([검토 및 적용 N])와 다르게 **누른다고 실행되지 않는다** — 토글은 표시만 바꾸고,
+    실제 조사는 [보내기] 한 번으로 고른 것 전부를 넘긴다. 후보가 10건 와도 2건만 고르려면
+    건별 왕복은 그 수만큼 늘어난다
+    (2026-08-13 관리자: *"체크박스로 체크 후 한번에 보내는 게 낫지 않아"*).
+
+    ⚠️ 어댑터 계약을 열지 않는다 — 선택 컴포넌트를 새로 만들지 않고 **기존 `Button` 만** 쓴다.
+    상태는 `yt_pending` 이 들고, 누를 때마다 카드를 통째로 다시 그린다(다이제스트 `added` 선례).
+
+    디스코드 한도는 한 줄 5개·최대 5줄 = 25개다. 토글 + 보내기라 **후보 24건이 상한**이고,
+    게이트가 그만큼 통과시킨 적은 없다(실측 최대 13건). 넘치면 뒤가 잘리므로 미리 자른다.
+    ⚠️ action 이름 `yt:tog`·`yt:go` 는 **바꾸지 마라** — 이미 나간 카드의 버튼이 깨진다.
+    """
+    shown = items[:YT_MAX_BUTTONS]
+    btns = [
+        Button(
+            f"{'✅' if it.get('picked') else '⬜'}{i}",
+            "yt:tog",
+            str(it["seq"]),
+            style="primary" if it.get("picked") else "secondary",
+        )
+        for i, it in enumerate(shown, start=1)
+        if it.get("seq") is not None
+    ]
+    n = sum(1 for it in shown if it.get("picked"))
+    if n and btns:
+        # arg = 아무 항목의 seq — 거기서 group 을 타고 형제 전부를 찾는다(다이제스트와 같은 역참조).
+        btns.append(Button(f"📤 보내기 ({n}건)", "yt:go", str(shown[0]["seq"]), style="success"))
+    return btns
 
 
 def choice_buttons(msg_id: int, choices: list[tuple[str, str]]) -> list[Button]:
@@ -1159,7 +1198,7 @@ REPO_ROOT = find_repo_root(PROJECT_DIR)
 # project_label 이 humanize 폴백. 표시 전용 — 라우팅·resolve_project·chat_selection 은 폴더명 기준.
 PROJECT_LABELS = load_project_labels(REPO_ROOT / "_Core" / "project_labels.json")
 # 🧩 다이제스트 [📌 백로그] 버튼이 한 줄 append 하는 개편 백로그(비보호 문서 — 워크스페이스 정본).
-BACKLOG_FILE = REPO_ROOT / "_Core" / "OPTIMIZE_BACKLOG.md"
+BACKLOG_FILE = REPO_ROOT / "_Core" / "기록" / "OPTIMIZE_BACKLOG.md"
 
 
 def load_notify_state(path: Path, today: str) -> tuple[set[tuple[str, str]], dict[str, str]]:
@@ -1375,9 +1414,11 @@ US_DIGEST_NOTIFY_ID = "us-digest"  # 미국주식 다이제스트(#미국주식)
 # 값이 함수 객체가 아니라 **이름**인 이유: ① 두 러너가 아래에 정의돼 전방참조가 되고
 # ② 테스트가 `monkeypatch.setattr(bridge, "run_opensource_digest", …)` 로 갈아끼우는데
 # 객체를 잡아두면 그 교체가 안 먹는다(늦은 바인딩이 필요).
+YT_NOTIFY_ID = "yt-digest"  # 유튜브 후보(#유튜브dev) — 배선 공용, 러너만 다르다
 DIGEST_RUNNERS: dict[str, str] = {
     DIGEST_NOTIFY_ID: "run_opensource_digest",
     US_DIGEST_NOTIFY_ID: "run_us_digest",
+    YT_NOTIFY_ID: "run_yt_digest",
 }
 DIGEST_MIN_STARS = 300  # **대형 축** 1차 거르기 하한(⭐) — 신흥 축은 아래 속도 필터가 대신한다
 # ── 속도(velocity) 필터 — 신흥 축의 ⭐하한을 대체한다(2026-08-11) ────────────
@@ -2487,8 +2528,8 @@ def _digest_verdict(head: str) -> str:
     """제목 꼬리(`… — 차용 1/2`)의 첫 낱말 = 판정. **DIGEST_COLORS 에 없는 낱말은 ""**(형식 이탈).
 
     낱말을 검증하지 않으면 슬롯이 뒤바뀐 제목(`… · 즉시적용 — foo/bar (⭐900)`)에서 판정 자리의
-    `foo/bar` 가 그대로 통과해 `_Core/OPTIMIZE_BACKLOG.md` 에 오염된 줄로 들어간다(digest_card 는
-    None → 평문 폴백, parse_digest_card 는 "참조" 폴백).
+    `foo/bar` 가 그대로 통과해 백로그 문서에 오염된 줄로 들어간다
+    (digest_card 는 None → 평문 폴백, parse_digest_card 는 "참조" 폴백).
     """
     tail = head.rsplit("—", 1)[-1].split() if "—" in head else []
     verdict = tail[0] if tail else ""
@@ -2702,7 +2743,7 @@ def backlog_line(day: str, entry: dict[str, Any]) -> str:
     """`- [YYYY-MM-DD] <이름> (<판정>) — <적용 한 줄> · <URL>` (형식 고정, 순수).
 
     name·apply·url 은 외부 유래(GitHub/HN 검색결과·판정 출력)다. 이 줄이 들어가는
-    `_Core/OPTIMIZE_BACKLOG.md` 는 헌법이 "클로드 개편 이어가자" 정본으로 지정한 문서라 **다음
+    `_Core/기록/OPTIMIZE_BACKLOG.md` 는 헌법이 "클로드 개편 이어가자" 정본으로 지정한 문서라 **다음
     세션의 풀권한 claude 가 읽는다** → 개행이 섞이면 2차 인젝션 저장고가 된다. 세 필드를 전부
     한 줄로 접고 200자로 자른다(결과는 반드시 한 줄).
     """
@@ -2735,7 +2776,7 @@ def _backlog_insert(text: str, line: str) -> str | None:
 
 
 def append_backlog(path: Path, line: str) -> bool:
-    """개편 백로그(_Core/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입. 성공 여부 반환.
+    """개편 백로그(_Core/기록/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입. 성공 여부 반환.
 
     브리지가 직접 쓴다(claude 무관 — graduate_notify 와 같은 사상). 저장은 원자적(tmp→replace).
     파일이 없으면 만들지 않고 False — 워크스페이스 정본을 브리지가 창조하지 않는다(오탐 방지).
@@ -3327,6 +3368,211 @@ def run_us_digest(adapter: Adapter, channel_id: int, today: str) -> bool:
         return False
     log.info("미국주식 다이제스트 게시 완료")
     return True
+
+
+# ── 🎬 유튜브 후보(#유튜브dev) ────────────────────────────────────────────────
+# 선별은 **브리지가 돌리지 않는다.** SessionStart 훅(`.claude/hooks/yt-daily.mjs`)이
+# `yt_pick.py --daily` 를 detached 로 던지고(1~2분) 결과를 `.yt_today.md` 에 남긴다.
+# 여기서는 **그 파일을 읽어 카드로 만들 뿐**이다 — 선별을 두 곳에서 돌리면 API 요청이 두 배가 된다.
+#
+# 그래서 한 세션 늦는다: 이번 세션이 시작시킨 선별은 이번 세션 안에 안 끝나고, **다음 세션이
+# 그 결과를 카드로 본다.** 3일 간격이라 한 세션 지연은 의미가 없다. 비동기를 이기려 하지 말 것
+# (기다리면 신원 확인 응답까지 늦어진다 — 훅 주석 참조).
+#
+# 발송 판정은 **날짜가 아니라 파일 첫 줄(스탬프)** 로 한다. `--daily` 는 간격에 걸리면 파일을
+# 쓰지 않고 그냥 끝나므로, 날짜로 판정하면 **3일 내내 같은 목록을 다시 보낸다.**
+YT_TODAY_F = Path(__file__).resolve().parent / "tools" / ".yt_today.md"
+YT_POSTED_F = LOG_DIR / "yt_posted.txt"  # 마지막으로 카드로 낸 스탬프 한 줄
+_YT_ENTRY = re.compile(r'^▸\s+"(?P<title>.*)"\s*$')
+_YT_URL = re.compile(r"^\s+(?P<url>https://www\.youtube\.com/watch\?v=[\w-]{6,20})\s*$")
+# 메타 줄에서 **고를 때 실제로 쓰는 것만** 뽑는다. 버리는 것에도 이유가 있다:
+#   `[미상]` — 13건 중 12건이 같아 변별력 0 · `좋아요 2.5%` — 전부 2~3%대라 마찬가지.
+# 남기는 것: 길이(볼 각오)·조회(검증된 정도)·채널(신뢰)·업로드일(신선도)·축(내 주제인가).
+_YT_CH = re.compile(r'^"([^"]*)"')
+# ⚠️ 구분자 `·` 를 앞에 고정한다. 안 그러면 **채널명 안의 숫자+분을 먼저 잡는다** —
+# `"1분코딩" … · 42분 ·` 이 카드에 **1분**으로 떴다(2026-08-14 실측. 1분코딩·3분코딩은 실존 채널).
+# 길이는 «볼 각오»를 재는 핵심 지표라 틀리면 선택 판단을 직접 오도한다.
+_YT_DUR = re.compile(r"·\s*(\d+)분")
+_YT_VIEW = re.compile(r"조회 ([\d,]+)")
+# 뒤 구분자를 선택적으로 — 축이 없는 항목은 날짜가 **줄 끝**에 와서 조용히 사라졌다.
+_YT_UP = re.compile(r"· (20\d{6})(?:\s*·|\s*$)")
+_YT_AXIS = re.compile(r"'([^']+)'")
+
+
+def yt_meta_compact(meta: str) -> tuple[str, list[str]]:
+    """메타 원문 → (압축 문자열, 축 목록). 파싱 실패는 빈 값 — 카드가 죽지 않게 한다."""
+    ch = _YT_CH.match(meta)
+    dur = _YT_DUR.search(meta)
+    view = _YT_VIEW.search(meta)
+    up = _YT_UP.search(meta)
+    axes = _YT_AXIS.findall(meta.split("축")[-1]) if "축" in meta else []
+    bits: list[str] = []
+    if dur:
+        bits.append(f"{dur.group(1)}분")
+    if view:
+        n = int(view.group(1).replace(",", ""))
+        bits.append(f"{n / 10000:.1f}만" if n >= 10000 else f"{n / 1000:.1f}천")
+    if ch and ch.group(1):
+        bits.append(ch.group(1))
+    if up:
+        d = up.group(1)
+        bits.append(f"{int(d[4:6])}/{int(d[6:8])}")
+    return " · ".join(bits), axes
+
+
+def parse_yt_candidates(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """`.yt_today.md` → (스탬프, 후보들). 스탬프 = 첫 줄(`# 유튜브 후보 — …`).
+
+    항목은 3줄 묶음이다 — `▸ "제목"` / 메타 / URL. **URL 이 있는 것만** 후보로 센다:
+    링크가 없으면 조사할 대상을 특정할 수 없어 버튼을 줘도 아무것도 못 한다(L-4 와 같은 판단).
+
+    제목·메타는 **유튜브에서 온 외부 문자열**이다(파일 3번째 줄이 스스로 경고를 지닌다).
+    여기서는 표시용으로만 쓰고 명령으로 해석하지 않는다.
+    """
+    lines = text.split("\n")
+    stamp = lines[0].strip() if lines else ""
+    items: list[dict[str, Any]] = []
+    pending: dict[str, Any] | None = None
+    for ln in lines[1:]:
+        m = _YT_ENTRY.match(ln)
+        if m:
+            pending = {"title": m.group("title").strip(), "meta": "", "url": ""}
+            continue
+        if pending is None:
+            continue
+        u = _YT_URL.match(ln)
+        if u:
+            pending["url"] = u.group("url")
+            items.append(pending)
+            pending = None
+        elif not pending["meta"] and ln.startswith("  "):
+            pending["meta"] = ln.strip()
+    return stamp, items
+
+
+def yt_group_by_axis(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """축으로 묶어 **표시 순서대로 다시 늘어놓는다**(관리자 선택 2026-08-13, 안 B).
+
+    묶는 이유: 같은 주제가 붙어 있으면 *"MCP 는 이 중 하나만"* 이라는 판단이 눈에 보인다.
+    ⚠️ **번호는 묶은 뒤에 매긴다** — 원래 순서를 유지하면 본문이 1·5·9·13 로 튀어
+    버튼(1~13 순서 고정)과 눈이 두 번 왕복한다. 그래서 여기서 순서를 확정하고,
+    호출측이 이 순서대로 seq 를 준다.
+
+    축이 여러 개인 항목은 **첫 축**에 넣는다 — 한 항목이 두 묶음에 나오면 번호가 두 개가 된다.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for it in items:
+        compact, axes = yt_meta_compact(str(it.get("meta", "")))
+        it["compact"] = compact
+        it["axis"] = axes[0] if axes else "기타"
+        groups.setdefault(it["axis"], []).append(it)
+    return [it for rows in groups.values() for it in rows]
+
+
+def yt_card_text(stamp: str, items: list[dict[str, Any]]) -> str:
+    """카드 본문 — 번호가 버튼 라벨과 같아야 고를 수 있다(items 는 이미 축 순서로 정렬됨).
+
+    표시 글리프는 **고른 것 `✅` · 안 고른 것 `▫`** 다. 버튼도 같은 상태를 그리므로 이중
+    렌더인데, **일부러 그렇게 둔다** — 폰에서는 버튼 줄이 14건 목록 **아래 멀리** 있어,
+    본문만 보고도 무엇을 골랐는지 알아야 한다. 안 고른 쪽만 `⬜`→`▫` 로 낮춰 목록이
+    체크박스 밭처럼 보이지 않게 했다(2026-08-14).
+    ⚠️ 둘은 `_yt_redraw` 가 **한 번에 다시 그리므로** 어긋날 수 없다. 한쪽만 갱신하는
+    경로를 새로 만들지 마라 — 그러면 이중 렌더가 곧바로 결함이 된다.
+    """
+    date = ""
+    m = re.search(r"(20\d\d-\d\d-\d\d)", stamp)
+    if m:
+        date = f"[ {m.group(1)} ]\n"
+    shown = items[:YT_MAX_BUTTONS]
+    body = [f"{date}🎬 **유튜브 후보 {len(items)}건**", ""]
+    seen_axis = None
+    for i, it in enumerate(shown, start=1):
+        axis = str(it.get("axis") or "기타")
+        if axis != seen_axis:
+            if seen_axis is not None:
+                body.append("")
+            n = sum(1 for x in shown if x.get("axis") == axis)
+            body.append(f"**{axis}** · {n}건")
+            seen_axis = axis
+        body.append(f"{'✅' if it.get('picked') else '▫'} **{i}.** {it['title']}")
+        if it.get("compact"):
+            body.append(f"-# {it['compact']}")
+    if len(items) > YT_MAX_BUTTONS:
+        body.append(f"\n-# …그 밖 {len(items) - YT_MAX_BUTTONS}건은 버튼 한도(25)로 생략")
+    return "\n".join(body)
+
+
+def run_yt_digest(adapter: Adapter, channel_id: int, _today: str) -> bool:
+    """유튜브 후보 카드 1장 게시. 반환 = 이 항목을 처리 완료로 볼지(False 면 다음 틱 재시도).
+
+    **낼 것이 없는 경우도 True 다** — 파일 없음·간격에 걸려 새 결과가 없음·후보 0건은 실패가
+    아니라 "오늘은 낼 게 없다"이다. False 로 돌리면 매 틱 같은 판정을 반복한다.
+    """
+    try:
+        text = YT_TODAY_F.read_text(encoding="utf-8")
+    except OSError:
+        return True  # 아직 한 번도 안 돌았다(첫 세션) — 다음 세션에 생긴다
+    stamp, items = parse_yt_candidates(text)
+    if not stamp:
+        return True
+    try:
+        if YT_POSTED_F.read_text(encoding="utf-8").strip() == stamp:
+            return True  # 이 스탬프는 이미 카드로 냈다
+    except OSError:
+        pass
+    if not items:
+        # 게이트는 돌았는데 통과 0건 — 스탬프를 기록해 같은 결과를 다시 안 본다.
+        _yt_mark_posted(stamp)
+        return True
+    items = yt_group_by_axis(items)  # 축으로 묶고 그 순서를 확정 — seq 는 그 뒤에 매긴다
+    for it in items[:YT_MAX_BUTTONS]:
+        it["seq"] = seq = next(_yt_seq)
+        it["picked"] = False
+        yt_pending[seq] = it
+    group: dict[str, Any] = {
+        "channel_id": channel_id,
+        "items": items[:YT_MAX_BUTTONS],
+        "stamp": stamp,
+    }
+    for it in group["items"]:
+        it["group"] = group  # 버튼 처리 때 형제 항목까지 다시 그리기 위한 역참조
+    # ⚠️ **try/except 로 감싸지 마라 — 어댑터는 계약상 예외를 던지지 않는다**(§3.3: 플랫폼
+    # 오류는 어댑터가 삼키고 로그+None). 감싸면 그 except 가 죽은 코드가 되고 실패가 True 로
+    # 나간다. 유튜브는 미국주식보다 나쁘다 — 스탬프가 `yt_posted.txt` 에 **파일로** 남아
+    # 다음 선별(3일 뒤)까지 카드가 영영 안 뜬다. `on:"session"` 이라 봇 기동 직후
+    # 이벤트루프 미준비 틱에 정확히 걸린다. **성공 판정은 반환값으로만.**
+    # (2026-08-14: 실제로 이 함수가 그 금지를 어기고 있었다 — 20줄 위 `run_us_digest` 선례 참조)
+    if (
+        adapter.send(channel_id, yt_card_text(stamp, items), yt_buttons(group["items"]) or None)
+        is None
+    ):
+        log.warning("유튜브 후보 게시 실패 — 되돌려 다음 틱 재시도")
+        for it in group["items"]:  # 게시 안 된 보류 항목은 남기지 않는다(다이제스트 선례)
+            yt_pending.pop(int(it["seq"]), None)
+        return False
+    _yt_mark_posted(stamp)
+    return True
+
+
+def _yt_mark_posted(stamp: str) -> None:
+    """낸 스탬프 기록 — 실패해도 게시 자체는 성공이므로 삼킨다(최악 = 다음 세션에 한 번 더 뜬다)."""
+    try:
+        YT_POSTED_F.parent.mkdir(parents=True, exist_ok=True)
+        YT_POSTED_F.write_text(stamp + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning("유튜브 발송 스탬프 기록 실패(%s)", type(e).__name__)
+
+
+def _yt_redraw(
+    adapter: Adapter, channel_id: int, message_id: int | None, group: dict[str, Any]
+) -> None:
+    """카드를 통째로 다시 그린다 — 형제 항목까지 함께여야 번호가 어긋나지 않는다."""
+    items = list(group["items"])
+    body = yt_card_text(str(group["stamp"]), items)
+    if isinstance(message_id, int):
+        adapter.edit(channel_id, message_id, body, yt_buttons(items) or None)
+    else:
+        adapter.send(channel_id, body, yt_buttons(items) or None)
 
 
 # ── 🧪 드라이런(`python bridge.py --digest-dry-run [--ignore-seen]`) ────────────
@@ -4805,6 +5051,9 @@ def _handle_button(
             timeout=timeout,
             user_id=event.user_id,
         )
+    elif action in ("yt:tog", "yt:go"):
+        # 🎬 유튜브 후보 — [⬜N] 토글(표시만) / [📤 보내기] 고른 것 전부를 한 번에.
+        _handle_yt_button(adapter, channel_id, message_id, action, arg)
     elif action == "c":
         # ③ 선택지 탭 — arg="<msg_id>:<idx|other>". 보류맵에서 세션·프로젝트를 찾아 resume 재실행.
         # M-1: channel_id + user_id 소유 항목만 조회(공유 채널 다중 유저·타 chat 세션 탈취 차단).
@@ -4871,6 +5120,63 @@ def _rerender_digest(
         adapter.edit(channel_id, message_id, body + note, buttons or None, card=spec)
     else:
         adapter.send(channel_id, body + note, buttons or None, card=spec)
+
+
+def _handle_yt_button(
+    adapter: Adapter,
+    channel_id: int,
+    message_id: int | None,
+    action: str,
+    arg: str,
+) -> None:
+    """[⬜N] 토글 / [📤 보내기]. 토글은 **실행하지 않는다** — 표시만 바꾸고 카드를 다시 그린다.
+
+    보류맵에 없으면(재기동으로 비었거나 남의 카드) 안내만 준다 — 죽은 버튼이 조용히 아무 일도
+    안 하면 눌린 줄 알고 계속 기다리게 된다.
+    """
+    item = yt_pending.get(int(arg)) if arg.isascii() and arg.isdigit() else None
+    if item is None:
+        adapter.send(channel_id, "⌛ 만료된 카드입니다 — 다음 선별 결과에서 다시 골라 주세요.")
+        return
+    group = item.get("group")
+    # 🔐 **채널 소유권을 확인한다**(`_handle_digest_button` 선례와 같은 모양). seq 는
+    # `itertools.count(1)` 이라 1,2,3… 으로 완전히 예측 가능해서, 이 검사가 없으면 다른
+    # 채널의 카드 상태를 토글·소진하고 그 후보 제목·URL 이 호출자 채널로 흘러간다.
+    if not isinstance(group, dict) or group.get("channel_id") != channel_id:
+        adapter.send(channel_id, "⌛ 만료된 카드입니다 — 다음 선별 결과에서 다시 골라 주세요.")
+        return
+    if action == "yt:tog":
+        # **축마다 1건** (관리자 결정 2026-08-13). 상한을 "3건" 같은 숫자로 두지 않은 이유:
+        # 같은 축 3건을 고르면 내용이 크게 겹쳐 노트 3개가 거의 같은 말을 한다. 축으로 나누면
+        # 그 낭비가 구조적으로 막히고, **축이 늘면 상한도 알아서 는다**(숫자를 손보지 않아도 된다).
+        # 실측 근거: 후보 13건 전량 = 5.4시간·자막만 약 59,000 토큰. 주 2회면 주 26개 PDF 라
+        # 애초에 아무도 안 읽는다.
+        picking = not item.get("picked")
+        if picking:
+            # 같은 축의 다른 선택을 **거부하지 않고 옮긴다**(라디오처럼) — 거부 문구를 읽고
+            # 이전 것을 손으로 해제하는 것보다 손이 덜 간다.
+            for sib in group["items"]:
+                if sib is not item and sib.get("axis") == item.get("axis"):
+                    sib["picked"] = False
+        item["picked"] = picking
+        _yt_redraw(adapter, channel_id, message_id, group)
+        return
+    picked = [it for it in group["items"] if it.get("picked")]
+    if not picked:
+        adapter.send(channel_id, "고른 항목이 없습니다 — 번호 버튼으로 먼저 체크해 주세요.")
+        return
+    # ⚠️ 실제 조사·PDF·드라이브 업로드는 아직 없다(2026-08-13). 여기까지가 ①②단계이고,
+    #    ③단계가 붙기 전에는 **무엇이 고쳐졌는지 보여주고 멈춘다** — 조용히 아무 일도 안 하면
+    #    눌렸는지 알 수 없고, 없는 기능을 있는 척하면 그게 더 나쁘다.
+    lines = [f"🔄 **{len(picked)}건 접수** — 조사 대기"]
+    lines += [f"{i}. {it['title']}\n-# {it['url']}" for i, it in enumerate(picked, start=1)]
+    lines.append("-# ③단계(조사 → PDF → 드라이브)는 아직 구현 전입니다.")
+    adapter.send(channel_id, "\n".join(lines))
+    for it in group["items"]:  # 접수분은 카드에서 내린다 — 두 번 보내지지 않게
+        if it.get("picked"):
+            yt_pending.pop(int(it["seq"]), None)
+    group["items"] = [it for it in group["items"] if not it.get("picked")]
+    _yt_redraw(adapter, channel_id, message_id, group)
 
 
 def _handle_digest_button(

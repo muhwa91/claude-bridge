@@ -1341,7 +1341,7 @@ def test_scheduler_category_in_order_between_data_and_system():
     assert discord_adapter._CAT_ALIASES[discord_adapter._CAT_SCHED] == ["스케쥴러"]
 
 
-def test_scheduler_special_has_two_role_channels():
+def test_scheduler_special_role_channels():
     """**표시명과 tag 가 일부러 다르다** — 표시명은 `반도체주식`, tag 는 `미국주식` 그대로.
 
     tag 를 표시명에 맞추면 채널 탐색 1차(`channel_map` 의 `(kind, tag)`)·2차(이름 canon)가
@@ -1351,7 +1351,13 @@ def test_scheduler_special_has_two_role_channels():
     assert discord_adapter._SPECIAL[discord_adapter._CAT_SCHED] == [
         ("반도체주식", "role", "미국주식"),
         ("오픈소스", "role", "오픈소스"),
+        ("유튜브dev", "role", "유튜브-Dev"),
+        ("유튜브일반", "role", "유튜브-일반"),
+        ("개발자료", "role", "개발자료"),
     ]
+    # 순서가 곧 디스코드 표시 순서다(2026-08-13 관리자 지정) — 바꾸면 채널이 재배치된다.
+    # notify.json 의 `channel` 은 **tag** 를 쓴다:
+    # yt-digest → "유튜브-Dev"(표시명 `유튜브dev` 아님).
     # 읽기전용·notify.json 라우팅도 tag 기준이라 함께 무변경이어야 한다.
     assert "미국주식" in discord_adapter._READONLY_TAGS
 

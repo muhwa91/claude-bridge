@@ -9,9 +9,36 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import bridge  # sys.path 주입 뒤에만 임포트 가능
 
+# 아래 격리 fixture 가 덮기 **전의** 실경로. 상수가 가리키는 파일이 실제로 있는지 보는
+# 테스트(`test_repo_paths_actually_exist`)가 이걸 쓴다 — fixture 가 autouse 라 그냥 읽으면
+# tmp 경로가 나와 **검사가 통째로 무의미해진다**(2026-08-14 실사고: `_Core/` 재배치 때
+# `BACKLOG_FILE` 만 옛 경로에 남았는데 테스트 1,362건이 전부 통과했다. 쓰는 테스트가
+# 하나같이 monkeypatch 해서 실경로를 아무도 안 봤기 때문).
+LIVE_PATHS = {
+    "BACKLOG_FILE": bridge.BACKLOG_FILE,
+    "PROJECT_LABELS": bridge.REPO_ROOT / "_Core" / "project_labels.json",
+    "SEEN_FILE": bridge.SEEN_FILE,
+    "YT_TODAY_F": bridge.YT_TODAY_F,
+}
+
 # 다이제스트가 **실제로 쓰는** 상태 파일. 모듈 상수를 직접 읽는 함수(mark_seen·append_rejected·
 # append_backlog·collect_awesome)를 부르는 테스트가 monkeypatch 를 빠뜨리면 라이브가 오염된다.
-_STATE_ATTRS = ("SEEN_FILE", "REJECTED_FILE", "BACKLOG_FILE", "AWESOME_SNAPSHOT_FILE")
+_STATE_ATTRS = (
+    "SEEN_FILE",
+    "REJECTED_FILE",
+    "BACKLOG_FILE",
+    "AWESOME_SNAPSHOT_FILE",
+    # 유튜브 후보(2026-08-13) — 둘 다 라이브 파일이라 격리하지 않으면 테스트가 실물을 건드린다.
+    # YT_POSTED_F 를 안 막으면 "이미 낸 스탬프"가 테스트 값으로 덮여 **실제 카드가 안 뜬다**.
+    # YT_TODAY_F 는 읽기 전용이지만, 격리해야 테스트가 라이브 선별 결과에 좌우되지 않는다.
+    "YT_POSTED_F",
+    "YT_TODAY_F",
+)
+
+
+# 아래 fixture 가 갈아끼우기 **전**의 실제 경로 — 임포트 시점에 잡아둔다.
+# (옛 `ORIGINAL_PATHS` 는 위 LIVE_PATHS 와 목적이 같아 2026-08-14 통합했다 — 같은 일을 하는
+#  dict 가 둘이면 다음 사람이 틀린 쪽에 상수를 늘린다.)
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +55,11 @@ def _isolate_state_files(monkeypatch, tmp_path_factory):
     state = tmp_path_factory.mktemp("digest_state")
     for attr in _STATE_ATTRS:
         monkeypatch.setattr(bridge, attr, state / getattr(bridge, attr).name)
+    # 보류맵도 비운다(2026-08-13) — 모듈 전역이라 앞 테스트의 항목이 그대로 남는다.
+    # 남으면 `sorted(yt_pending)` 이 **이번 테스트가 만든 seq 가 아닌 옛 것**을 먼저 집어
+    # 엉뚱한 그룹을 토글한다(실제로 그렇게 한 건 실패했다). 라이브에는 없는 문제다 —
+    # 프로세스가 하나뿐이고 카드가 실제로 그 항목들을 가리키기 때문.
+    monkeypatch.setattr(bridge, "yt_pending", {})
 
 
 @pytest.fixture(autouse=True)

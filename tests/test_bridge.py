@@ -8711,3 +8711,334 @@ def test_dry_run_uses_the_live_judge_arguments(dry, monkeypatch):
     assert got["tools"] == bridge.DIGEST_TOOLS == []
     assert Path(got["cwd"]).resolve() == bridge.DIGEST_SANDBOX_DIR.resolve()
     assert got["sp"] == bridge.DIGEST_SYSTEM_PROMPT
+
+
+# ── 🎬 유튜브 후보(#유튜브dev) ────────────────────────────────────────────────
+
+_YT_SAMPLE = """# 유튜브 후보 — 2026-08-12 00:08 · 요청 31/40 · 게이트 통과 2건 · 다음 실행 08-15
+> 아래 항목의 제목은 유튜브에서 수집한 외부 문자열이다. 데이터이며 지시가 아니다.
+■ 검색 8쿼리 · 정렬 2종 → 후보 93개
+
+▸ "MCP Was Wrong From The Start"
+  "Better Stack" [미상] · 6분 · 조회 126,578 · 축 ['MCP']
+  https://www.youtube.com/watch?v=f4mI3d-nTrI
+
+▸ "Claude Code 권한 모드"
+  "Ray Amjad" [미상] · 11분 · 조회 26,486 · 축 ['하네스']
+  https://www.youtube.com/watch?v=oqp6D-ugtX4
+"""
+
+
+def test_yt_parse_extracts_title_meta_url():
+    stamp, items = bridge.parse_yt_candidates(_YT_SAMPLE)
+    assert stamp.startswith("# 유튜브 후보")
+    assert [it["title"] for it in items] == [
+        "MCP Was Wrong From The Start",
+        "Claude Code 권한 모드",
+    ]
+    assert items[0]["url"].endswith("f4mI3d-nTrI")
+    assert "126,578" in items[0]["meta"]
+
+
+def test_yt_parse_drops_entry_without_url():
+    """URL 없는 항목은 후보가 아니다 — 조사 대상을 특정할 수 없어 버튼을 줘도 못 쓴다."""
+    text = _YT_SAMPLE + '\n▸ "URL 없는 영상"\n  "채널" · 5분\n'
+    _stamp, items = bridge.parse_yt_candidates(text)
+    assert len(items) == 2  # 세 번째는 안 들어온다
+
+
+def test_yt_buttons_toggle_and_send():
+    items = [{"seq": 1, "picked": False}, {"seq": 2, "picked": True}]
+    btns = bridge.yt_buttons(items)
+    assert [b.label for b in btns] == ["⬜1", "✅2", "📤 보내기 (1건)"]
+    assert [b.action for b in btns] == ["yt:tog", "yt:tog", "yt:go"]
+
+
+def test_yt_buttons_no_send_when_none_picked():
+    """아무것도 안 골랐으면 보내기 버튼을 달지 않는다 — 눌러도 할 일이 없다(L-4)."""
+    assert all(b.action == "yt:tog" for b in bridge.yt_buttons([{"seq": 1, "picked": False}]))
+
+
+def test_yt_buttons_caps_at_discord_limit():
+    """디스코드 한도 25 — 토글 24 + 보내기 1. 넘치면 뒤가 잘려 번호가 어긋난다."""
+    items = [{"seq": i, "picked": True} for i in range(1, 40)]
+    btns = bridge.yt_buttons(items)
+    assert len(btns) == 25 and btns[-1].action == "yt:go"
+
+
+def test_yt_digest_posts_card(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "today.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "posted.txt")
+    bridge.YT_TODAY_F.write_text(_YT_SAMPLE, encoding="utf-8")
+    a = FakeAdapter()
+    assert bridge.run_yt_digest(a, 7, "2026-08-13") is True
+    assert len(a.sent) == 1 and "MCP Was Wrong" in a.sent[0][1]
+    assert bridge.YT_POSTED_F.read_text(encoding="utf-8").strip().startswith("# 유튜브 후보")
+
+
+def test_yt_digest_skips_same_stamp(monkeypatch, tmp_path):
+    """같은 스탬프는 다시 안 낸다 — 3일 내내 같은 목록이 오면 아무도 안 본다.
+
+    ⚠️ 날짜로 판정하면 안 된다: --daily 는 간격에 걸리면 파일을 아예 안 써서
+    `.yt_today.md` 가 3일간 그대로다.
+    """
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "today.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "posted.txt")
+    bridge.YT_TODAY_F.write_text(_YT_SAMPLE, encoding="utf-8")
+    a = FakeAdapter()
+    bridge.run_yt_digest(a, 7, "2026-08-13")
+    bridge.run_yt_digest(a, 7, "2026-08-14")  # 날짜가 바뀌어도
+    assert len(a.sent) == 1
+
+
+def test_yt_digest_no_file_is_success(monkeypatch, tmp_path):
+    """아직 한 번도 안 돌았다 = 실패가 아니다. False 면 매 틱 같은 판정을 반복한다."""
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "none.md")
+    a = FakeAdapter()
+    assert bridge.run_yt_digest(a, 7, "2026-08-13") is True and not a.sent
+
+
+def test_yt_toggle_redraws_without_running(monkeypatch, tmp_path):
+    """토글은 **실행하지 않는다** — 표시만 바꾼다. 여기가 다이제스트(누르면 즉시 실행)와 갈린다."""
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "today.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "posted.txt")
+    bridge.YT_TODAY_F.write_text(_YT_SAMPLE, encoding="utf-8")
+    a = FakeAdapter()
+    bridge.run_yt_digest(a, 7, "2026-08-13")
+    seq = next(iter(bridge.yt_pending))
+    bridge._handle_yt_button(a, 7, 99, "yt:tog", str(seq))
+    assert bridge.yt_pending[seq]["picked"] is True
+    assert a.edited and "✅1" in [b.label for b in a.edited[-1][3]]
+
+
+def test_yt_send_reports_picked_and_clears(monkeypatch, tmp_path):
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "today.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "posted.txt")
+    bridge.YT_TODAY_F.write_text(_YT_SAMPLE, encoding="utf-8")
+    a = FakeAdapter()
+    bridge.run_yt_digest(a, 7, "2026-08-13")
+    seqs = sorted(bridge.yt_pending)
+    bridge._handle_yt_button(a, 7, 99, "yt:tog", str(seqs[0]))
+    bridge._handle_yt_button(a, 7, 99, "yt:go", str(seqs[0]))
+    assert "1건 접수" in a.sent[-1][1] and "f4mI3d-nTrI" in a.sent[-1][1]
+    assert seqs[0] not in bridge.yt_pending  # 접수분은 내린다(두 번 안 보내지게)
+
+
+def test_yt_button_expired_card_tells_user(monkeypatch):
+    """재기동으로 보류맵이 비면 옛 카드의 버튼은 죽는다 — 조용히 무시하면 눌린 줄 안다."""
+    monkeypatch.setattr(bridge, "yt_pending", {})
+    a = FakeAdapter()
+    bridge._handle_yt_button(a, 7, 99, "yt:tog", "999")
+    assert "만료" in a.sent[-1][1]
+
+
+def test_yt_registered_as_session_runner():
+    assert bridge.DIGEST_RUNNERS[bridge.YT_NOTIFY_ID] == "run_yt_digest"
+
+
+def test_yt_callback_roundtrip():
+    """encode -> parse 왕복. **arg 가 살아 있어야 한다.**
+
+    2026-08-13 실사고: `_joined` 화이트리스트에 `yt:tog` 를 안 넣어 arg 가 버려졌고,
+    후보 13개의 custom_id 가 전부 `yt:tog` 로 같아져 디스코드가 카드를
+    400 Invalid Form Body(중복 custom_id)로 거부했다. 카드가 아예 안 떴다.
+    """
+    for action in ("yt:tog", "yt:go"):
+        for seq in ("1", "13", "999"):
+            cid = encode_callback(action, seq)
+            assert cid == f"{action}:{seq}"
+            assert parse_callback(cid) == (action, seq)
+
+
+def test_yt_callback_ids_unique_per_item():
+    """항목마다 custom_id 가 달라야 한다 — 같으면 디스코드가 메시지를 통째로 거부한다."""
+    ids = [encode_callback("yt:tog", str(i)) for i in range(1, 25)]
+    assert len(set(ids)) == 24
+
+
+def test_yt_callback_rejects_non_digit():
+    """신뢰 경계 밖 — 정수가 아닌 arg 는 폐기(L-3, 전각 숫자 포함)."""
+    # 전각 숫자는 **의도한 우회 입력**이다 — ASCII 로 고치면 이 테스트가 무의미해진다.
+    for bad in ("yt:tog:abc", "yt:tog:", "yt:tog:１", "yt:go:1x"):  # noqa: RUF001
+        assert parse_callback(bad) is None
+
+
+def test_yt_meta_compact_drops_noise():
+    """변별력 없는 것은 버린다 — [미상] 은 13건 중 12건이 같고 좋아요%는 전부 2~3%대."""
+    meta = "\"Better Stack\" [미상] · 6분 · 조회 126,578 · 좋아요 2.5% · 20260808 · 축 ['MCP']"
+    compact, axes = bridge.yt_meta_compact(meta)
+    assert compact == "6분 · 12.7만 · Better Stack · 8/8"
+    assert axes == ["MCP"] and "미상" not in compact and "좋아요" not in compact
+
+
+def test_yt_meta_compact_survives_garbage():
+    """파싱 실패로 카드가 죽지 않는다 — 메타는 외부 문자열이라 형식이 언제든 바뀔 수 있다."""
+    assert bridge.yt_meta_compact("") == ("", [])
+    assert bridge.yt_meta_compact("형식이 다른 줄") == ("", [])
+
+
+def test_yt_group_by_axis_renumbers_in_display_order():
+    """축으로 묶은 **뒤** 번호를 매긴다 — 원래 순서를 유지하면 본문이 1·5·9 로 튄다."""
+    items = [
+        {"title": "a", "meta": "· 1분 · 축 ['MCP']"},
+        {"title": "b", "meta": "· 1분 · 축 ['하네스']"},
+        {"title": "c", "meta": "· 1분 · 축 ['MCP']"},
+    ]
+    out = bridge.yt_group_by_axis(items)
+    assert [it["title"] for it in out] == ["a", "c", "b"]  # MCP 끼리 붙는다
+    assert [it["axis"] for it in out] == ["MCP", "MCP", "하네스"]
+
+
+def test_yt_group_puts_multi_axis_item_in_first():
+    """축이 둘이면 첫 축에만 넣는다 — 두 묶음에 나오면 한 항목에 번호가 두 개가 된다."""
+    out = bridge.yt_group_by_axis([{"title": "x", "meta": "· 1분 · 축 ['에이전트', '하네스']"}])
+    assert out[0]["axis"] == "에이전트"
+
+
+def test_yt_pick_is_one_per_axis(monkeypatch, tmp_path):
+    """같은 축에서 다른 것을 누르면 **체크가 옮겨간다**(거부 아님).
+
+    상한을 숫자가 아니라 축으로 둔 이유: 같은 축 3건은 내용이 겹쳐 노트가 거의 같아진다.
+    """
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "today.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "posted.txt")
+    bridge.YT_TODAY_F.write_text(_YT_SAMPLE, encoding="utf-8")
+    a = FakeAdapter()
+    bridge.run_yt_digest(a, 7, "2026-08-13")
+    # 샘플은 MCP 1 · 하네스 1 — 축이 달라 둘 다 남는다
+    s = sorted(bridge.yt_pending)
+    bridge._handle_yt_button(a, 7, 99, "yt:tog", str(s[0]))
+    bridge._handle_yt_button(a, 7, 99, "yt:tog", str(s[1]))
+    assert all(bridge.yt_pending[x]["picked"] for x in s)
+
+
+def test_yt_same_axis_pick_moves_check():
+    """같은 축 2건 — 두 번째를 누르면 첫 번째가 풀린다."""
+    items = [
+        {"seq": 1, "title": "a", "axis": "MCP", "picked": True, "compact": ""},
+        {"seq": 2, "title": "b", "axis": "MCP", "picked": False, "compact": ""},
+    ]
+    # `channel_id` 는 실물 그룹(`run_yt_digest`)이 늘 넣는 필드다. 소유권 검사(2026-08-14)가
+    # 이 값을 보므로 테스트 픽스처도 실물과 같은 모양이어야 한다.
+    group = {"channel_id": 7, "items": items, "stamp": "# 2026-08-13"}
+    for it in items:
+        it["group"] = group
+    import bridge as _b
+
+    _b.yt_pending.update({1: items[0], 2: items[1]})
+    _b._handle_yt_button(FakeAdapter(), 7, 99, "yt:tog", "2")
+    assert items[0]["picked"] is False and items[1]["picked"] is True
+
+
+def test_yt_button_rejects_other_channel():
+    """🔐 다른 채널에서 온 콜백은 거절한다 — seq 는 1,2,3… 으로 예측 가능하다.
+
+    없으면 남의 채널 카드를 토글·소진하고 그 후보 제목·URL 이 호출자 채널로 흘러간다
+    (`_handle_digest_button` 이 같은 검사를 하고 있었다).
+    """
+    it = {"seq": 1, "title": "a", "axis": "MCP", "picked": False, "compact": ""}
+    it["group"] = {"channel_id": 7, "items": [it], "stamp": "# 2026-08-14"}
+    bridge.yt_pending[1] = it
+    a = FakeAdapter()
+    bridge._handle_yt_button(a, 999, 99, "yt:tog", "1")  # 다른 채널에서 호출
+    assert it["picked"] is False, "남의 채널 카드가 토글됐다"
+    assert "만료" in a.sent[-1][1]
+
+
+def test_yt_card_text_groups_and_dates():
+    items = bridge.yt_group_by_axis(
+        [
+            {"title": "a", "meta": "\"Ch\" · 6분 · 조회 12,000 · 20260808 · 축 ['MCP']"},
+            {"title": "b", "meta": "\"Ch\" · 9분 · 조회 3,000 · 20260801 · 축 ['하네스']"},
+        ]
+    )
+    for i, it in enumerate(items, 1):
+        it["seq"] = i
+        it["picked"] = i == 1  # ✅ 분기를 **실제로 태운다** (종전엔 전부 False 라 공회전했다)
+    body = bridge.yt_card_text("# 유튜브 후보 — 2026-08-12 00:08 · 요청 31/40", items)
+    assert body.startswith("[ 2026-08-12 ]")
+    assert "**MCP** · 1건" in body and "**하네스** · 1건" in body
+    # 고른 것 ✅ / 안 고른 것 ▫ — 이중 렌더는 의도된 것이다(폰에서 버튼이 목록 아래 멀다).
+    # 종전 이 테스트는 전 항목 picked=False + `assert "⬜" not in body` 만 봐서, 본문 표시를
+    # 통째로 `▫` 고정으로 바꿔도 통과했다(2026-08-14 QA 게이트 실측 — 흠집 생존).
+    assert "✅ **1.** a" in body
+    assert "▫ **2.** b" in body
+    assert "⬜" not in body  # 옛 글리프는 안 쓴다
+
+
+def test_repo_paths_actually_exist():
+    """상수가 가리키는 **실경로가 실재하는지** 단언한다.
+
+    2026-08-14 실사고: `_Core/` 를 역할별 폴더로 재배치하면서 `BACKLOG_FILE` 만 옛 경로에
+    남았다. `Path` 연산자로 쪼개져 있어(`REPO_ROOT / "_Core" / "OPTIMIZE_BACKLOG.md"`)
+    문자열 일괄 치환을 비껴갔고, docstring 은 새 경로로 갱신돼 **문서만 맞고 코드가 틀린**
+    상태가 됐다. 그런데 테스트 1,362건이 전부 통과했다 — `BACKLOG_FILE` 을 쓰는 테스트가
+    **하나같이 monkeypatch** 해서 실경로를 아무도 안 봤기 때문이다.
+
+    읽기 실패는 `except OSError` 로 삼켜져 로그도 안 남는다(무음 실패). 그래서 이 테스트가
+    유일한 방어선이다. ⚠️ **`conftest.LIVE_PATHS` 를 쓴다** — `bridge.BACKLOG_FILE` 을 직접
+    읽으면 autouse 격리 fixture 가 덮은 tmp 경로가 나와 검사가 무의미해진다.
+    """
+    from conftest import LIVE_PATHS
+
+    for name, p in LIVE_PATHS.items():
+        assert p.exists(), f"{name} 이 가리키는 {p} 가 없다 — 파일이 옮겨졌나?"
+
+
+def test_backlog_read_returns_content():
+    """경로가 맞아도 **실제로 읽히는지**까지 본다(존재만으로는 무음 실패를 못 잡는다)."""
+    from conftest import LIVE_PATHS
+
+    body = bridge.harness_backlog(LIVE_PATHS["BACKLOG_FILE"])
+    assert body, "백로그를 못 읽었다 — BACKLOG_FILE 경로나 권한을 확인하라"
+
+
+def test_yt_buttons_skips_items_without_seq():
+    """seq 없는 항목은 **건너뛴다** — 안 그러면 `it["seq"]` 가 KeyError 로 카드를 통째로 죽인다.
+
+    2026-08-14 QA 게이트: `if it.get("seq") is not None` 를 `if True` 로 바꿔도 447건 전원
+    통과했다(경계 미커버). 보류맵 등재 전 항목이 섞여 들어오는 경로가 실재하므로 고정한다.
+    """
+    items = [{"seq": 1, "picked": False}, {"picked": False}, {"seq": 3, "picked": False}]
+    btns = bridge.yt_buttons(items)
+    assert [b.arg for b in btns] == ["1", "3"]  # seq 없는 가운데 항목은 빠진다
+
+
+def test_yt_digest_send_failure_reverts(monkeypatch, tmp_path):
+    """게시 실패(`send` 가 None)면 **False 를 돌리고 스탬프를 안 남긴다**.
+
+    2026-08-14 실사고: `adapter.send` 를 try/except 로 감쌌는데 어댑터는 계약상 예외를
+    던지지 않는다(§3.3 — 실패는 로그+None). 그래서 except 가 죽은 코드가 되고 실패가
+    True 로 나가 `_yt_mark_posted` 가 스탬프를 남겼다. 유튜브는 그 스탬프가 **파일로**
+    남아 다음 선별(3일 뒤)까지 카드가 영영 안 뜬다. `run_us_digest` 는 20줄 위에서
+    같은 금지를 명문으로 적어두고 있었다.
+    """
+
+    class _DeadSend(FakeAdapter):
+        def send(self, *a, **k):  # noqa: ARG002 — 계약상 시그니처를 맞춘 스텁
+            return None  # 어댑터가 삼킨 실패 — 예외가 아니라 None 이다
+
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "today.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "posted.txt")
+    bridge.YT_TODAY_F.write_text(_YT_SAMPLE, encoding="utf-8")
+
+    assert bridge.run_yt_digest(_DeadSend(), 7, "2026-08-14") is False
+    assert not bridge.YT_POSTED_F.exists(), "게시 실패인데 스탬프를 남겼다 — 3일간 잠긴다"
+    assert not bridge.yt_pending, "게시 안 된 보류 항목이 남았다"
+
+
+def test_yt_meta_compact_regex_boundaries():
+    """정규식이 **엉뚱한 곳을 먼저 잡는** 두 경우를 고정한다(2026-08-14 실측).
+
+    ① 채널명에 숫자+분이 들어가면 길이를 그것으로 읽었다 — `"1분코딩" … · 42분` 이 카드에
+       **1분**으로 떴다(1분코딩·3분코딩은 실존 채널). 길이는 «볼 각오»를 재는 지표라
+       틀리면 선택 판단을 직접 오도한다.
+    ② 축이 없는 항목은 업로드일이 줄 끝에 와서 뒤 `·` 를 요구하던 패턴이 조용히 놓쳤다.
+    """
+    c1, _ = bridge.yt_meta_compact(
+        "\"1분코딩\" [미상] · 42분 · 조회 126,578 · 좋아요 2.5% · 20260808 · 축 ['MCP']"
+    )
+    assert c1.startswith("42분"), c1
+
+    c2, axes = bridge.yt_meta_compact('"Ch" [미상] · 6분 · 조회 100 · 20260808')
+    assert axes == [] and c2.endswith("8/8"), c2  # 축 없어도 날짜는 남는다

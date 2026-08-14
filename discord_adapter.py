@@ -148,7 +148,18 @@ _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
     # 한다(히스토리·권한 보존). `_READONLY_TAGS`·`notify.json` 의 `channel` 도 tag 기준이라
     # 함께 무변경. 같은 규칙의 선례 = 위 게스트질문("role tag/채널명 불변").
     # 2026-08-02: 카드가 미국장 7 + 국내장 3 이 되어 표시명 `미국주식` → `반도체주식`.
-    _CAT_SCHED: [("반도체주식", "role", "미국주식"), ("오픈소스", "role", "오픈소스")],
+    # 2026-08-13: 유튜브 노트 파이프라인 채널 3개 추가(개발자 지시). 순서도 개발자 지정.
+    #   표시명은 **하이픈 제거 후 실제로 보일 이름을 그대로** 적는다 — 위 98줄대로 채널명에서
+    #   하이픈이 지워지므로 `유튜브-Dev` 라 써도 `#유튜브dev` 로 뜬다. 헷갈리지 않게 결과를 적었다.
+    #   tag 는 **레포·드라이브 폴더명과 일치**시켜 `notify.json` 의 `channel` 값과 갈리지 않게 한다
+    #   (tag 는 절대 고치지 말 것 — 위 경고. 표시명만 바꾸면 기존 채널이 제자리 rename 된다).
+    _CAT_SCHED: [
+        ("반도체주식", "role", "미국주식"),
+        ("오픈소스", "role", "오픈소스"),
+        ("유튜브dev", "role", "유튜브-Dev"),
+        ("유튜브일반", "role", "유튜브-일반"),
+        ("개발자료", "role", "개발자료"),  # 드라이브 폴더도 `개발-Dev` → `개발자료` 로 개명
+    ],
     _CAT_SYSTEM: [("알림", "role", "알림"), ("봇상태", "role", "봇상태")],  # 하이픈 원천 제거
 }
 # 사람이 글을 못 쓰는 채널(tag 기준 — 표시명 `#반도체주식`). **봇이 카드를 밀어넣기만 하고
@@ -1306,7 +1317,19 @@ class DiscordAdapter:
             fut = asyncio.run_coroutine_threadsafe(coro, loop)
             return fut.result(timeout=timeout)
         except Exception as e:  # §3.3: 모든 플랫폼 오류를 삼키고 로그(코어 직렬 루프 보호)
-            log.warning("디스코드 호출 실패: %s", type(e).__name__)
+            # 사유까지 남긴다(2026-08-13) — 타입만으로는 왜 400 인지 알 수 없어, 실제로
+            # 카드가 안 뜨는 원인을 찾는 데 재기동을 몇 번 반복해야 했다. HTTPException 의
+            # 본문은 디스코드 API 의 검증 메시지(어느 필드가 왜 거부됐는지)라 진단 가치가 크다.
+            # 300자로 자른다 — 컴포넌트 오류는 항목별로 길게 나온다.
+            # `except Exception` 이라 디스코드 HTTPException 만 오는 게 아니다 — aiohttp 는 URL·
+            # 호스트를, 우리 코루틴의 ValueError/TypeError 는 페이로드 조각을 문자열에 싣는다.
+            # 이 모듈은 머리말에서 «전송 직전 mask_secrets 로 방어심층 마스킹» 을 선언했으므로
+            # 로그도 같은 문을 지난다(`.env` 값·내부 절대경로가 대상, 2026-08-14).
+            log.warning(
+                "디스코드 호출 실패: %s — %s",
+                type(e).__name__,
+                mask_secrets(str(e), self.secrets)[:300],
+            )
             return None
 
     async def _send_coro(self, channel_id: int, payload: Any, view: Any) -> int | None:

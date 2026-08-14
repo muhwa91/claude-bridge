@@ -235,6 +235,14 @@ def parse_callback(data: str) -> tuple[str, str] | None:
             if _valid_id(item_id):
                 return (prefix[:-1], item_id)
             return None
+    for _yt in ("yt:tog:", "yt:go:"):
+        # 🎬 yt:tog:<seq> | yt:go:<seq> — seq 는 우리가 발행한 정수지만 callback_data 는
+        # 신뢰 경계 밖이라 다른 정수 arg 들과 같은 문(isascii+isdigit)을 통과시킨다(L-3).
+        if data.startswith(_yt):
+            seq = data[len(_yt) :]
+            if seq.isascii() and seq.isdigit():
+                return (_yt[:-1], seq)
+            return None
     if data.startswith("c:"):
         # c:<msg_id>:<idx|other> — msg_id 정수, 선택은 정수 인덱스 또는 'other'.
         # L-3: isascii() 병행으로 전각·위첨자 등 유니코드 숫자(int() 통과)를 차단.
@@ -300,6 +308,12 @@ def encode_callback(action: str, arg: str) -> str:
         "fav:add",
         "fav:del",
         "od:rev",
+        # 🎬 유튜브 후보 다중 선택(2026-08-13) — arg=seq(정수).
+        # ⚠️ **여기 등록을 잊으면 arg 가 통째로 버려진다**(폴백이 `return action`).
+        # 그러면 후보 13개의 custom_id 가 전부 `yt:tog` 로 같아져 디스코드가 카드를
+        # **400 Invalid Form Body(중복 custom_id)** 로 거부한다 — 실제로 그렇게 실패했다.
+        "yt:tog",
+        "yt:go",
     )
     if action in _joined:
         return f"{action}:{arg}"

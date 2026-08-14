@@ -18,6 +18,7 @@ logs/opensource_seen.json
 logs/opensource_rejected.jsonl
 logs/awesome_snapshot.md
 logs/awesome_snapshot.tmp
+logs/yt_posted.txt
 logs/digest_dryrun.txt
 logs/us_sec_facts.json
 logs/us_sec_facts.tmp
@@ -40,7 +41,10 @@ htmlcov/
 .oauth_client.json
 .oauth_token.json
 
-# Claude 생성 임시 산출물 (미리보기·초안 — 커밋 대상 아님)
+# `_Temp_files/` 는 2026-08-13 에 폐지됐지만 **이 규칙은 남긴다** — 이 파일은 공개 미러
+# `muhwa91/claude-bridge` 에 그대로 커밋되는 파일이라, 지우면 **공개 레포의 방어선**이 함께 사라진다.
+# "다시 생기면 눈에 띄게" 라는 의도는 비공개 루트 `.gitignore` 만으로 이미 달성된다.
+# (2026-08-13 보안 게이트 지적 H-1 — 한 번 지웠다가 되돌림)
 _Temp_files/
 
 # 빌드 산출물
@@ -61,6 +65,3 @@ Thumbs.db
 tools/.yt_cache.json
 tools/.yt_lastrun
 tools/.yt_today.md
-
-# 공개 미러 제외 — 실명 채널에 대한 판정이 들어간다(공개 부적합)
-tools/yt_channel_rep.json

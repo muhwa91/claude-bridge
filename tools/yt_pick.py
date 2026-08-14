@@ -559,7 +559,9 @@ def selftest() -> int:
         == r"WinError 5: \\NAS01\Users\<user>\c.txt"
     ), clean(r"\\NAS01\Users\TestUser\c.txt")  # UNC
     assert clean("/home/test user/.cache/x") == "/home/<user>/.cache/x", clean("/home/test user/x")
-    assert clean("/Users/testuser/Library/x") == "/Users/<user>/Library/x", clean("/Users/testuser/x")
+    assert clean("/Users/testuser/Library/x") == "/Users/<user>/Library/x", clean(
+        "/Users/testuser/x"
+    )
     assert (
         clean("ProxyError(proxy=http://user:s3cr3t@10.0.0.5:8080)")
         == "ProxyError(proxy=http://<redacted>@10.0.0.5:8080)"

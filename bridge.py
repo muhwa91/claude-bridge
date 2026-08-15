@@ -5526,6 +5526,16 @@ def _handle_button(
             else:
                 adapter.send(channel_id, body, btns)
         elif verb in ("go", "why"):
+            # 🔴 **확인창을 먼저 소비한다 — 버튼을 남기면 게이트가 무의미하다.**
+            #   2026-08-16 실사용 시험에서 잡혔다: [실행] 을 눌러도 확인창이 버튼째 남아
+            #   **몇 번이든 다시 누를 수 있었다.** 누를 때마다 클로드가 돈다 —
+            #   게이트가 막으려던 바로 그것이다.
+            #   기존 `push`·`x` 는 눌리면 메시지를 결과로 갈아끼워 버튼을 없앤다. 그 패턴을 따른다.
+            #   ⚠️ **실행 «전에»** 갈아끼운다. 실행은 오래 걸리므로 그 사이에 또 눌릴 수 있다.
+            if isinstance(message_id, int):
+                mark = "🔍 원인 분석" if verb == "why" else "▶ 실행합니다"
+                head = str(entry.get("task", ""))[:60]
+                adapter.edit(channel_id, message_id, f"{mark}\n\n> {head}", [])
             proj = str(entry.get("project_path", ""))
             task = str(entry.get("task", ""))
             if verb == "why":

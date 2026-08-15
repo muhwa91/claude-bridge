@@ -9455,3 +9455,21 @@ def test_macro_run_goes_through_confirm_gate(tmp_path, monkeypatch):
     assert "사용량이 소모" in str(body)
     btns = a.edited[-1][3] if a.edited else None
     assert btns and any(b.action == "r" and b.arg.endswith(":go") for b in btns)
+
+
+def test_r_go_consumes_the_confirm_card(monkeypatch):
+    """🔴 [실행] 을 누르면 확인창의 버튼이 사라져야 한다 — 안 그러면 몇 번이든 다시 눌린다.
+
+    2026-08-16 실사용 시험에서 잡힌 결함이다. 게이트를 통과한 카드가 살아 있으면
+    **누를 때마다 클로드가 돈다** — 게이트가 막으려던 바로 그것이다.
+    기존 `push`·`x` 는 눌리면 메시지를 갈아끼워 버튼을 없앤다(같은 규칙).
+    """
+    bridge.resumable.clear()
+    bridge._remember_reply_target(55, "sid", "/p", 777, task="배포해줘", tools=None)
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_kw: {})
+    a = FakeAdapter()
+    _fire(a, _btn(777, "r", "55:go"), target_root="root")
+    assert a.edited, "확인창을 갈아끼우지 않았다"
+    _ch, _mid, text, btns = a.edited[-1]
+    assert "실행합니다" in text
+    assert not btns, f"버튼이 남았다: {btns}"

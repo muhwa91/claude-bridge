@@ -27,8 +27,13 @@ if (-not $NoPing) {
         -Encoding ascii -ErrorAction SilentlyContinue
 }
 
+# 프로세스 판정 — 2026-08-16 정정. 종전 `-like '*bridge.py*'` 는 **자기 자신과 pytest 도** 잡았다:
+#   · `pytest tests/test_bridge.py`  ← 파일명에 'bridge.py' 가 들어 있다
+#   · `python -c "... 'claude-bridge/bridge.py' ..."`  ← 경로 문자열
+# 그래서 테스트를 돌리는 중에 이 스크립트를 실행하면 **ALREADY_RUNNING 으로 오판**했다.
+# `[\/ ]` 앞자리 + 끝 앵커라야 진짜 기동(`python.exe" bridge.py`)만 잡는다(실증 표는 작업일지).
 $running = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*bridge.py*' })
+    Where-Object { $_.CommandLine -match '[\/ ]bridge\.py\s*$' })
 
 if ($running.Count -gt 0 -and -not $Force) {
     Write-Output ("ALREADY_RUNNING pid={0}" -f ($running[0].ProcessId))

@@ -11,6 +11,8 @@ logs/bridge.ready
 logs/notify_state.json
 logs/channel_map.json
 logs/channel_sessions.json
+# 1e 매크로 — 즐겨찾기·최근 실행. **작업 지시 원문이 들어간다**(프로젝트 경로·내부 사정).
+logs/macros.json
 logs/restart_notice.json
 logs/photos/
 logs/session_ping

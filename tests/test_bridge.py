@@ -1104,17 +1104,18 @@ def test_parse_callback_recent_rejects_bad():
     assert parse_callback("rec:²") is None  # 위첨자 숫자 차단(isascii)
 
 
-def test_unrouted_callbacks_ack_only():
-    """1e(fav·rec)는 아직 코덱만 — _handle_button 미분기라 ack 후 무시(안전).
+def test_macro_callbacks_route_and_fail_safe():
+    """1e 라우팅 — 목록이 비었거나 인덱스가 밀린 버튼은 **실행하지 않고** 이유를 말한다.
 
-    ⚠️ `r` 은 2026-08-16 에 **1b 로 라우팅됐다** — 이 테스트에서 뺐다.
-    라우팅된 것을 여기 남겨두면 «미분기라 안전» 이라는 이 테스트의 주장이 거짓이 된다.
+    ⚠️ 2026-08-16 로 `r`·`fav`·`rec` 가 전부 라우팅됐다. 종전 이 테스트는
+    「미분기라 ack 후 무시」를 고정하고 있었는데, 라우팅된 뒤엔 그 주장이 거짓이 된다.
+    조용히 다른 항목을 돌리는 것이 이 기능의 가장 나쁜 실패라, 그 자리를 대신 잠근다.
     """
     a = FakeAdapter()
-    _fire(a, _btn(777, "fav:add", "2"), target_root="root")
     _fire(a, _btn(777, "rec", "3"), target_root="root")
-    assert [c for c, _n in a.acked] == ["cq1", "cq1"]  # ack 만
-    assert a.sent == [] and a.edited == []  # 무시(부작용 없음)
+    _fire(a, _btn(777, "fav:del", "9"), target_root="root")
+    assert len(a.sent) == 2
+    assert all("없습니다" in s[1] for s in a.sent)
 
 
 def test_r_callback_miss_tells_why():
@@ -9398,3 +9399,59 @@ def test_followup_not_attached_to_choice_messages():
     # 계약: choice is not None 이면 followup=None. 구현이 그 조건을 갖는지 소스로 고정한다.
     src = inspect.getsource(bridge.run_claude_with_progress)
     assert "choice is None" in src and "_followup_buttons" in src
+
+
+# ══════════════════════════════════════════════
+# 1e 매크로 (계약 §4.5) — 2026-08-16
+# ══════════════════════════════════════════════
+# 위험은 «저장이 되는가»가 아니라 **엉뚱한 것을 실행하는 것**이다(인덱스 밀림·손상 파일).
+
+
+def test_load_macros_survives_broken_file(tmp_path):
+    """손으로 편집할 수 있는 파일이라, 한 줄이 깨졌다고 기능 전체가 죽으면 안 된다."""
+    p = tmp_path / "m.json"
+    assert bridge.load_macros(p) == {"favorites": [], "recent": []}  # 없음
+    p.write_text("{ 깨진", encoding="utf-8")
+    assert bridge.load_macros(p) == {"favorites": [], "recent": []}  # 손상
+    p.write_text('{"favorites": [{"task": ""}, {"task": "ok"}], "recent": "x"}', encoding="utf-8")
+    got = bridge.load_macros(p)
+    assert [f["task"] for f in got["favorites"]] == ["ok"]  # 빈 task 는 버린다
+    assert got["recent"] == []  # 리스트가 아니면 버린다
+
+
+def test_push_recent_dedups_and_caps():
+    """같은 지시를 또 하면 목록이 그것으로 채워지는 것을 막는다(끌어올리기)."""
+    d = {"favorites": [], "recent": []}
+    for i in range(8):
+        bridge.push_recent(d, "/p", f"t{i}")
+    assert len(d["recent"]) == bridge._RECENT_MAX
+    assert d["recent"][0]["task"] == "t7"  # 최신이 앞
+    bridge.push_recent(d, "/p", "t4")
+    assert d["recent"][0]["task"] == "t4"
+    assert [r["task"] for r in d["recent"]].count("t4") == 1  # 중복 없음
+    bridge.push_recent(d, "/p", "   ")  # 공백은 담지 않는다
+    assert d["recent"][0]["task"] == "t4"
+
+
+def test_macro_label_numbers_and_truncates():
+    assert bridge._macro_label({"name": "배포"}, 0) == "1. 배포"
+    long = bridge._macro_label({"task": "가" * 60}, 2)
+    assert long.startswith("3. ") and long.endswith("…") and len(long) < 50
+
+
+def test_macro_run_goes_through_confirm_gate(tmp_path, monkeypatch):
+    """🔴 매크로도 **즉시 실행하지 않는다** — 1b 확인 게이트(`r:*:go`)로 수렴한다(계약)."""
+    m = tmp_path / "m.json"
+    m.write_text(
+        '{"favorites": [], "recent": [{"project": "", "task": "배포해줘"}]}', encoding="utf-8"
+    )
+    monkeypatch.setattr(bridge, "MACROS_FILE", m)
+    ran = []
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *a, **_kw: ran.append(a) or {})
+    a = FakeAdapter()
+    _fire(a, _btn(777, "rec", "0"), target_root="root")
+    assert ran == []  # 실행 0
+    body = (a.edited or a.sent)[-1]
+    assert "사용량이 소모" in str(body)
+    btns = a.edited[-1][3] if a.edited else None
+    assert btns and any(b.action == "r" and b.arg.endswith(":go") for b in btns)

@@ -880,11 +880,11 @@ def test_enqueue_coro_noop_when_stopping():
 
 def test_message_event_channel_map_project_and_role():
     a = _adapter()
-    a._channel_map = {100: ("project", "etf_info"), 200: ("role", "간단처리")}
+    a._channel_map = {100: ("project", "etf_info"), 200: ("role", "알림")}
     ev_p = a._message_event(_msg(777, "hi", channel_id=100, channel_name="딴이름"))
     assert ev_p.project == "etf_info" and ev_p.channel_role is None  # 채널ID 매핑 우선
     ev_r = a._message_event(_msg(777, "hi", channel_id=200))
-    assert ev_r.channel_role == "간단처리" and ev_r.project is None
+    assert ev_r.channel_role == "알림" and ev_r.project is None
 
 
 def test_message_event_unmapped_falls_back_to_channel_name():
@@ -1042,15 +1042,10 @@ def test_ensure_channels_creates_categories_channels_and_persists(tmp_path):
     asyncio.run(a._ensure_channels())
     tags = set(a._channel_map.values())
     assert {
-        ("role", "간단처리"),
-        ("role", "데이터분석"),
         ("role", "알림"),
         ("role", "봇상태"),
     } <= tags
     assert {("project", "etf_info"), ("project", "trading_info")} <= tags
-    assert any(
-        topic == discord_adapter._DATA_TOPIC for _n, topic in guild.created
-    )  # 데이터-분석 토픽
     assert a.role_channel("알림") is not None and a.role_channel("봇상태") is not None
     assert cm.exists()  # 영속
     assert discord_adapter.load_channel_map(cm) == a._channel_map
@@ -1079,8 +1074,8 @@ def test_concurrent_on_ready_no_duplicate(monkeypatch):
         await asyncio.gather(a._ensure_channels(), a._ensure_channels())
 
     asyncio.run(two_on_ready())
-    # 카테고리 7개(간단처리·프로젝트·데이터분석·스케쥴러·시스템·질문·PlayList, 중복 X).
-    assert len(guild.categories) == 7
+    # 카테고리 5개(프로젝트·스케쥴러·시스템·질문·PlayList) — 간단처리·데이터분석 제거(2026-08-16).
+    assert len(guild.categories) == 5  # 간단처리·데이터분석 제거(2026-08-16)
     assert [n for n, _ in guild.created].count("etf_info") == 1
 
 
@@ -1144,7 +1139,7 @@ def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch)
 
     class _RejectingGuild(_FakeGuild):
         async def create_text_channel(self, name, **kwargs):
-            if name == "알림":  # 특정 채널만 생성 거부(권한 없음 모사)
+            if name == "봇상태":  # 특정 채널만 생성 거부(권한 없음 모사)
                 raise discord.DiscordException("forbidden")
             return await super().create_text_channel(name, **kwargs)
 
@@ -1154,9 +1149,9 @@ def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch)
     a._client = SimpleNamespace(guilds=[guild])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())  # 예외로 안 죽음
     tags = set(a._channel_map.values())
-    assert ("role", "알림") not in tags  # 실패한 채널은 미매핑(스킵)
+    assert ("role", "봇상태") not in tags  # 실패한 채널은 미매핑(스킵)
     # 형제 채널·프로젝트·다른 특수채널은 정상 매핑(부분 실패가 전체를 무너뜨리지 않음)
-    assert {("role", "간단처리"), ("role", "봇상태"), ("project", "etf_info")} <= tags
+    assert {("role", "알림"), ("project", "etf_info")} <= tags
 
 
 # ---------------------------------------------------------------------------
@@ -1217,21 +1212,8 @@ def test_special_channel_names_are_joined(monkeypatch):
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     created = {n for n, _ in guild.created}
-    assert {"간단처리", "데이터분석", "알림", "봇상태"} <= created
+    assert {"알림", "봇상태"} <= created
     assert not any("-" in n for n in created)  # 하이픈 없음
-
-
-def test_simple_channel_name_idempotent(monkeypatch):
-    # 간단처리 텍스트 채널이 이미 정상명이면 재기동해도 리네임 안 함(정확 일치 skip).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
-    simple = _FakeChannel(700, "간단처리")
-    a._channel_map = {700: ("role", "간단처리")}
-    _guild_for(a, text_channels=[simple])
-    asyncio.run(a._ensure_channels())
-    assert simple.renames == []  # 이미 목표명 → skip
-    assert a._channel_map[700] == ("role", "간단처리")  # 라우팅 태그 불변
 
 
 def test_rename_rejected_keeps_mapping(monkeypatch):
@@ -1240,11 +1222,11 @@ def test_rename_rejected_keeps_mapping(monkeypatch):
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
     simple = _FakeChannel(700, "구이름", reject_rename=True)  # 목표명과 달라 리네임 시도됨
-    a._channel_map = {700: ("role", "간단처리")}
+    a._channel_map = {700: ("role", "알림")}
     _guild_for(a, text_channels=[simple])
     asyncio.run(a._ensure_channels())
-    assert simple.renames == ["간단처리"] and simple.name == "구이름"  # 시도했으나 거부→기존명 보존
-    assert a._channel_map[700] == ("role", "간단처리")  # 매핑 유지(라우팅 OK)
+    assert simple.renames == ["알림"] and simple.name == "구이름"  # 시도했으나 거부→기존명 보존
+    assert a._channel_map[700] == ("role", "알림")  # 매핑 유지(라우팅 OK)
 
 
 def test_label_fallback_to_folder_when_no_label(monkeypatch):
@@ -1274,9 +1256,6 @@ def test_special_registers_guest_role_in_question_category(monkeypatch):
     # 게스트질문 role 은 ❓ 질문 카테고리, 간단처리 role 은 🗂️ 간단처리(게스트 뺌·무손상).
     assert ("게스트질문", "role", "게스트질문") in discord_adapter._SPECIAL[
         discord_adapter._CAT_QUESTION
-    ]
-    assert discord_adapter._SPECIAL[discord_adapter._CAT_SIMPLE] == [
-        ("간단처리", "role", "간단처리")
     ]
     # 카테고리 순서: 시스템 < 질문 < PlayList.
     order = discord_adapter._CAT_ORDER
@@ -1323,21 +1302,19 @@ def test_categories_ordered(monkeypatch):
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     order = {discord_adapter._cat_core(c.name): c.position for c in guild.categories}
-    assert order["간단처리"] == 0
-    assert order["프로젝트"] == 1
-    assert order["데이터분석"] == 2
-    assert order["스케쥴러"] == 3  # 🗓️ 스케쥴러 (데이터분석 아래·시스템 위)
-    assert order["시스템"] == 4
-    assert order["질문"] == 5  # ❓ 질문 (시스템 아래·PlayList 위)
-    assert order["playlist"] == 6  # 🎵 PlayList
+    # 간단처리·데이터분석은 2026-08-16 제거 — 순서가 앞으로 당겨졌다.
+    assert order["프로젝트"] == 0
+    assert order["스케쥴러"] == 1  # 🗓️ 스케쥴러 (프로젝트 아래·시스템 위)
+    assert order["시스템"] == 2
+    assert order["질문"] == 3  # ❓ 질문 (시스템 아래·PlayList 위)
+    assert order["playlist"] == 4  # 🎵 PlayList
 
 
 def test_scheduler_category_in_order_between_data_and_system():
-    # 🗓️ 스케쥴러 = _CAT_ORDER index 3(데이터분석 아래·시스템 위).
+    # 🗓️ 스케쥴러 = _CAT_ORDER index 1(프로젝트 아래·시스템 위).
     order = discord_adapter._CAT_ORDER
-    assert order.index(discord_adapter._CAT_SCHED) == 3
-    assert order[2] == discord_adapter._CAT_DATA
-    assert order[4] == discord_adapter._CAT_SYSTEM
+    assert order.index(discord_adapter._CAT_SCHED) == 1
+    assert order[2] == discord_adapter._CAT_SYSTEM
     assert discord_adapter._CAT_ALIASES[discord_adapter._CAT_SCHED] == ["스케쥴러"]
 
 
@@ -1595,7 +1572,7 @@ def test_categories_created_with_emoji(monkeypatch):
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     names = {c.name for c in guild.categories}
-    assert {"🗂️ 간단처리", "📁 프로젝트", "📊 데이터분석", "⚙️ 시스템", "🎵 PlayList"} <= names
+    assert {"📁 프로젝트", "⚙️ 시스템", "🎵 PlayList"} <= names
 
 
 def test_existing_category_renamed_to_emoji_idempotent(monkeypatch):
@@ -1603,11 +1580,11 @@ def test_existing_category_renamed_to_emoji_idempotent(monkeypatch):
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
-    plain = _FakeCategory("간단처리")
-    already = _FakeCategory("📊 데이터분석")  # 이미 이모지형
+    plain = _FakeCategory("프로젝트")
+    already = _FakeCategory("⚙️ 시스템")  # 이미 이모지형
     _guild_for(a, categories=[plain, already])
     asyncio.run(a._ensure_channels())
-    assert plain.renames == ["🗂️ 간단처리"]  # 코어명 매칭 → 이모지 rename
+    assert plain.renames == ["📁 프로젝트"]  # 코어명 매칭 → 이모지 rename
     assert already.renames == []  # 정확 일치 → skip(멱등)
 
 
@@ -1711,7 +1688,7 @@ def test_nonempty_default_category_kept(monkeypatch):
 
 
 def test_bot_category_not_deleted_even_if_empty(monkeypatch):
-    # 봇 카테고리(간단처리 등)는 기본 이름 목록에 없어 삭제 대상 아님.
+    # 봇 카테고리(프로젝트 등)는 기본 이름 목록에 없어 삭제 대상 아님.
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])

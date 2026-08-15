@@ -180,8 +180,6 @@ COMMANDS = (
     | frozenset(COMMAND_ALIASES)
     | PUSH_WORDS
 )
-# 특수 채널 역할 중 "프로젝트 무관 일반 실행" 대상(§4.4). 데이터분석 한계 안내는 채널 토픽에 1회.
-_GENERAL_ROLES = frozenset({"간단처리", "데이터분석"})
 # 플레이리스트 전용 채널(🎵 PlayList) — 사람끼리 대화하는 공간이라 화이트리스트(음악 재생·청소·
 # ㅁ추가)만 처리하고 그 외는 반응·안내 없이 조용히 무시한다(_handle_text 최상단 게이트). 태그는
 # _ensure_voice 가 durable 하게 관리하는 "playlist"(계약의 '플레이리스트'는 이 내부 태그로 실현).
@@ -189,7 +187,7 @@ _MUSIC_ONLY_ROLES = frozenset({"playlist"})
 
 # ── 게스트질문 채널(개발자 외 서버 멤버용 웹검색 Q&A, 격리) ──────────────────────
 # role 태그. 이 채널의 실행은 도구=WebSearch 1개·cwd=격리 샌드박스로 워크스페이스(파일·bash·git·
-# CLAUDE.md·프로젝트 목록) 노출을 0으로 막는다. 기존 "간단처리"(개발자 전용·full)와 별개.
+# CLAUDE.md·프로젝트 목록) 노출을 0으로 막는다. 프로젝트 채널(개발자 전용·full)과 별개.
 _GUEST_ROLE = "게스트질문"
 # 게스트 실행 허용 도구 = WebSearch 하나(파일/bash/git 없음). WebFetch 는 뺀다 — 게스트가 로컬
 # 서비스(localhost:8000/8080/5173, 개발자 trading-info API·프론트)를 fetch 하는 SSRF 를 argv 로
@@ -205,7 +203,7 @@ GUEST_TOOLS = ["WebSearch"]
 # 거슬러 로드(루트 헌법·프로젝트 CLAUDE.md)해 격리가 깨지기 때문(레포 하위 .guest_sandbox 안 씀).
 GUEST_SANDBOX_DIR = Path(tempfile.gettempdir()) / "claude_bridge_guest_sandbox"
 # 게스트 전용 최소 시스템 프롬프트. 기본 BRIDGE_SYSTEM_PROMPT 는 내부 명칭(_Template/Dev·CLAUDE.md
-# ·간단처리·push 흐름)을 담아 인젝션 시 구조가 노출될 여지가 있어, 게스트엔 이 최소본만 준다
+# ·push 흐름)을 담아 인젝션 시 구조가 노출될 여지가 있어, 게스트엔 이 최소본만 준다
 # (비밀·파일은 도구0이라 애초에 불가 — 명칭 노출까지 차단).
 GUEST_SYSTEM_PROMPT = (
     "너는 웹 검색만 할 수 있는 공개 질문답변 봇이다. "
@@ -225,7 +223,7 @@ BRIDGE_SYSTEM_PROMPT = (
     "따라서 세션 시작 신원 확인·비밀번호·작업 선택 메뉴를 절대 수행하지 말고, "
     "인사 없이 지시된 작업을 현재 작업 디렉터리에서 바로 수행하라. "
     "코드·프로젝트와 무관한 일반 질문(지식·방법·정보·시세 등)이면 프로젝트 작업 범위를 "
-    "따지거나 거부하지 말고 그냥 아는 대로 답하라(#간단처리 채널은 이런 자유 질문 모드다). "
+    "따지거나 거부하지 말고 그냥 아는 대로 답하라. "
     "코드나 파일을 실제로 변경했다면 커밋은 **네가 하지 마라** — 너에겐 셸·git 도구가 없다. "
     "대신 응답 **마지막 줄**에 정확히 "
     "`📦커밋: <Conventional Commit 메시지> :: <경로1>, <경로2>` 형식으로 보고하면 "
@@ -248,7 +246,7 @@ BRIDGE_SYSTEM_PROMPT = (
 )
 
 # claude CLI 허용 도구 화이트리스트(= 안전 경계). WebSearch/WebFetch(읽기전용 웹조회)는 허용 —
-# #간단처리 등에서 시세·정보 질문에 답하기 위함.
+# 프로젝트 채널에서 시세·정보 질문에도 답하기 위함.
 # ▸ **Bash 는 한 항목도 없다 (2026-08-16 security 게이트 D1)**. 종전엔
 #   `Bash(git add/commit/status/diff *)`·`Bash(ruff/mypy/pytest *)` 7개가 남아 있었고,
 #   **그 7개가 곧 임의 셸이었다** — 접두 글롭의 `*` 는 명령 끝이 아니라 **문자열 끝까지** 먹어
@@ -5047,11 +5045,9 @@ def _resolve_photo_cwd(event: Event, target_root: str) -> str | None:
     """이 채널에서 사진 실행 대상(cwd)을 해석한다 — 없으면 None(프로젝트 선택 필요).
 
     _run_photo 실행 규칙과 _handle_text 의 보류-소비 게이트가 공유하는 단일 소스(중복 제거).
-    특수 채널(_GENERAL_ROLES)은 프로젝트 무관(cwd=루트), 그 외는 채널=프로젝트(event.project)
+    채널=프로젝트(event.project)
     또는 chat 선택 프로젝트, 어느 것도 없으면 None(§1.4 텍스트 일반 실행과 동형 규칙).
     """
-    if event.channel_role in _GENERAL_ROLES:
-        return target_root
     name = chat_selection.get(event.channel_id)
     if event.project and resolve_project(event.project, target_root) is not None:
         name = event.project  # 채널=프로젝트 UX 가 chat 선택보다 우선
@@ -5070,7 +5066,7 @@ def _run_photo(
 ) -> None:
     """사진(photo_ref) + 캡션(지시) → 이미지 다운로드·경로 주입·일반 실행. 즉시 첨부·보류 소비 공유.
 
-    실행 대상(cwd) 해석은 텍스트 일반 실행과 동일 규칙 — 특수 채널(#간단처리·#데이터분석)은
+    실행 대상(cwd) 해석은 텍스트 일반 실행과 동일 규칙 —
     프로젝트 무관(cwd=루트), 그 외는 채널=프로젝트(event.project) 또는 chat 선택 프로젝트. 어느
     것도 없으면 실행 없이 프로젝트 선택 안내. photo_ref/caption 은 인자로 받아, 즉시 첨부(캡션=
     event.text)와 보류 소비(캡션=다음 텍스트·photo_ref=보류분)가 이 한 경로를 공유한다.
@@ -5156,7 +5152,7 @@ def _is_selection_message(text: str, target_root: str) -> bool:
     first = parts[0]
     if resolve_project(first, target_root) is not None:
         return True
-    return any(lbl == first for lbl in PROJECT_LABELS.values())  # 한글 라벨(간단처리 이동)
+    return any(lbl == first for lbl in PROJECT_LABELS.values())  # 한글 라벨
 
 
 def _handle_photo(
@@ -6098,57 +6094,6 @@ def _handle_text(
             )
             return
 
-    # 특수 채널(#간단처리·#데이터-분석): 프로젝트 무관 일반 실행 — cwd=target_root·full tools(§4.4).
-    # 프로젝트 접두·선택 고정 없이 메시지 전체를 지시로 실행. 인가·stdin·화이트리스트 불변.
-    # 데이터분석 한계 안내는 채널 토픽에 1회(어댑터) — 매 메시지 반복 금지.
-    if event.channel_role in _GENERAL_ROLES:
-        # 프로젝트명(폴더명 또는 한글 라벨)으로 시작하면 그 프로젝트 채널로 이동해 실행한다
-        # (로그·진행·결과가 프로젝트 채널로 스트리밍). 원채널엔 이동 흔적 한 줄만 남긴다.
-        # 프로젝트명이 아니거나 채널 매핑이 없으면(폴백) 아래 프로젝트-무관 일반 실행으로 회귀.
-        first = stripped.split(maxsplit=1)[0] if stripped else ""
-        folder = (
-            first
-            if resolve_project(first, target_root) is not None
-            # 한글 라벨 역맵(label→folder) — 정확 일치만(부분·casefold 매칭 없음).
-            else next((f for f, lbl in PROJECT_LABELS.items() if lbl == first), None)
-        )
-        proj_path = resolve_project(folder, target_root) if folder else None
-        proj_ch = adapter.project_channel(folder) if folder else None
-        if folder and proj_path is not None and proj_ch is not None and proj_ch != channel_id:
-            label = project_label(folder)
-            parts = stripped.split(maxsplit=1)
-            task = parts[1].strip() if len(parts) > 1 else ""
-            log.info("chat=%s 간단처리→프로젝트 이동 project=%s", channel_id, folder)
-            adapter.send(channel_id, f"🔀 「{label}」 작업을 <#{proj_ch}> 에서 진행합니다.")
-            chat_selection[proj_ch] = folder  # 이후 그 채널에서 프로젝트 생략 지시가 이어짐
-            if not task:
-                # 프로젝트명만 보냄(지시 없음) — 이동 후 선택만 고정하고 안내(버튼 탭과 동일 UX).
-                adapter.send(proj_ch, project_guide(folder))
-                return
-            _run_with_session(
-                adapter,
-                proj_ch,  # ⑤ 이동 후엔 proj_ch 가 세션 키(그 채널의 연속 대화로 이어짐)
-                f"{LEAD_RUN} 작업 중",
-                claude_exe,
-                proj_path,
-                task,
-                timeout,
-                user_id=event.user_id,
-            )
-            return
-        log.info("chat=%s 일반 실행 role=%s", channel_id, event.channel_role)
-        _run_with_session(
-            adapter,
-            channel_id,
-            f"{LEAD_RUN} 작업 중",
-            claude_exe,
-            target_root,
-            text,
-            timeout,
-            user_id=event.user_id,
-        )
-        return
-
     # ④ 선택 고정 해석: 첫 단어가 유효 프로젝트면 명시 우선, 아니면 채널 선택으로 실행.
     # §1.4: 디스코드는 채널명을 event.project 로 채운다 — 실존 프로젝트면 "채널=프로젝트" UX 로
     # chat_selection 보다 우선한다. project 미설정(DM)·일반 채널(비프로젝트명)은 검증에서 걸러져
@@ -6816,7 +6761,7 @@ def _selftest() -> None:
     assert _guest_bypass(_ge("질문"))
     assert not _guest_bypass(_ge("ㅁ노래"))  # ㅁ명령 제외
     assert not _guest_bypass(_ge("질문", kind="photo"))  # 사진 제외
-    assert not _guest_bypass(_ge("질문", role="간단처리"))  # 다른 채널
+    assert not _guest_bypass(_ge("질문", role="알림"))  # 다른 채널
     assert GUEST_TOOLS == ["WebSearch"]  # WebSearch 만(WebFetch SSRF 차단·파일·bash·git 없음)
     # cwd 격리 = 레포 밖(CLAUDE.md 상위로드 차단). 이름이 아니라 경로 관계로 판정한다 —
     # 레포명 리터럴은 레포를 개명하면 조용히 무효가 된다.

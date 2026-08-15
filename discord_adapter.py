@@ -101,18 +101,14 @@ _OMIT_NOTE_MAXLEN = 40  # footer 에 붙일 `⚠️N개 필드 생략(길이 초
 _BOT_NICKNAME = "치이카와 봇"
 # 카테고리 표시명(이모지·공백·대문자 자유). 기존 카테고리는 코어명(_cat_core: 이모지·기호·공백 제거)
 # 으로 탐색 후 이모지형으로 rename(중복 생성 방지·멱등). 음성 카테고리는 이전 이름 '음성'도 별칭.
-_CAT_SIMPLE = "🗂️ 간단처리"
 _CAT_PROJECT = "📁 프로젝트"
-_CAT_DATA = "📊 데이터분석"
 _CAT_SCHED = "🗓️ 스케쥴러"
 _CAT_SYSTEM = "⚙️ 시스템"
 _CAT_QUESTION = "❓ 질문"  # 게스트질문(개발자 외 서버 멤버 Q&A) 전용 — 시스템↔PlayList 사이.
 _CAT_VOICE = "🎵 PlayList"
-# 위치 순서(0..6): 데이터분석 아래·시스템 위에 스케쥴러, 시스템 아래·PlayList 위에 질문.
+# 위치 순서(0..4): 프로젝트 아래 스케쥴러, 시스템 아래·PlayList 위에 질문.
 _CAT_ORDER = [
-    _CAT_SIMPLE,
     _CAT_PROJECT,
-    _CAT_DATA,
     _CAT_SCHED,
     _CAT_SYSTEM,
     _CAT_QUESTION,
@@ -120,9 +116,7 @@ _CAT_ORDER = [
 ]
 # 카테고리별 코어 별칭(기존 탐색) — 대부분 코어명 1개, 음성은 이전 이름 '음성' 포함.
 _CAT_ALIASES: dict[str, list[str]] = {
-    _CAT_SIMPLE: ["간단처리"],
     _CAT_PROJECT: ["프로젝트"],
-    _CAT_DATA: ["데이터분석"],
     _CAT_SCHED: ["스케쥴러"],
     _CAT_SYSTEM: ["시스템"],
     _CAT_QUESTION: ["질문"],
@@ -132,15 +126,12 @@ _VOICE_NAME = "PlayList"  # 음성 채널(재생 기능은 후속 — 자리만)
 _DEFAULT_GENERAL = ("일반", "general")  # 디스코드 기본 텍스트/음성 채널명(로컬라이즈 포함)
 # 디스코드 기본 빈 카테고리 — 비어있고 봇이 만든 게 아닐 때만 삭제(#5).
 _DEFAULT_CATEGORIES = ("채팅 채널", "Text Channels", "음성 채널", "Voice Channels")
-_DATA_TOPIC = "HTML 리포트는 디스코드에 안 뜸 — 파일/요약만."  # 데이터분석 채널 토픽(안내 1회)
 # ponytail: 빈이름 targeting 폐기 — 디스코드가 U+3164·U+2800 둘 다 400 거부(라이브 실측). 두 채널
-# (간단처리 텍스트·PlayList 음성)은 정상 표시명을 갖고 일반 리네임 경로(정확명 비교·멱등)를 탄다.
+# (프로젝트 텍스트·PlayList 음성)은 정상 표시명을 갖고 일반 리네임 경로를 탄다.
 _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
-    _CAT_SIMPLE: [("간단처리", "role", "간단처리")],  # 개발자 전용·full 도구
     # 게스트질문(개발자 외 서버 멤버·웹검색 Q&A·cwd 격리·코어 bridge._GUEST_ROLE 와 태그 일치)은
     # 별도 '질문' 카테고리. role tag/채널명 불변(격리 매칭 유지) — 카테고리 배치만 분리.
     _CAT_QUESTION: [("게스트질문", "role", "게스트질문")],
-    _CAT_DATA: [("데이터분석", "role", "데이터분석")],  # 하이픈 원천 제거
     # ⚠️ **표시명과 tag 가 일부러 다르다 — 맞추려고 tag 를 고치지 마라.** 채널 탐색은
     # ①`channel_map.json` 의 `(kind, tag)` → ②이름 canon 순인데, tag 를 바꾸면 1·2차 모두
     # 빗나가 **새 채널이 생긴다**. 옛 채널의 히스토리도, 손으로 설정한 읽기전용 권한도 새
@@ -746,9 +737,7 @@ class DiscordAdapter:
             (PROJECT_LABELS.get(n, n), "project", n) for n in _project_order(self._project_names)
         ]
         plan: list[tuple[str, list[tuple[str, str, str]]]] = [
-            (_CAT_SIMPLE, _SPECIAL[_CAT_SIMPLE]),
             (_CAT_PROJECT, proj_chans),
-            (_CAT_DATA, _SPECIAL[_CAT_DATA]),
             (_CAT_SCHED, _SPECIAL[_CAT_SCHED]),
             (_CAT_SYSTEM, _SPECIAL[_CAT_SYSTEM]),
             (_CAT_QUESTION, _SPECIAL[_CAT_QUESTION]),
@@ -771,7 +760,6 @@ class DiscordAdapter:
                         ch = await guild.create_text_channel(
                             target,
                             category=category,
-                            topic=_DATA_TOPIC if tag == "데이터분석" else None,
                         )
                         log.info("채널 생성: 요청=%r 저장=%r id=%s", target, ch.name, ch.id)
                         by_canon[_canon(ch.name)] = ch

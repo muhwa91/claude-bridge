@@ -1752,12 +1752,15 @@ def test_guest_channel_command_not_special(monkeypatch):
     assert runs and runs[0][1] == "ㅁ푸시해줘" and a.music == []  # 웹 질문으로 흐름(push 아님)
 
 
-def test_nonguest_keeps_full_system_prompt(monkeypatch):
-    # 회귀: 게스트 외 경로(간단처리 일반 실행)는 기존 BRIDGE_SYSTEM_PROMPT 유지.
+def test_nonguest_keeps_full_system_prompt(monkeypatch, tmp_path):
+    # 회귀: 게스트 외 경로(프로젝트 채널 실행)는 기존 BRIDGE_SYSTEM_PROMPT 유지.
+    #   ⚠️ 종전엔 `channel_role="간단처리"` 로 시험했으나 그 채널은 2026-08-16 제거됐다.
+    #   잠그려는 것은 «게스트가 아니면 전체 프롬프트» 이지 특정 채널이 아니다.
+    (tmp_path / "etf_info").mkdir()
     runs = _spy_rcwp_full(monkeypatch)
     a = FakeAdapter()
-    ev = Event(kind="text", channel_id=100, user_id=777, text="2+2", channel_role="간단처리")
-    _fire(a, ev, target_root="root")
+    ev = Event(kind="text", channel_id=100, user_id=777, text="etf_info 2+2")
+    _fire(a, ev, target_root=str(tmp_path))
     assert runs[0][3] == bridge.BRIDGE_SYSTEM_PROMPT  # 기본 프롬프트(게스트 최소본 아님)
     # 회귀: full 에 `--tools` 를 붙이면 안 된다 — 글롭이 조용히 버려져 커밋이 죽는다.
     assert not runs[0][4]
@@ -2678,37 +2681,6 @@ def _spy_rcwp(monkeypatch):
     return runs
 
 
-def test_general_channel_runs_project_less(monkeypatch, tmp_path):
-    # #간단처리(channel_role) → 프로젝트 무관 일반 실행: cwd=target_root, task=메시지 전체.
-    runs = _spy_rcwp(monkeypatch)
-    a = FakeAdapter()
-    ev = Event(kind="text", channel_id=100, user_id=777, text="2+2 뭐야", channel_role="간단처리")
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == [(str(tmp_path), "2+2 뭐야")]
-
-
-def test_data_analysis_channel_runs_general(monkeypatch, tmp_path):
-    # #데이터-분석도 일반 실행(한계 안내는 채널 토픽 1회 — 매 메시지 반복 없음).
-    runs = _spy_rcwp(monkeypatch)
-    a = FakeAdapter()
-    ev = Event(
-        kind="text", channel_id=100, user_id=777, text="MU 조사해", channel_role="데이터분석"
-    )
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == [(str(tmp_path), "MU 조사해")]
-    assert not any("HTML" in t for _c, t, _b in a.sent)  # 매 메시지 안내 금지
-
-
-def test_general_channel_commands_still_work(monkeypatch, tmp_path):
-    # 특수 채널에서도 명령(ㅁ도움말)은 정상 — role 분기는 free-form 실행에만.
-    runs = _spy_rcwp(monkeypatch)
-    a = FakeAdapter()
-    ev = Event(kind="text", channel_id=100, user_id=777, text="ㅁ도움말", channel_role="간단처리")
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == []  # 실행 아님
-    assert a.sent[0][1] == bridge.HELP_TEXT
-
-
 def _spy_rcwp_ch(monkeypatch):
     # (channel_id, proj, task) 기록 — 이동 실행이 프로젝트 채널로 가는지 검증. dict 반환(실제 계약).
     runs = []
@@ -2720,92 +2692,6 @@ def _spy_rcwp_ch(monkeypatch):
         ),
     )
     return runs
-
-
-def test_general_channel_project_prefix_moves_to_project_channel(monkeypatch, tmp_path):
-    # #간단처리 "trading_info <지시>" → 원채널 이동흔적 + 프로젝트 채널로 실행 + 선택 고정.
-    bridge.chat_selection.clear()
-    (tmp_path / "trading_info").mkdir()
-    runs = _spy_rcwp_ch(monkeypatch)
-    a = FakeAdapter(projects={"trading_info": 555})
-    ev = Event(
-        kind="text",
-        channel_id=100,
-        user_id=777,
-        text="trading_info 로그 봐줘",
-        channel_role="간단처리",
-    )
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == [(555, str(tmp_path / "trading_info"), "로그 봐줘")]
-    assert a.sent[0][0] == 100 and "<#555>" in a.sent[0][1]  # 원채널 이동흔적(채널 링크)
-    assert bridge.chat_selection[555] == "trading_info"
-
-
-def test_general_channel_label_prefix_moves(monkeypatch, tmp_path):
-    # #간단처리 "주식모니터링 <지시>"(한글 라벨) → trading_info 로 매핑, 프로젝트 채널로 실행.
-    bridge.chat_selection.clear()
-    monkeypatch.setattr(bridge, "PROJECT_LABELS", {"trading_info": "주식모니터링"})
-    (tmp_path / "trading_info").mkdir()
-    runs = _spy_rcwp_ch(monkeypatch)
-    a = FakeAdapter(projects={"trading_info": 555})
-    ev = Event(
-        kind="text",
-        channel_id=100,
-        user_id=777,
-        text="주식모니터링 시세 확인",
-        channel_role="간단처리",
-    )
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == [(555, str(tmp_path / "trading_info"), "시세 확인")]
-    assert bridge.chat_selection[555] == "trading_info"
-
-
-def test_general_channel_non_project_runs_project_less(monkeypatch, tmp_path):
-    # #간단처리 "그냥 일반 질문"(프로젝트 아님) → 기존 프로젝트-무관 실행(이동 안 함).
-    bridge.chat_selection.clear()
-    (tmp_path / "trading_info").mkdir()
-    runs = _spy_rcwp_ch(monkeypatch)
-    a = FakeAdapter(projects={"trading_info": 555})
-    ev = Event(
-        kind="text", channel_id=100, user_id=777, text="그냥 일반 질문", channel_role="간단처리"
-    )
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == [(100, str(tmp_path), "그냥 일반 질문")]  # 원채널·cwd=root·전체 지시
-    assert not any("🔀" in t for _c, t, _b in a.sent)
-
-
-def test_general_channel_project_only_guides_and_fixes(monkeypatch, tmp_path):
-    # #간단처리 "trading_info"(지시 없음) → 프로젝트 채널로 이동 + 안내 + 선택 고정(실행 없음).
-    bridge.chat_selection.clear()
-    (tmp_path / "trading_info").mkdir()
-    runs = _spy_rcwp_ch(monkeypatch)
-    a = FakeAdapter(projects={"trading_info": 555})
-    ev = Event(
-        kind="text", channel_id=100, user_id=777, text="trading_info", channel_role="간단처리"
-    )
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == []  # 실행 없음
-    assert a.sent[0][0] == 100 and "<#555>" in a.sent[0][1]  # 이동흔적
-    assert a.sent[1][0] == 555  # 프로젝트 채널로 안내
-    assert bridge.chat_selection[555] == "trading_info"
-
-
-def test_general_channel_project_prefix_no_channel_falls_back(monkeypatch, tmp_path):
-    # project_channel 미매핑 → 이동 안 하고 일반 실행 폴백(크래시 없음).
-    bridge.chat_selection.clear()
-    (tmp_path / "trading_info").mkdir()
-    runs = _spy_rcwp_ch(monkeypatch)
-    a = FakeAdapter()  # projects 비어있음 → project_channel None
-    ev = Event(
-        kind="text",
-        channel_id=100,
-        user_id=777,
-        text="trading_info 로그 봐줘",
-        channel_role="간단처리",
-    )
-    _fire(a, ev, target_root=str(tmp_path))
-    assert runs == [(100, str(tmp_path), "trading_info 로그 봐줘")]  # 일반 실행 폴백
-    assert not any("🔀" in t for _c, t, _b in a.sent)
 
 
 def test_restart_done_to_status_channel():
@@ -3896,19 +3782,6 @@ def test_photo_deletes_temp_file_after_run(monkeypatch, tmp_path):
     assert not img.exists()  # 임시파일 삭제됨
 
 
-def test_photo_general_role_runs_at_root(photo_env, tmp_path):
-    # #간단처리(project None·role 간단처리) 사진+지시 → 프로젝트 무관 실행(cwd=루트) + 이미지.
-    _fire(
-        photo_env,
-        _photo(777, caption="이 값 좀 봐줘", project=None, channel_role="간단처리"),
-        repo_root=tmp_path,
-        target_root=str(tmp_path),
-    )
-    assert len(photo_env.runs) == 1
-    assert photo_env.runs[0]["proj"] == str(tmp_path)  # cwd=루트(프로젝트 무관)
-    assert photo_env.fetched  # 이미지 다운로드됨(무시하지 않음)
-
-
 def test_photo_no_project_no_selection_guides(photo_env, tmp_path):
     # 프로젝트 채널도 특수 채널도 아니고 선택도 없음 → 실행·다운로드 없이 프로젝트 선택 안내.
     _fire(
@@ -4830,27 +4703,12 @@ def test_channel_sessions_isolated_per_channel(monkeypatch, tmp_path):
     assert calls[2]["resume"] == "sid-100"  # 채널 100 셋째 실행은 채널 100 의 첫 세션 이어받음
 
 
-@pytest.mark.usefixtures("sess_env")
-def test_channel_session_move_stores_under_proj_ch(monkeypatch, tmp_path):
-    # 간단처리→프로젝트 이동(③) 세션은 원채널이 아니라 proj_ch 키로 저장된다.
-    (tmp_path / "trading_info").mkdir()
-    calls = _sess_spy(monkeypatch, [{"is_error": False, "result": "ok", "session_id": "sid-move"}])
-    a = FakeAdapter(secrets=[], projects={"trading_info": 555})
-    ev = Event(
-        kind="text",
-        channel_id=100,
-        user_id=777,
-        text="trading_info 로그 봐줘",
-        channel_role="간단처리",
-    )
-    _fire(a, ev, repo_root=tmp_path, target_root=str(tmp_path))
-    assert bridge.channel_sessions == {555: "sid-move"}  # proj_ch(555) 키, 원채널 100 아님
-    assert calls[0]["cid"] == 555 and calls[0]["resume"] is None
-
-
-@pytest.mark.usefixtures("sess_env")
 def test_channel_session_resume_error_falls_back_to_new(monkeypatch, tmp_path):
     # 만료 세션 resume 이 에러 → 세션 버리고 새 세션으로 1회 재실행, 새 sid 저장(막히지 않음).
+    # ⚠️ 이 mkdir 은 2026-08-16 에 추가했다 — 종전엔 **앞 테스트가 남긴 전역
+    #    `chat_selection` 에 기대** 통과하고 있었다(테스트 격리 결함).
+    #    그 앞 테스트를 지우자 드러났다. 자기 것은 자기가 만든다.
+    (tmp_path / "etf_info").mkdir()
     bridge.channel_sessions[777] = "sid-stale"
     calls = _sess_spy(
         monkeypatch,

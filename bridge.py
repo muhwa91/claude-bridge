@@ -57,6 +57,7 @@ NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
 CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # channelID→(kind,tag) 매핑(자동생성 §4.4)
 MACROS_FILE = LOG_DIR / "macros.json"  # 1e 매크로(즐겨찾기·최근) — 영속(§4.5)
+RESUMABLE_FILE = LOG_DIR / "resumable.json"  # 1b·1c 재실행/답장 재료 — 영속(재기동 후 버튼 생존)
 CHANNEL_SESSIONS_FILE = (
     LOG_DIR / "channel_sessions.json"
 )  # channelID→마지막 claude session_id(연속성)
@@ -372,8 +373,15 @@ channel_sessions: dict[int, str] = {}
 # ⑤-b 답장 이어가기(1c, 계약 §4.6) — 결과 message_id -> {session_id, proj, user_id}.
 # ⑤(channel_sessions)는 **채널당 최신 1개**라 «위로 스크롤해 옛 결과에 답장»을 구분하지 못한다.
 # 여기 있으면 그 메시지의 실행을 잇고, 없으면 종전대로 채널 최신 세션으로 흐른다.
-# ponytail: 영속하지 않는다(in-memory LRU). 재시작하면 옛 메시지 답장은 미스가 되는데,
-#   그때는 채널 세션 폴백이 받아 주므로 사용자가 막히지 않는다 — 디스크 쓰기를 살 이유가 없다.
+# 🔴 **영속한다 (2026-08-16, 실사용 시험으로 판단이 뒤집혔다).**
+#   처음엔 «재시작하면 채널 세션 폴백이 받으니 디스크 쓰기를 살 이유가 없다»고 봤다.
+#   그건 **1c(답장)에만** 참이다 — **1b([다시 실행] 버튼)에는 폴백이 없어 버튼이 그냥 죽는다.**
+#   화면에 남아 있는 옛 결과의 버튼을 누르면 "찾지 못했습니다"만 나온다
+#   (실사용 시험에서 실제로 겪음).
+#   재기동은 드물지 않다(코드 반영마다 — 2026-08-16 하루에 4회).
+#   ⚠️ 재실행(`:go`)은 **task 를 새로 돌리는 것**이라 session_id 가 낡아도 상관없다.
+#      1c 는 낡은 session_id 로 resume 을 시도하다 실패하면
+#      `resume_run` 의 맥락 재주입 폴백이 받는다.
 # M-1 격리: user_id 를 함께 저장해 **보낸 사람만** 이어갈 수 있다(pending 과 동형).
 resumable: dict[int, dict[str, Any]] = {}
 _RESUMABLE_MAX = 200  # 초과 시 오래된 것부터 버린다(dict 는 삽입순 — pending 과 달리 소비가 없다)
@@ -1334,6 +1342,32 @@ def save_macros(path: Path, data: dict[str, list[dict[str, str]]]) -> None:
     """원자적 영속(save_channel_sessions 와 같은 tmp→replace)."""
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_resumable(path: Path) -> dict[int, dict[str, Any]]:
+    """resumable.json → {message_id: entry}. 없음·손상은 빈 dict(방어적).
+
+    키는 JSON 이 str 로 저장하므로 int 로 되돌린다. 정수가 아닌 키는 버린다.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict) and isinstance(v.get("session_id"), str) and str(k).isdigit():
+                out[int(k)] = v
+    return out
+
+
+def save_resumable(path: Path, data: dict[int, dict[str, Any]]) -> None:
+    """원자적 영속(save_channel_sessions 와 같은 tmp→replace). 키는 str."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps({str(k): v for k, v in data.items()}, ensure_ascii=False), encoding="utf-8"
+    )
     tmp.replace(path)
 
 
@@ -4950,6 +4984,10 @@ def _remember_reply_target(
     # 상한이 없으면 장수 프로세스에서 단조 증가한다.
     while len(resumable) > _RESUMABLE_MAX:
         resumable.pop(next(iter(resumable)))
+    # 재기동 후에도 버튼이 살아 있게 영속한다(위 상수 주석 참조). 실패는 조용히 넘긴다 —
+    # 디스크가 안 되는 것이 실행을 막을 이유는 없다(메모리에는 이미 들어갔다).
+    with contextlib.suppress(OSError):
+        save_resumable(RESUMABLE_FILE, resumable)
 
 
 def _find_reply_target(event: Event) -> dict[str, Any] | None:
@@ -6522,6 +6560,8 @@ def main() -> int:
     notify_fired.update(_fired)
     notify_snooze.update(_snooze)
     channel_sessions.update(load_channel_sessions(CHANNEL_SESSIONS_FILE))  # ⑤ 대화 세션 연속성 복원
+    # 1b·1c 재실행/답장 재료 복원 — 이게 없으면 재기동 직후 화면에 남은 버튼이 전부 죽는다.
+    resumable.update(load_resumable(RESUMABLE_FILE))
 
     # 지연 import: discord.py 는 discord_adapter 에만 격리 — 코어(bridge)를 직접 import 하는
     # 경로(selftest·단위 테스트)는 이 줄에 닿지 않아 discord.py 미설치 환경에서도 죽지 않는다

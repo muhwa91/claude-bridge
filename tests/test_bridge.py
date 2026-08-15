@@ -9473,3 +9473,34 @@ def test_r_go_consumes_the_confirm_card(monkeypatch):
     _ch, _mid, text, btns = a.edited[-1]
     assert "실행합니다" in text
     assert not btns, f"버튼이 남았다: {btns}"
+
+
+def test_resumable_survives_restart(tmp_path, monkeypatch):
+    """🔴 재기동 후에도 [다시 실행] 버튼이 살아야 한다.
+
+    1c(답장)는 채널 세션 폴백이 받지만 **1b(버튼)는 폴백이 없어 그냥 죽는다** —
+    실사용 시험에서 실제로 겪었다(2026-08-16). 재기동은 코드 반영마다 일어난다.
+    """
+    f = tmp_path / "r.json"
+    monkeypatch.setattr(bridge, "RESUMABLE_FILE", f)
+    bridge.resumable.clear()
+    bridge._remember_reply_target(90, "sid-x", "/p", 777, task="배포해줘", tools=["Read"])
+    assert f.exists(), "영속되지 않았다"
+
+    bridge.resumable.clear()  # 재기동 흉내
+    bridge.resumable.update(bridge.load_resumable(f))
+    e = bridge.resumable[90]
+    assert e["task"] == "배포해줘" and e["user_id"] == 777 and e["tools"] == ["Read"]
+
+
+def test_load_resumable_survives_broken_file(tmp_path):
+    """손상·이상 키는 조용히 버린다 — 파일 한 줄 때문에 버튼 기능 전체가 죽으면 안 된다."""
+    f = tmp_path / "r.json"
+    assert bridge.load_resumable(f) == {}
+    f.write_text("{ 깨진", encoding="utf-8")
+    assert bridge.load_resumable(f) == {}
+    f.write_text(
+        '{"12": {"session_id": "s"}, "x": {"session_id": "s"}, "13": {}}', encoding="utf-8"
+    )
+    got = bridge.load_resumable(f)
+    assert list(got) == [12]  # 정수 아닌 키·session_id 없는 항목은 버린다

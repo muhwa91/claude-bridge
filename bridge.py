@@ -365,6 +365,15 @@ chat_selection: dict[int, str] = {}
 # ponytail: 직렬 워커(한 번에 하나)라 락 불필요 — chat_selection 과 동형.
 channel_sessions: dict[int, str] = {}
 
+# ⑤-b 답장 이어가기(1c, 계약 §4.6) — 결과 message_id -> {session_id, proj, user_id}.
+# ⑤(channel_sessions)는 **채널당 최신 1개**라 «위로 스크롤해 옛 결과에 답장»을 구분하지 못한다.
+# 여기 있으면 그 메시지의 실행을 잇고, 없으면 종전대로 채널 최신 세션으로 흐른다.
+# ponytail: 영속하지 않는다(in-memory LRU). 재시작하면 옛 메시지 답장은 미스가 되는데,
+#   그때는 채널 세션 폴백이 받아 주므로 사용자가 막히지 않는다 — 디스크 쓰기를 살 이유가 없다.
+# M-1 격리: user_id 를 함께 저장해 **보낸 사람만** 이어갈 수 있다(pending 과 동형).
+resumable: dict[int, dict[str, Any]] = {}
+_RESUMABLE_MAX = 200  # 초과 시 오래된 것부터 버린다(dict 는 삽입순 — pending 과 달리 소비가 없다)
+
 # ⑥ 캡션 없는 사진 보류(사진 먼저 → 지시 나중) — channel_id -> (photo_ref, time.monotonic()).
 # 캡션 없는 사진이 오면 폐기하지 않고 여기 보류하고, 같은 채널의 다음 '자유 지시'(명령 아님)가
 # TTL(PENDING_PHOTO_TTL_SEC) 안에 오면 그 사진과 묶어 사진+캡션 흐름으로 실행한다
@@ -4780,6 +4789,11 @@ def run_claude_with_progress(
     # 감지 시 버튼 렌더 + 보류맵 저장(session_id 는 result 이벤트 발행분만).
     if choice is not None:
         _render_choices(adapter, channel_id, proj_path, data.get("session_id"), choice, user_id)
+    # 1c(계약 §4.6): 이 결과 메시지에 답장하면 **이 실행**을 잇도록 등재한다.
+    #   여기가 유일한 자리다 — message_id·session_id·proj_path·user_id 넷이 모두 여기 있고,
+    #   호출부로 배관을 빼면 경로마다 빠뜨린다
+    #   (⑤ `_remember_session` 이 그 이유로 호출부 3곳에 흩어져 있다).
+    _remember_reply_target(message_id, data.get("session_id"), proj_path, user_id)
     return data
 
 
@@ -4821,6 +4835,42 @@ def _render_choices(
         "question": question,
         "await_reply": False,
     }
+
+
+def _remember_reply_target(
+    message_id: object, sid: object, proj_path: str, user_id: int | None
+) -> None:
+    """결과 메시지 → 그 실행의 세션을 등재한다(1c, 계약 §4.6). 순수 조건만 통과시킨다.
+
+    등재 조건: message_id 가 int 이고 session_id 가 **비지 않은 str** 일 때만.
+    session_id 가 없다는 것은 «세션이 서지 못한 실행»(resume 실패 synthetic·즉사)이라
+    이어갈 대상이 아니다 — 계약의 *"session_id 있는 완료 결과만 답장 가능"* 이 이 줄이다.
+    """
+    if not isinstance(message_id, int) or not isinstance(sid, str) or not sid:
+        return
+    resumable[message_id] = {"session_id": sid, "project_path": proj_path, "user_id": user_id}
+    # 오래된 것부터 버린다. `pending` 은 버튼을 누르면 소비돼 줄지만 이쪽은 소비가 없어
+    # 상한이 없으면 장수 프로세스에서 단조 증가한다.
+    while len(resumable) > _RESUMABLE_MAX:
+        resumable.pop(next(iter(resumable)))
+
+
+def _find_reply_target(event: Event) -> dict[str, Any] | None:
+    """답장 대상 실행을 찾는다 — 없거나 **남의 것**이면 None(M-1 격리).
+
+    소유 검증을 여기서 하는 이유: 호출부가 두 곳 이상이 되면 한쪽이 빠뜨린다
+    (`_find_awaiting` 이 같은 이유로 user_id 를 인자로 받는다).
+    """
+    mid = getattr(event, "reply_to", None)
+    if not isinstance(mid, int):
+        return None
+    entry = resumable.get(mid)
+    if entry is None:
+        return None
+    owner = entry.get("user_id")
+    if owner is not None and owner != event.user_id:
+        return None
+    return entry
 
 
 def _remember_session(channel_id: int, sid: object) -> None:
@@ -5816,6 +5866,38 @@ def _handle_text(
             builtin_only=True,
         )
         return
+
+    # 1c 답장 이어가기(계약 §4.6) — **`_find_awaiting` 보다 먼저** 본다.
+    #   계약이 정한 우선순위다: reply_to 가 있으면 그 메시지의 실행을 잇고,
+    #   없을 때만 ③(직접입력 대기).
+    #   답장은 «어느 실행을 잇겠다»는 명시적 지목이라, 우연히 열려 있는 선택지 대기보다 앞선다.
+    #   ㅁ 명령은 제외 — ③ 과 같은 이유로 답장에 실려 와도 명령으로 처리한다.
+    if not stripped.startswith("ㅁ"):
+        target = _find_reply_target(event)
+        if target is not None:
+            sid, proj = target.get("session_id"), target.get("project_path")
+            if isinstance(sid, str) and isinstance(proj, str):
+                log.info("chat=%s 1c 답장 resume mid=%s", channel_id, event.reply_to)
+                resume_run(
+                    adapter,
+                    channel_id,
+                    claude_exe,
+                    proj,
+                    stripped,
+                    "",
+                    sid,
+                    timeout,
+                    user_id=event.user_id,
+                )
+                return
+        elif isinstance(getattr(event, "reply_to", None), int):
+            # 미스 — 계약이 정한 안내를 내고 **일반 처리로 흘린다**(막지 않는다).
+            #   재시작·LRU 축출·남의 메시지가 여기로 온다. 채널 세션 폴백이 받아 주므로
+            #   사용자는 프로젝트명만 붙이면 그대로 진행된다.
+            adapter.send(
+                channel_id,
+                "이어갈 세션을 찾지 못했습니다. 프로젝트명과 함께 새로 요청해주세요.",
+            )
 
     # ③ 직접입력 대기: '✏️직접입력' 후 다음 텍스트는 그 세션 resume 입력으로 라우팅.
     # ㅁ 명령(ㅁ취소·ㅁ도움말·ㅁ프로젝트 등)은 예외 — 아래 분기로 폴백해 정상 처리한다

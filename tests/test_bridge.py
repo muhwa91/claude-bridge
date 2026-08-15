@@ -176,7 +176,16 @@ def _btn(
     )
 
 
-def _txt(user_id, text, *, message_id=None, channel_id=None, channel_role=None, project=None):
+def _txt(
+    user_id,
+    text,
+    *,
+    message_id=None,
+    channel_id=None,
+    channel_role=None,
+    project=None,
+    reply_to=None,
+):
     return Event(
         kind="text",
         channel_id=channel_id if channel_id is not None else user_id,
@@ -185,6 +194,7 @@ def _txt(user_id, text, *, message_id=None, channel_id=None, channel_role=None, 
         message_id=message_id,
         channel_role=channel_role,
         project=project,
+        reply_to=reply_to,
     )
 
 
@@ -7463,8 +7473,8 @@ def test_real_schedules_digest_needs_session_ping_only():
     for it in digests:
         if len(it.get("days") or []) == 1:
             hits = sum(
-                it["id"] in [x["id"] for x in due_notifications(
-                    _REAL_ITEMS, m, set(), m.date().isoformat())]
+                it["id"]
+                in [x["id"] for x in due_notifications(_REAL_ITEMS, m, set(), m.date().isoformat())]
                 for m in week
             )
             assert hits == 1, (it["id"], hits)
@@ -9251,3 +9261,59 @@ def test_yt_dev_log_path_agrees_with_picker():
     yt_pick = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(yt_pick)
     assert yt_pick.DEV_LOG.resolve() == LIVE_PATHS["YT_DEV_LOG"].resolve()
+
+
+# ══════════════════════════════════════════════
+# 1c 답장 이어가기 (계약 §4.6) — 2026-08-16
+# ══════════════════════════════════════════════
+# 이 기능의 위험은 «되는가»가 아니라 **격리와 폴백**이다:
+#   ① 남의 메시지에 답장해 남의 세션을 잇는 것(M-1) ② 미스일 때 사용자가 막히는 것.
+# 그래서 성공 경로 1개보다 경계 케이스를 더 촘촘히 잠근다.
+
+
+def _reset_resumable():
+    bridge.resumable.clear()
+
+
+def test_remember_reply_target_requires_session_id():
+    """session_id 없는 실행은 등재하지 않는다 — «이어갈 대상»이 아니다(계약 §4.6)."""
+    _reset_resumable()
+    bridge._remember_reply_target(10, None, "/p", 1)
+    bridge._remember_reply_target(11, "", "/p", 1)
+    bridge._remember_reply_target(None, "sid", "/p", 1)
+    assert bridge.resumable == {}
+    bridge._remember_reply_target(12, "sid-ok", "/p", 1)
+    assert bridge.resumable[12]["session_id"] == "sid-ok"
+
+
+def test_remember_reply_target_lru_bounded():
+    """소비가 없는 맵이라 상한이 없으면 장수 프로세스에서 단조 증가한다."""
+    _reset_resumable()
+    for i in range(bridge._RESUMABLE_MAX + 30):
+        bridge._remember_reply_target(i, f"s{i}", "/p", 1)
+    assert len(bridge.resumable) == bridge._RESUMABLE_MAX
+    assert 0 not in bridge.resumable  # 오래된 것부터 버린다
+    assert (bridge._RESUMABLE_MAX + 29) in bridge.resumable
+
+
+def test_find_reply_target_isolates_other_user():
+    """🔴 M-1 — 남의 결과에 답장해도 그 세션을 이어받지 못한다."""
+    _reset_resumable()
+    bridge._remember_reply_target(50, "sid", "/p", user_id=111)
+    assert bridge._find_reply_target(_txt(111, "이어서", reply_to=50)) is not None
+    assert bridge._find_reply_target(_txt(222, "이어서", reply_to=50)) is None
+
+
+def test_find_reply_target_miss_paths():
+    """reply_to 없음·모르는 mid 는 조용히 None — 일반 처리로 흘러야 한다."""
+    _reset_resumable()
+    bridge._remember_reply_target(60, "sid", "/p", 1)
+    assert bridge._find_reply_target(_txt(1, "x")) is None  # 답장 아님
+    assert bridge._find_reply_target(_txt(1, "x", reply_to=999)) is None  # 모르는 mid
+
+
+def test_find_reply_target_allows_unknown_owner():
+    """user_id 미상(None)으로 등재된 것은 막지 않는다 — 예약·자동 경로 무회귀."""
+    _reset_resumable()
+    bridge._remember_reply_target(70, "sid", "/p", user_id=None)
+    assert bridge._find_reply_target(_txt(999, "x", reply_to=70)) is not None

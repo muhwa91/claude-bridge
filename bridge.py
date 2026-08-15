@@ -56,7 +56,6 @@ SCHEDULES_FILE = PROJECT_DIR / "schedules" / "notify.json"
 NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
 CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # channelID→(kind,tag) 매핑(자동생성 §4.4)
-MACROS_FILE = LOG_DIR / "macros.json"  # 1e 매크로(즐겨찾기·최근) — 영속(§4.5)
 RESUMABLE_FILE = LOG_DIR / "resumable.json"  # 1b·1c 재실행/답장 재료 — 영속(재기동 후 버튼 생존)
 CHANNEL_SESSIONS_FILE = (
     LOG_DIR / "channel_sessions.json"
@@ -178,9 +177,6 @@ COMMAND_ALIASES = {
 # (알 수 없는 ㅁ… → HELP)이 정규 명령을 오검출하지 않게 한다.
 COMMANDS = (
     frozenset({"ㅁ도움말", "ㅁ프로젝트", "ㅁ취소", "ㅁ재시작", "ㅁ청소", "ㅁ새대화"})
-    # 1e 매크로(계약 §4.5). ⚠️ 계약은 `/최근`·`/즐겨찾기` 로 적었으나 그건 **텔레그램 시절 표기**다 —
-    # 이 봇의 명령 규약은 `ㅁ` 접두 통일이라 그쪽에 맞춘다(계약서에 델타 기재).
-    | frozenset({"ㅁ최근", "ㅁ즐겨찾기"})
     | frozenset(COMMAND_ALIASES)
     | PUSH_WORDS
 )
@@ -1308,43 +1304,6 @@ def save_channel_sessions(path: Path, sessions: dict[int, str]) -> None:
     tmp.replace(path)
 
 
-# ── 1e 매크로(계약 §4.5) — logs/macros.json ──────────────────────────
-# `{"favorites": [{name,project,task}], "recent": [{project,task}]}`.
-# recent 는 실행할 때마다 앞에 붙고 최근 _RECENT_MAX 개만 남는다(중복은 위로 끌어올린다).
-# ⚠️ **영속한다** — resumable(1b·1c)과 달리 재시작해도 남아야 «즐겨찾기»가 의미를 갖는다.
-_RECENT_MAX = 5
-
-
-def load_macros(path: Path) -> dict[str, list[dict[str, str]]]:
-    """macros.json → {favorites, recent}. 없음·손상은 빈 구조(load_schedules 와 같은 방어적 태도).
-
-    구조가 어긋난 항목은 **조용히 버린다** — 손으로 편집할 수 있는 파일이라 한 줄이 깨졌다고
-    매크로 기능 전체가 죽으면 안 된다.
-    """
-    out: dict[str, list[dict[str, str]]] = {"favorites": [], "recent": []}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return out
-    if not isinstance(raw, dict):
-        return out
-    for key in out:
-        items = raw.get(key)
-        if not isinstance(items, list):
-            continue
-        for it in items:
-            if isinstance(it, dict) and isinstance(it.get("task"), str) and it["task"].strip():
-                out[key].append({k: str(v) for k, v in it.items() if isinstance(v, (str, int))})
-    return out
-
-
-def save_macros(path: Path, data: dict[str, list[dict[str, str]]]) -> None:
-    """원자적 영속(save_channel_sessions 와 같은 tmp→replace)."""
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
-
-
 def load_resumable(path: Path) -> dict[int, dict[str, Any]]:
     """resumable.json → {message_id: entry}. 없음·손상은 빈 dict(방어적).
 
@@ -1369,18 +1328,6 @@ def save_resumable(path: Path, data: dict[int, dict[str, Any]]) -> None:
         json.dumps({str(k): v for k, v in data.items()}, ensure_ascii=False), encoding="utf-8"
     )
     tmp.replace(path)
-
-
-def push_recent(data: dict[str, list[dict[str, str]]], project: str, task: str) -> None:
-    """최근 실행을 맨 앞에 올린다(중복은 끌어올리기). 순수 — 저장은 호출부.
-
-    같은 지시를 또 하면 목록이 그것으로 채워지는 것을 막는다(중복 제거가 이 함수의 전부다).
-    """
-    task = task.strip()
-    if not task:
-        return
-    data["recent"] = [r for r in data["recent"] if r.get("task") != task][: _RECENT_MAX - 1]
-    data["recent"].insert(0, {"project": project, "task": task})
 
 
 def resolve_notify_channel(adapter: Adapter, item: dict[str, Any]) -> tuple[int | None, str]:
@@ -4868,16 +4815,9 @@ def run_claude_with_progress(
         note = commit_reported_changes(str(data.get("result", "")), Path(proj_path), REPO_ROOT)
         if note is not None:
             reply = f"{strip_commit_mark(reply)}\n\n{note}"
-    # 1b(계약 §4.2): 결과에 후속 버튼을 단다. **선택지가 뜬 실행에는 달지 않는다** —
-    #   그건 미완이고, 그 위에 «다시 실행»을 얹으면 사용자가 답을 고르는 대신 재실행을 누른다.
-    followup = (
-        _followup_buttons(message_id, bool(data.get("is_error")))
-        if isinstance(message_id, int) and choice is None
-        else None
-    )
     # 완료: 진행 메시지를 최종 결과로 교체 편집(어댑터가 마스킹·오버플로 흡수).
     if message_id is not None:
-        adapter.edit(channel_id, message_id, reply, followup)
+        adapter.edit(channel_id, message_id, reply)
     else:
         adapter.send(channel_id, reply)
     # 감지 시 버튼 렌더 + 보류맵 저장(session_id 는 result 이벤트 발행분만).
@@ -4887,15 +4827,7 @@ def run_claude_with_progress(
     #   여기가 유일한 자리다 — message_id·session_id·proj_path·user_id·task·tools 가 모두 여기 있고,
     #   호출부로 배관을 빼면 경로마다 빠뜨린다
     #   (⑤ `_remember_session` 이 그 이유로 호출부 3곳에 흩어져 있다).
-    _remember_reply_target(
-        message_id, data.get("session_id"), proj_path, user_id, task, allowed_tools
-    )
-    # 1e(§4.5) 최근 실행 누적. **세션이 선 실행만** 담는다 — 즉사한 것을 「최근」에 올려 두면
-    # 버튼을 눌러도 같은 자리에서 또 죽는다. 실패 자체는 담는다(재시도가 그 기능이다).
-    if isinstance(data.get("session_id"), str) and task.strip():
-        macros = load_macros(MACROS_FILE)
-        push_recent(macros, proj_path, task)
-        save_macros(MACROS_FILE, macros)
+    _remember_reply_target(message_id, data.get("session_id"), proj_path, user_id)
     return data
 
 
@@ -4937,22 +4869,6 @@ def _render_choices(
         "question": question,
         "await_reply": False,
     }
-
-
-def _macro_label(item: dict[str, str], idx: int) -> str:
-    """매크로 버튼 라벨 — `1. <이름 또는 지시 앞부분>`. 디스코드 라벨 80자 한도 안에서 자른다."""
-    text = (item.get("name") or item.get("task") or "").strip().replace("\n", " ")
-    return f"{idx + 1}. {text[:40]}" + ("…" if len(text) > 40 else "")
-
-
-def _followup_buttons(mid: int, failed: bool) -> list[Button]:
-    """결과 메시지에 붙는 후속 버튼(1b, 계약 §4.2). 실패면 원인 분석이 하나 더 붙는다."""
-    if failed:
-        return [
-            Button("🔄 재시도", "r", str(mid), "secondary"),
-            Button("🔍 원인 분석", "r", f"{mid}:why", "secondary"),
-        ]
-    return [Button("🔄 다시 실행", "r", str(mid), "secondary")]
 
 
 def _remember_reply_target(
@@ -5534,125 +5450,6 @@ def _handle_button(
             adapter.send(channel_id, result)
         outcome = "완료" if result.startswith(HEADER_DONE) else "실패"
         log.info("chat=%s callback push 결과=%s", channel_id, outcome)
-    elif action == "r":
-        # 1b 후속버튼(계약 §4.2). arg = "<mid>" | "<mid>:go" | "<mid>:why".
-        # 🔴 **모든 실제 재실행은 `:go` 한 경로로 수렴한다**(계약) — 맨 `r:<mid>` 는 확인만 띄운다.
-        #   사용량이 소모되는 동작이라, 오탭 한 번으로 클로드가 도는 것을
-        #   막는 것이 이 게이트의 전부다.
-        base, _, verb = str(arg).partition(":")
-        entry = resumable.get(int(base)) if base.isdigit() else None
-        owner = entry.get("user_id") if entry else None
-        if entry is None or (owner is not None and owner != event.user_id):
-            # 재시작·LRU 축출·남의 버튼. 조용히 무시하지 않고 이유를 말한다
-            # (버튼이 죽은 것처럼 보인다).
-            log.info("chat=%s callback r 미스 arg=%r", channel_id, arg)
-            adapter.send(channel_id, "재실행 정보를 찾지 못했습니다(재시작됐거나 오래된 메시지).")
-        elif verb == "":
-            task = str(entry.get("task", ""))
-            head = task[:60] + ("…" if len(task) > 60 else "")
-            body = f"다시 실행하시겠어요? Claude 사용량이 소모됩니다.\n\n> {head}"
-            btns = [
-                Button("실행", "r", f"{base}:go", "primary"),
-                # 1e(§4.5): 즐겨찾기 등록은 **이 확인창에서** 한다 —
-                # 재실행하려다 "이건 자주 쓰겠다"고
-                # 느끼는 순간이 여기라, 별도 명령을 만드는 것보다 여기 붙는 것이 자연스럽다.
-                Button("⭐", "fav:add", base, "secondary"),
-                Button("취소", "x", "", "secondary"),
-            ]
-            if isinstance(message_id, int):
-                adapter.edit(channel_id, message_id, body, btns)
-            else:
-                adapter.send(channel_id, body, btns)
-        elif verb in ("go", "why"):
-            # 🔴 **확인창을 먼저 소비한다 — 버튼을 남기면 게이트가 무의미하다.**
-            #   2026-08-16 실사용 시험에서 잡혔다: [실행] 을 눌러도 확인창이 버튼째 남아
-            #   **몇 번이든 다시 누를 수 있었다.** 누를 때마다 클로드가 돈다 —
-            #   게이트가 막으려던 바로 그것이다.
-            #   기존 `push`·`x` 는 눌리면 메시지를 결과로 갈아끼워 버튼을 없앤다. 그 패턴을 따른다.
-            #   ⚠️ **실행 «전에»** 갈아끼운다. 실행은 오래 걸리므로 그 사이에 또 눌릴 수 있다.
-            if isinstance(message_id, int):
-                mark = "🔍 원인 분석" if verb == "why" else "▶ 실행합니다"
-                head = str(entry.get("task", ""))[:60]
-                adapter.edit(channel_id, message_id, f"{mark}\n\n> {head}", [])
-            proj = str(entry.get("project_path", ""))
-            task = str(entry.get("task", ""))
-            if verb == "why":
-                # 읽기전용 진단 — 원래 도구가 아니라 `NOTIFY_CHECK_TOOLS`(=["Read"])로 좁힌다.
-                # 실패 원인을 «보기만» 하는 것이라 쓰기 권한을 줄 이유가 없다(계약 §4.2).
-                task = f"직전 작업이 실패했다. 원인만 진단해 보고하라(수정하지 마라).\n\n{task}"
-                tools = NOTIFY_CHECK_TOOLS
-            else:
-                t = entry.get("tools")
-                tools = t if isinstance(t, list) else None
-            log.info("chat=%s callback r:%s mid=%s", channel_id, verb, base)
-            run_claude_with_progress(
-                adapter,
-                channel_id,
-                f"{LEAD_RUN} 작업 중",
-                claude_exe,
-                proj,
-                task,
-                timeout,
-                allowed_tools=tools,
-                user_id=event.user_id,
-            )
-    elif action in ("rec", "fav", "fav:add", "fav:del"):
-        # 1e 매크로(계약 §4.5). arg 는 항상 **정수 idx**(C-1: task 는 콜백에 안 싣는다).
-        data = load_macros(MACROS_FILE)
-        if action == "fav:add":
-            # 등록 = 1b 확인창의 [⭐]. arg 는 그 결과 메시지 mid 라 `resumable` 에서 재료를 꺼낸다.
-            entry = resumable.get(int(arg)) if str(arg).isdigit() else None
-            owner = entry.get("user_id") if entry else None
-            if entry is None or (owner is not None and owner != event.user_id):
-                adapter.send(channel_id, "등록할 실행을 찾지 못했습니다.")
-                return
-            task = str(entry.get("task", "")).strip()
-            if any(f.get("task") == task for f in data["favorites"]):
-                adapter.send(channel_id, "이미 즐겨찾기에 있습니다.")
-                return
-            data["favorites"].append(
-                {"name": task[:40], "project": str(entry.get("project_path", "")), "task": task}
-            )
-            save_macros(MACROS_FILE, data)
-            log.info("chat=%s fav:add %d개", channel_id, len(data["favorites"]))
-            adapter.send(channel_id, f"⭐ 즐겨찾기에 등록했습니다({len(data['favorites'])}개).")
-            return
-        items = data["favorites"] if action.startswith("fav") else data["recent"]
-        idx = int(arg) if str(arg).isdigit() else -1
-        if not 0 <= idx < len(items):
-            # 목록이 바뀐 뒤 옛 메시지의 버튼을 누른 경우. 인덱스가 밀렸으므로 **실행하지 않는다** —
-            # 조용히 다른 항목을 돌리는 것이 이 기능의 가장 나쁜 실패다.
-            adapter.send(channel_id, "그 항목이 없습니다(목록이 바뀌었을 수 있어요).")
-            return
-        if action == "fav:del":
-            gone = items.pop(idx)
-            save_macros(MACROS_FILE, data)
-            log.info("chat=%s fav:del idx=%d", channel_id, idx)
-            adapter.send(channel_id, f"🗑 삭제했습니다 — {_macro_label(gone, idx)}")
-            return
-        # 실행: **즉시 돌리지 않고 1b 확인 게이트로 수렴한다**(계약 §4.5 — "실행은 4.2 로 수렴").
-        # 실행 직전 `resolve_project` 로 경로를 재검증한다 — 저장된 프로젝트가 사라졌을 수 있다.
-        it = items[idx]
-        proj = str(it.get("project", ""))
-        if proj and not Path(proj).is_dir():
-            adapter.send(channel_id, "그 프로젝트 폴더를 찾지 못했습니다(이동·삭제됐을 수 있어요).")
-            return
-        head = str(it.get("task", ""))[:60]
-        body = f"실행하시겠어요? Claude 사용량이 소모됩니다.\n\n> {head}"
-        mid = adapter.send(channel_id, body, [Button("취소", "x", "", "secondary")])
-        if isinstance(mid, int):
-            # 게이트가 읽는 자리에 재료를 심고, 그 mid 로 [실행] 버튼을 다시 그린다 —
-            # 매크로도 `r:*:go` 단일 경로로 합류한다(계약).
-            _remember_reply_target(mid, "macro", proj, event.user_id, str(it.get("task", "")), None)
-            adapter.edit(
-                channel_id,
-                mid,
-                body,
-                [
-                    Button("실행", "r", f"{mid}:go", "primary"),
-                    Button("취소", "x", "", "secondary"),
-                ],
-            )
     elif action == "x":
         log.info("chat=%s callback 취소", channel_id)
         if isinstance(message_id, int):
@@ -6262,33 +6059,6 @@ def _handle_text(
         save_channel_sessions(CHANNEL_SESSIONS_FILE, channel_sessions)
         log.info("chat=%s cmd=new 세션 리셋", channel_id)
         adapter.send(channel_id, "🆕 새 대화를 시작합니다.")
-        return
-
-    if cmd in ("ㅁ최근", "ㅁ즐겨찾기"):
-        # 1e 매크로(§4.5). 목록만 낸다 —
-        # **실행은 버튼 → 1b 확인 게이트**로 수렴한다(즉시 실행 금지).
-        fav = cmd == "ㅁ즐겨찾기"
-        data = load_macros(MACROS_FILE)
-        items = data["favorites"] if fav else data["recent"]
-        if not items:
-            adapter.send(
-                channel_id,
-                "등록된 즐겨찾기가 없습니다. 재실행 확인창의 [⭐] 로 등록하세요."
-                if fav
-                else "최근 실행이 없습니다.",
-            )
-            return
-        # 콜백엔 **정수 idx 만** 싣는다(C-1: task 는 stdin 전용 — 콜백은 신뢰 경계 밖이다).
-        buttons = [
-            Button(_macro_label(it, i), "fav" if fav else "rec", str(i), "secondary")
-            for i, it in enumerate(items)
-        ]
-        if fav:  # 삭제는 **실행과 다른 행**에 둔다(계약) — 오탭으로 지우지 않게
-            buttons += [
-                Button(f"🗑 {i + 1}", "fav:del", str(i), "danger") for i in range(len(items))
-            ]
-        log.info("chat=%s cmd=%s %d건", channel_id, cmd, len(items))
-        adapter.send(channel_id, "⭐ 즐겨찾기" if fav else "🕘 최근 실행", buttons)
         return
 
     # '오라클…' — 재고 잡이는 GitHub Actions(oci_arm_grabber)로 이관됨. gh 로 실행목록을

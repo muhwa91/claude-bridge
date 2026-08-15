@@ -7,7 +7,6 @@
 
 import dataclasses
 import importlib.util
-import inspect
 import json
 import logging
 import os
@@ -1102,57 +1101,6 @@ def test_parse_callback_recent_rejects_bad():
     assert parse_callback("rec:") is None
     assert parse_callback("rec:x") is None
     assert parse_callback("rec:²") is None  # 위첨자 숫자 차단(isascii)
-
-
-def test_macro_callbacks_route_and_fail_safe():
-    """1e 라우팅 — 목록이 비었거나 인덱스가 밀린 버튼은 **실행하지 않고** 이유를 말한다.
-
-    ⚠️ 2026-08-16 로 `r`·`fav`·`rec` 가 전부 라우팅됐다. 종전 이 테스트는
-    「미분기라 ack 후 무시」를 고정하고 있었는데, 라우팅된 뒤엔 그 주장이 거짓이 된다.
-    조용히 다른 항목을 돌리는 것이 이 기능의 가장 나쁜 실패라, 그 자리를 대신 잠근다.
-    """
-    a = FakeAdapter()
-    _fire(a, _btn(777, "rec", "3"), target_root="root")
-    _fire(a, _btn(777, "fav:del", "9"), target_root="root")
-    assert len(a.sent) == 2
-    assert all("없습니다" in s[1] for s in a.sent)
-
-
-def test_r_callback_miss_tells_why():
-    """🔴 `r` 은 이제 라우팅된다 — 모르는 mid 면 **조용히 죽지 않고** 이유를 말한다.
-
-    버튼이 반응 없이 죽으면 사용자는 봇이 멈춘 줄 안다(재시작·LRU 축출이 흔한 경로다).
-    """
-    bridge.resumable.clear()
-    a = FakeAdapter()
-    _fire(a, _btn(777, "r", "42"), target_root="root")
-    assert a.sent and "재실행 정보를 찾지 못했습니다" in a.sent[0][1]
-
-
-def test_r_confirm_gate_does_not_execute():
-    """🔴 게이트의 전부 — 맨 `r:<mid>` 는 **확인만 띄우고 클로드를 돌리지 않는다.**"""
-    bridge.resumable.clear()
-    bridge._remember_reply_target(42, "sid", "/p", 777, task="배포해줘", tools=None)
-    a = FakeAdapter()
-    _fire(a, _btn(777, "r", "42"), target_root="root")
-    body = (a.edited or a.sent)[0][2]  # (channel, mid, text, buttons) — 본문은 2번
-    assert "사용량이 소모" in body and "배포해줘" in body
-
-
-def test_r_gate_isolates_other_user():
-    """🔴 M-1 — 남의 결과 버튼을 눌러도 그 실행을 재현하지 못한다."""
-    bridge.resumable.clear()
-    # ⚠️ 누르는 쪽은 **인가된 유저**여야 한다(777) — 미인가는 허용목록이 먼저 막아
-    #    이 격리 경로에 도달조차 못 한다. 잠그려는 것은 «인가돼 있어도 남의 것은 못 만진다» 다.
-    bridge._remember_reply_target(43, "sid", "/p", user_id=111, task="t", tools=None)
-    a = FakeAdapter()
-    _fire(a, _btn(777, "r", "43"), target_root="root")
-    assert a.sent and "찾지 못했습니다" in a.sent[0][1]
-
-
-# ---------------------------------------------------------------------------
-# ㅁ 명령(ㅁ프로젝트·ㅁ취소·ㅁ도움말) — 접두 ㅁ 통일 / §4.3 ㅁ프로젝트 버튼 목록
-# ---------------------------------------------------------------------------
 
 
 def test_korean_help_alias_routes_to_help():
@@ -9300,6 +9248,26 @@ def test_yt_dev_log_path_agrees_with_picker():
     assert yt_pick.DEV_LOG.resolve() == LIVE_PATHS["YT_DEV_LOG"].resolve()
 
 
+def test_followup_buttons_are_not_emitted():
+    """🔴 결과에 **버튼을 달지 않는다** — 1b(후속버튼)·1e(매크로)는 2026-08-16 제거됐다.
+
+    개발자 판단: *"다시실행은 필요가 없어 — 그냥 질문 후 대답받는것만 있으면되니까."*
+    남긴 것은 **답장 이어가기(1c)** 하나다. 그것이 「질문 후 대답」 그 자체다.
+
+    ⚠️ 이 테스트는 «없다»를 못박는다. 지우기만 하면 되살아나도 아무도 모른다 —
+    이 레포는 «끝난 것이 목록에 남는» 실패와 «없어진 것이 조용히 돌아오는» 실패를 둘 다 겪었다.
+    """
+    assert not hasattr(bridge, "_followup_buttons")
+    assert not hasattr(bridge, "_macro_label")
+    assert not hasattr(bridge, "MACROS_FILE")
+    # 코덱은 남아 있다(1a 가 깐 것) — 코어가 미분기라 «ack 후 무시»로 안전하다.
+    assert parse_callback("r:12") == ("r", "12")
+    a = FakeAdapter()
+    _fire(a, _btn(777, "r", "12"), target_root="root")
+    _fire(a, _btn(777, "rec", "0"), target_root="root")
+    assert a.sent == [] and a.edited == []  # 부작용 0
+
+
 # ══════════════════════════════════════════════
 # 1c 답장 이어가기 (계약 §4.6) — 2026-08-16
 # ══════════════════════════════════════════════
@@ -9363,116 +9331,10 @@ def test_find_reply_target_allows_unknown_owner():
 # 그래서 **확인 게이트가 실제로 막는가**를 가장 촘촘히 잠근다.
 
 
-def test_followup_buttons_shape():
-    """성공은 1개, 실패는 재시도+원인분석 2개. 콜백은 코덱이 받는 형식이어야 한다."""
-    ok = bridge._followup_buttons(7, failed=False)
-    assert [b.action for b in ok] == ["r"] and ok[0].arg == "7"
-    ng = bridge._followup_buttons(7, failed=True)
-    assert len(ng) == 2 and ng[1].arg == "7:why"
-    # 🔴 코덱이 실제로 받아야 «죽은 버튼»이 아니다
-    for b in ok + ng:
-        assert parse_callback(f"{b.action}:{b.arg}") is not None, b.arg
-
-
-def test_r_callback_codec_accepts_go_and_why_only():
-    """접미는 정확히 go|why — 그 밖은 폐기(신뢰 경계 밖 입력)."""
-    assert parse_callback("r:12") == ("r", "12")
-    assert parse_callback("r:12:go") == ("r", "12:go")
-    assert parse_callback("r:12:why") == ("r", "12:why")
-    # `r:１２` 는 **전각 숫자** — `int()` 는 통과시키지만  # noqa: RUF003
-    # 코덱은 isascii 로 막아야 한다(L-3).
-    for bad in ("r:12:run", "r:x:go", "r:", "r:12:go:go", "r:１２"):  # noqa: RUF001
-        assert parse_callback(bad) is None, bad
-
-
-def test_rerun_entry_carries_task_and_tools():
-    """1b 는 task·tools 를 쓴다 — 1c 와 **같은 항목**에 실린다(맵을 둘로 나누면 한쪽만 축출된다)."""
-    _reset_resumable()
-    bridge._remember_reply_target(80, "sid", "/p", 1, task="배포해줘", tools=["Read"])
-    e = bridge.resumable[80]
-    assert e["task"] == "배포해줘" and e["tools"] == ["Read"]
-    assert e["session_id"] == "sid"  # 1c 재료도 그대로
-
-
-def test_followup_not_attached_to_choice_messages():
-    """선택지가 뜬 실행(미완)에는 후속 버튼을 달지 않는다 — 답 고르기를 밀어낸다."""
-    # 계약: choice is not None 이면 followup=None. 구현이 그 조건을 갖는지 소스로 고정한다.
-    src = inspect.getsource(bridge.run_claude_with_progress)
-    assert "choice is None" in src and "_followup_buttons" in src
-
-
 # ══════════════════════════════════════════════
 # 1e 매크로 (계약 §4.5) — 2026-08-16
 # ══════════════════════════════════════════════
 # 위험은 «저장이 되는가»가 아니라 **엉뚱한 것을 실행하는 것**이다(인덱스 밀림·손상 파일).
-
-
-def test_load_macros_survives_broken_file(tmp_path):
-    """손으로 편집할 수 있는 파일이라, 한 줄이 깨졌다고 기능 전체가 죽으면 안 된다."""
-    p = tmp_path / "m.json"
-    assert bridge.load_macros(p) == {"favorites": [], "recent": []}  # 없음
-    p.write_text("{ 깨진", encoding="utf-8")
-    assert bridge.load_macros(p) == {"favorites": [], "recent": []}  # 손상
-    p.write_text('{"favorites": [{"task": ""}, {"task": "ok"}], "recent": "x"}', encoding="utf-8")
-    got = bridge.load_macros(p)
-    assert [f["task"] for f in got["favorites"]] == ["ok"]  # 빈 task 는 버린다
-    assert got["recent"] == []  # 리스트가 아니면 버린다
-
-
-def test_push_recent_dedups_and_caps():
-    """같은 지시를 또 하면 목록이 그것으로 채워지는 것을 막는다(끌어올리기)."""
-    d = {"favorites": [], "recent": []}
-    for i in range(8):
-        bridge.push_recent(d, "/p", f"t{i}")
-    assert len(d["recent"]) == bridge._RECENT_MAX
-    assert d["recent"][0]["task"] == "t7"  # 최신이 앞
-    bridge.push_recent(d, "/p", "t4")
-    assert d["recent"][0]["task"] == "t4"
-    assert [r["task"] for r in d["recent"]].count("t4") == 1  # 중복 없음
-    bridge.push_recent(d, "/p", "   ")  # 공백은 담지 않는다
-    assert d["recent"][0]["task"] == "t4"
-
-
-def test_macro_label_numbers_and_truncates():
-    assert bridge._macro_label({"name": "배포"}, 0) == "1. 배포"
-    long = bridge._macro_label({"task": "가" * 60}, 2)
-    assert long.startswith("3. ") and long.endswith("…") and len(long) < 50
-
-
-def test_macro_run_goes_through_confirm_gate(tmp_path, monkeypatch):
-    """🔴 매크로도 **즉시 실행하지 않는다** — 1b 확인 게이트(`r:*:go`)로 수렴한다(계약)."""
-    m = tmp_path / "m.json"
-    m.write_text(
-        '{"favorites": [], "recent": [{"project": "", "task": "배포해줘"}]}', encoding="utf-8"
-    )
-    monkeypatch.setattr(bridge, "MACROS_FILE", m)
-    ran = []
-    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *a, **_kw: ran.append(a) or {})
-    a = FakeAdapter()
-    _fire(a, _btn(777, "rec", "0"), target_root="root")
-    assert ran == []  # 실행 0
-    body = (a.edited or a.sent)[-1]
-    assert "사용량이 소모" in str(body)
-    btns = a.edited[-1][3] if a.edited else None
-    assert btns and any(b.action == "r" and b.arg.endswith(":go") for b in btns)
-
-
-def test_r_go_consumes_the_confirm_card(monkeypatch):
-    """🔴 [실행] 을 누르면 확인창의 버튼이 사라져야 한다 — 안 그러면 몇 번이든 다시 눌린다.
-
-    2026-08-16 실사용 시험에서 잡힌 결함이다. 게이트를 통과한 카드가 살아 있으면
-    **누를 때마다 클로드가 돈다** — 게이트가 막으려던 바로 그것이다.
-    기존 `push`·`x` 는 눌리면 메시지를 갈아끼워 버튼을 없앤다(같은 규칙).
-    """
-    bridge.resumable.clear()
-    bridge._remember_reply_target(55, "sid", "/p", 777, task="배포해줘", tools=None)
-    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_kw: {})
-    a = FakeAdapter()
-    _fire(a, _btn(777, "r", "55:go"), target_root="root")
-    assert a.edited, "확인창을 갈아끼우지 않았다"
-    _ch, _mid, text, btns = a.edited[-1]
-    assert "실행합니다" in text
-    assert not btns, f"버튼이 남았다: {btns}"
 
 
 def test_resumable_survives_restart(tmp_path, monkeypatch):

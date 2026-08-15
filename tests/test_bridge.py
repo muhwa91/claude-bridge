@@ -7433,23 +7433,41 @@ def test_real_schedules_us_digest_skips_kst_sun_mon():
 
 @_needs_real_schedules
 def test_real_schedules_digest_needs_session_ping_only():
-    # 다이제스트는 요일·시각과 무관 — 아무 창에도 안 걸리는 시각에도 오늘 핑이면 저희끼리 due.
-    # 배포본의 다이제스트 항목 **전부**(오픈소스·미국주식)가 같은 규칙으로 잡혀야 한다.
-    # 기준 시각은 **수요일** — us-digest 의 days(화~토) 안이라 요일 필터에 걸리지 않는다.
-    moment = datetime(2026, 7, 15, 3, 0, tzinfo=_KST)
-    digests = [it["id"] for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
+    """다이제스트는 **시각창과 무관**하고 오직 세션 핑으로만 due 다 — 자기 `days` 안의 날에.
+
+    ⚠️ 종전 이 테스트는 *"다이제스트는 요일과도 무관"* 을 전제로 수요일 한 날만 봤다.
+    그 전제는 깨졌다 — `us-digest` 가 화~토, `os-digest` 가 월(2026-08-16 주 1회 판정)로
+    각자 요일을 갖는다. 그래서 **항목마다 자기 요일에서** 검사한다. 한 날에 몰아 보면
+    요일이 하나만 바뀌어도 이 테스트가 "기능이 깨졌다"는 **거짓 신호**를 낸다.
+    """
+    digests = [it for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS]
     assert digests, "배포본에 다이제스트 항목이 하나도 없다"
-    # 이 시각엔 시각 창에 아무것도 안 걸린다 → due = **세션 항목 전부**(다이제스트 + pending-checks)
-    expected = [
-        it["id"]
-        for it in _REAL_ITEMS
-        if it["id"] in _REAL_SESSION_IDS and "wed" in it.get("days", ["wed"])
-    ]
-    assert set(digests) <= set(expected)
-    assert due_notifications(_REAL_ITEMS, moment, set(), None) == []
-    assert [
-        it["id"] for it in due_notifications(_REAL_ITEMS, moment, set(), "2026-07-15")
-    ] == expected
+
+    # 2026-07-13(월)부터 한 주 — 인덱스 = bridge._WEEKDAYS 순서와 맞춘다.
+    week = [datetime(2026, 7, 13 + i, 3, 0, tzinfo=_KST) for i in range(7)]
+    assert [bridge._WEEKDAYS[d.weekday()] for d in week] == list(bridge._WEEKDAYS)
+
+    for it in digests:
+        days = it.get("days") or list(bridge._WEEKDAYS)  # days 없으면 매일
+        for moment in week:
+            wd = bridge._WEEKDAYS[moment.weekday()]
+            today = moment.date().isoformat()
+            # 핑이 없으면 시각과 무관하게 아무것도 안 나간다(시각창 판정이 아님을 고정)
+            assert it["id"] not in [
+                x["id"] for x in due_notifications(_REAL_ITEMS, moment, set(), None)
+            ]
+            fired = [x["id"] for x in due_notifications(_REAL_ITEMS, moment, set(), today)]
+            assert (it["id"] in fired) is (wd in days), (it["id"], wd, days, fired)
+
+    # 주 1회 항목은 한 주에 정확히 한 번만 발화한다(요일을 2개 넣으면 그만큼 늘어난다).
+    for it in digests:
+        if len(it.get("days") or []) == 1:
+            hits = sum(
+                it["id"] in [x["id"] for x in due_notifications(
+                    _REAL_ITEMS, m, set(), m.date().isoformat())]
+                for m in week
+            )
+            assert hits == 1, (it["id"], hits)
 
 
 # ── ② on:"session" x 핑 값 경계 ─────────────────────────────────────────────

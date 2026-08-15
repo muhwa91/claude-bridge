@@ -7,6 +7,7 @@
 
 import dataclasses
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -1103,14 +1104,49 @@ def test_parse_callback_recent_rejects_bad():
     assert parse_callback("rec:²") is None  # 위첨자 숫자 차단(isascii)
 
 
-def test_new_callbacks_not_routed_in_handle_button_ack_only():
-    # 1a: r/fav/rec 는 코덱만 — _handle_button 미분기라 ack 후 무시(안전). 방출도 아직 없음.
+def test_unrouted_callbacks_ack_only():
+    """1e(fav·rec)는 아직 코덱만 — _handle_button 미분기라 ack 후 무시(안전).
+
+    ⚠️ `r` 은 2026-08-16 에 **1b 로 라우팅됐다** — 이 테스트에서 뺐다.
+    라우팅된 것을 여기 남겨두면 «미분기라 안전» 이라는 이 테스트의 주장이 거짓이 된다.
+    """
     a = FakeAdapter()
-    _fire(a, _btn(777, "r", "42"), target_root="root")
     _fire(a, _btn(777, "fav:add", "2"), target_root="root")
     _fire(a, _btn(777, "rec", "3"), target_root="root")
-    assert [c for c, _n in a.acked] == ["cq1", "cq1", "cq1"]  # ack 만
+    assert [c for c, _n in a.acked] == ["cq1", "cq1"]  # ack 만
     assert a.sent == [] and a.edited == []  # 무시(부작용 없음)
+
+
+def test_r_callback_miss_tells_why():
+    """🔴 `r` 은 이제 라우팅된다 — 모르는 mid 면 **조용히 죽지 않고** 이유를 말한다.
+
+    버튼이 반응 없이 죽으면 사용자는 봇이 멈춘 줄 안다(재시작·LRU 축출이 흔한 경로다).
+    """
+    bridge.resumable.clear()
+    a = FakeAdapter()
+    _fire(a, _btn(777, "r", "42"), target_root="root")
+    assert a.sent and "재실행 정보를 찾지 못했습니다" in a.sent[0][1]
+
+
+def test_r_confirm_gate_does_not_execute():
+    """🔴 게이트의 전부 — 맨 `r:<mid>` 는 **확인만 띄우고 클로드를 돌리지 않는다.**"""
+    bridge.resumable.clear()
+    bridge._remember_reply_target(42, "sid", "/p", 777, task="배포해줘", tools=None)
+    a = FakeAdapter()
+    _fire(a, _btn(777, "r", "42"), target_root="root")
+    body = (a.edited or a.sent)[0][2]  # (channel, mid, text, buttons) — 본문은 2번
+    assert "사용량이 소모" in body and "배포해줘" in body
+
+
+def test_r_gate_isolates_other_user():
+    """🔴 M-1 — 남의 결과 버튼을 눌러도 그 실행을 재현하지 못한다."""
+    bridge.resumable.clear()
+    # ⚠️ 누르는 쪽은 **인가된 유저**여야 한다(777) — 미인가는 허용목록이 먼저 막아
+    #    이 격리 경로에 도달조차 못 한다. 잠그려는 것은 «인가돼 있어도 남의 것은 못 만진다» 다.
+    bridge._remember_reply_target(43, "sid", "/p", user_id=111, task="t", tools=None)
+    a = FakeAdapter()
+    _fire(a, _btn(777, "r", "43"), target_root="root")
+    assert a.sent and "찾지 못했습니다" in a.sent[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -9317,3 +9353,48 @@ def test_find_reply_target_allows_unknown_owner():
     _reset_resumable()
     bridge._remember_reply_target(70, "sid", "/p", user_id=None)
     assert bridge._find_reply_target(_txt(999, "x", reply_to=70)) is not None
+
+
+# ══════════════════════════════════════════════
+# 1b 후속 액션 버튼 (계약 §4.2) — 2026-08-16
+# ══════════════════════════════════════════════
+# 이 기능의 위험은 «사용량이 소모되는 실행이 오탭 한 번으로 도는 것»이다.
+# 그래서 **확인 게이트가 실제로 막는가**를 가장 촘촘히 잠근다.
+
+
+def test_followup_buttons_shape():
+    """성공은 1개, 실패는 재시도+원인분석 2개. 콜백은 코덱이 받는 형식이어야 한다."""
+    ok = bridge._followup_buttons(7, failed=False)
+    assert [b.action for b in ok] == ["r"] and ok[0].arg == "7"
+    ng = bridge._followup_buttons(7, failed=True)
+    assert len(ng) == 2 and ng[1].arg == "7:why"
+    # 🔴 코덱이 실제로 받아야 «죽은 버튼»이 아니다
+    for b in ok + ng:
+        assert parse_callback(f"{b.action}:{b.arg}") is not None, b.arg
+
+
+def test_r_callback_codec_accepts_go_and_why_only():
+    """접미는 정확히 go|why — 그 밖은 폐기(신뢰 경계 밖 입력)."""
+    assert parse_callback("r:12") == ("r", "12")
+    assert parse_callback("r:12:go") == ("r", "12:go")
+    assert parse_callback("r:12:why") == ("r", "12:why")
+    # `r:１２` 는 **전각 숫자** — `int()` 는 통과시키지만  # noqa: RUF003
+    # 코덱은 isascii 로 막아야 한다(L-3).
+    for bad in ("r:12:run", "r:x:go", "r:", "r:12:go:go", "r:１２"):  # noqa: RUF001
+        assert parse_callback(bad) is None, bad
+
+
+def test_rerun_entry_carries_task_and_tools():
+    """1b 는 task·tools 를 쓴다 — 1c 와 **같은 항목**에 실린다(맵을 둘로 나누면 한쪽만 축출된다)."""
+    _reset_resumable()
+    bridge._remember_reply_target(80, "sid", "/p", 1, task="배포해줘", tools=["Read"])
+    e = bridge.resumable[80]
+    assert e["task"] == "배포해줘" and e["tools"] == ["Read"]
+    assert e["session_id"] == "sid"  # 1c 재료도 그대로
+
+
+def test_followup_not_attached_to_choice_messages():
+    """선택지가 뜬 실행(미완)에는 후속 버튼을 달지 않는다 — 답 고르기를 밀어낸다."""
+    # 계약: choice is not None 이면 followup=None. 구현이 그 조건을 갖는지 소스로 고정한다.
+    src = inspect.getsource(bridge.run_claude_with_progress)
+    assert "choice is None" in src and "_followup_buttons" in src

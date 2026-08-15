@@ -4781,19 +4781,28 @@ def run_claude_with_progress(
         note = commit_reported_changes(str(data.get("result", "")), Path(proj_path), REPO_ROOT)
         if note is not None:
             reply = f"{strip_commit_mark(reply)}\n\n{note}"
+    # 1b(계약 §4.2): 결과에 후속 버튼을 단다. **선택지가 뜬 실행에는 달지 않는다** —
+    #   그건 미완이고, 그 위에 «다시 실행»을 얹으면 사용자가 답을 고르는 대신 재실행을 누른다.
+    followup = (
+        _followup_buttons(message_id, bool(data.get("is_error")))
+        if isinstance(message_id, int) and choice is None
+        else None
+    )
     # 완료: 진행 메시지를 최종 결과로 교체 편집(어댑터가 마스킹·오버플로 흡수).
     if message_id is not None:
-        adapter.edit(channel_id, message_id, reply)
+        adapter.edit(channel_id, message_id, reply, followup)
     else:
         adapter.send(channel_id, reply)
     # 감지 시 버튼 렌더 + 보류맵 저장(session_id 는 result 이벤트 발행분만).
     if choice is not None:
         _render_choices(adapter, channel_id, proj_path, data.get("session_id"), choice, user_id)
-    # 1c(계약 §4.6): 이 결과 메시지에 답장하면 **이 실행**을 잇도록 등재한다.
-    #   여기가 유일한 자리다 — message_id·session_id·proj_path·user_id 넷이 모두 여기 있고,
+    # 1c(계약 §4.6)·1b(§4.2): 이 결과 메시지의 «답장 이어가기»·«다시 실행» 재료를 등재한다.
+    #   여기가 유일한 자리다 — message_id·session_id·proj_path·user_id·task·tools 가 모두 여기 있고,
     #   호출부로 배관을 빼면 경로마다 빠뜨린다
     #   (⑤ `_remember_session` 이 그 이유로 호출부 3곳에 흩어져 있다).
-    _remember_reply_target(message_id, data.get("session_id"), proj_path, user_id)
+    _remember_reply_target(
+        message_id, data.get("session_id"), proj_path, user_id, task, allowed_tools
+    )
     return data
 
 
@@ -4837,8 +4846,23 @@ def _render_choices(
     }
 
 
+def _followup_buttons(mid: int, failed: bool) -> list[Button]:
+    """결과 메시지에 붙는 후속 버튼(1b, 계약 §4.2). 실패면 원인 분석이 하나 더 붙는다."""
+    if failed:
+        return [
+            Button("🔄 재시도", "r", str(mid), "secondary"),
+            Button("🔍 원인 분석", "r", f"{mid}:why", "secondary"),
+        ]
+    return [Button("🔄 다시 실행", "r", str(mid), "secondary")]
+
+
 def _remember_reply_target(
-    message_id: object, sid: object, proj_path: str, user_id: int | None
+    message_id: object,
+    sid: object,
+    proj_path: str,
+    user_id: int | None,
+    task: str = "",
+    tools: list[str] | None = None,
 ) -> None:
     """결과 메시지 → 그 실행의 세션을 등재한다(1c, 계약 §4.6). 순수 조건만 통과시킨다.
 
@@ -4848,7 +4872,15 @@ def _remember_reply_target(
     """
     if not isinstance(message_id, int) or not isinstance(sid, str) or not sid:
         return
-    resumable[message_id] = {"session_id": sid, "project_path": proj_path, "user_id": user_id}
+    # 1b 재실행(§4.2)이 쓰는 `task`·`tools` 를 같은 항목에 싣는다 — 계약이 *"1단계 ⑥ 영속 시 합침"*
+    # 이라 예고한 그 합침이다. 키가 같은 맵을 둘로 나누면 **한쪽만 축출돼** 버튼이 죽는다.
+    resumable[message_id] = {
+        "session_id": sid,
+        "project_path": proj_path,
+        "user_id": user_id,
+        "task": task,
+        "tools": tools,
+    }
     # 오래된 것부터 버린다. `pending` 은 버튼을 누르면 소비돼 줄지만 이쪽은 소비가 없어
     # 상한이 없으면 장수 프로세스에서 단조 증가한다.
     while len(resumable) > _RESUMABLE_MAX:
@@ -5399,6 +5431,54 @@ def _handle_button(
             adapter.send(channel_id, result)
         outcome = "완료" if result.startswith(HEADER_DONE) else "실패"
         log.info("chat=%s callback push 결과=%s", channel_id, outcome)
+    elif action == "r":
+        # 1b 후속버튼(계약 §4.2). arg = "<mid>" | "<mid>:go" | "<mid>:why".
+        # 🔴 **모든 실제 재실행은 `:go` 한 경로로 수렴한다**(계약) — 맨 `r:<mid>` 는 확인만 띄운다.
+        #   사용량이 소모되는 동작이라, 오탭 한 번으로 클로드가 도는 것을
+        #   막는 것이 이 게이트의 전부다.
+        base, _, verb = str(arg).partition(":")
+        entry = resumable.get(int(base)) if base.isdigit() else None
+        owner = entry.get("user_id") if entry else None
+        if entry is None or (owner is not None and owner != event.user_id):
+            # 재시작·LRU 축출·남의 버튼. 조용히 무시하지 않고 이유를 말한다
+            # (버튼이 죽은 것처럼 보인다).
+            log.info("chat=%s callback r 미스 arg=%r", channel_id, arg)
+            adapter.send(channel_id, "재실행 정보를 찾지 못했습니다(재시작됐거나 오래된 메시지).")
+        elif verb == "":
+            task = str(entry.get("task", ""))
+            head = task[:60] + ("…" if len(task) > 60 else "")
+            body = f"다시 실행하시겠어요? Claude 사용량이 소모됩니다.\n\n> {head}"
+            btns = [
+                Button("실행", "r", f"{base}:go", "primary"),
+                Button("취소", "x", "", "secondary"),
+            ]
+            if isinstance(message_id, int):
+                adapter.edit(channel_id, message_id, body, btns)
+            else:
+                adapter.send(channel_id, body, btns)
+        elif verb in ("go", "why"):
+            proj = str(entry.get("project_path", ""))
+            task = str(entry.get("task", ""))
+            if verb == "why":
+                # 읽기전용 진단 — 원래 도구가 아니라 `NOTIFY_CHECK_TOOLS`(=["Read"])로 좁힌다.
+                # 실패 원인을 «보기만» 하는 것이라 쓰기 권한을 줄 이유가 없다(계약 §4.2).
+                task = f"직전 작업이 실패했다. 원인만 진단해 보고하라(수정하지 마라).\n\n{task}"
+                tools = NOTIFY_CHECK_TOOLS
+            else:
+                t = entry.get("tools")
+                tools = t if isinstance(t, list) else None
+            log.info("chat=%s callback r:%s mid=%s", channel_id, verb, base)
+            run_claude_with_progress(
+                adapter,
+                channel_id,
+                f"{LEAD_RUN} 작업 중",
+                claude_exe,
+                proj,
+                task,
+                timeout,
+                allowed_tools=tools,
+                user_id=event.user_id,
+            )
     elif action == "x":
         log.info("chat=%s callback 취소", channel_id)
         if isinstance(message_id, int):

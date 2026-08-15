@@ -248,13 +248,17 @@ def parse_callback(data: str) -> tuple[str, str] | None:
     # 1b·1e, 여기선 코덱만. 정확 매칭 밖은 None(폐기) 불변. 코어 _handle_button 은 미분기라
     # "ack 후 무시"로 안전(1a 는 이 버튼들을 방출하지 않음 — 코덱만 준비).
     if data.startswith("r:"):
-        # r:<mid> (재실행) | r:<mid>:go (확인 게이트 통과 실행). mid 정수, 접미는 정확히 'go'.
+        # r:<mid> (재실행 확인 게이트) | r:<mid>:go (게이트 통과 실행) | r:<mid>:why (원인 분석).
+        # mid 정수, 접미는 정확히 'go'|'why' — 그 밖은 None(폐기) 불변.
+        # `why` 는 1b 구현(2026-08-16) 때 추가했다: 계약 §4.2 가 실패 메시지에 `[🔍 원인 분석]`
+        # 버튼을 명시하는데 코덱에 자리가 없어 눌러도 죽는 버튼이 될 뻔했다. 읽기전용 진단이라
+        # 확인 게이트를 태우지 않는다(사용량이 거의 없고, 게이트가 있으면 아무도 안 누른다).
         parts = data.split(":")
         mid_ok = len(parts) in (2, 3) and _dig(parts[1])
         if mid_ok and len(parts) == 2:
             return ("r", parts[1])
-        if mid_ok and len(parts) == 3 and parts[2] == "go":
-            return ("r", f"{parts[1]}:go")
+        if mid_ok and len(parts) == 3 and parts[2] in ("go", "why"):
+            return ("r", f"{parts[1]}:{parts[2]}")
         return None
     if data.startswith("fav:"):
         # fav:<idx> (실행) | fav:add:<idx> (등록) | fav:del:<idx> (삭제). idx 정수.

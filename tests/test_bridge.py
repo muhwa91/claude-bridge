@@ -1947,31 +1947,21 @@ def _allowed_tools_argv(cmd):
     return cmd[cmd.index("--allowedTools") + 1 :]  # 도구 목록은 argv 말미(resume 미사용 시)
 
 
-def test_run_claude_trading_info_adds_narrowed_test_runners(monkeypatch, tmp_path):
-    cap = _capture_argv(monkeypatch)
-    # 폴더명은 **실제와 같은 하이픈**이라야 한다. 2026-08-12 까지 이 줄이 `trading_info`(옛 이름)
-    # 라서, 키가 개명을 안 따라간 것을 이 테스트가 초록으로 덮고 있었다 — 실제로는 한 번도
-    # 매칭되지 않는 죽은 설정이었다. 언더스코어로 되돌리면 같은 사각이 다시 생긴다.
-    run_claude("claude", str(tmp_path / "trading-info"), "task", timeout=30)
-    tools = _allowed_tools_argv(cap["cmd"])
-    # 좁힌 테스트 명령 prefix 만 들어간다(인자는 prefix 매칭이 자동 커버).
-    assert "Bash(php artisan test:*)" in tools
-    assert "Bash(php vendor/bin/phpunit:*)" in tools
-    assert "Bash(npm run test:*)" in tools
-    assert "Bash(npx vitest:*)" in tools
-    assert "Bash(pytest *)" in tools  # 기본 화이트리스트도 유지
-    # 넓은 와일드카드(php -r RCE·npm install·임의 npx)는 절대 안 들어간다.
-    assert "Bash(php:*)" not in tools
-    assert "Bash(npm:*)" not in tools
-    assert "Bash(npx:*)" not in tools
+@pytest.mark.parametrize("name", ["trading-info", "etf_info"])
+def test_run_claude_full_tier_is_allowed_tools_verbatim(monkeypatch, tmp_path, name):
+    """full 티어는 **어느 프로젝트에서도** ALLOWED_TOOLS 그대로다(프로젝트별 확장 없음).
 
-
-def test_run_claude_other_project_no_extra_tools(monkeypatch, tmp_path):
+    2026-08-16 까지 trading-info 만 `Bash(php artisan test:*)` 등 5개를 더 받았는데, 콜론 접두
+    매칭도 접두 글롭과 똑같이 문자열 끝까지 먹어 `npm run test && type .env` 가 통과한다 —
+    full 티어의 Bash 를 0으로 내려도 이 dict 가 **한 프로젝트에만 임의 셸을 다시 여는 뒷문**
+    이었다. dict·병합 분기를 함께 지웠으니 폴더명으로 갈리는 경로 자체가 없다.
+    """
     cap = _capture_argv(monkeypatch)
-    run_claude("claude", str(tmp_path / "etf_info"), "task", timeout=30)
+    run_claude("claude", str(tmp_path / name), "task", timeout=30)
     tools = _allowed_tools_argv(cap["cmd"])
-    assert tools == bridge.ALLOWED_TOOLS  # 확장 없음 = 기본 그대로
-    assert not any("artisan" in t or "vitest" in t for t in tools)
+    assert tools == bridge.ALLOWED_TOOLS
+    assert not any("artisan" in t or "vitest" in t or "npm" in t for t in tools)
+    assert not hasattr(bridge, "PROJECT_EXTRA_TOOLS")  # 되살리지 마라(방식 B 로 간다)
 
 
 def test_run_claude_explicit_scope_not_extended(monkeypatch, tmp_path):
@@ -1984,14 +1974,14 @@ def test_run_claude_explicit_scope_not_extended(monkeypatch, tmp_path):
 def test_run_claude_empty_scope_is_not_full_scope(monkeypatch, tmp_path):
     """`allowed_tools=[]`(빈 목록, 도구 0개)가 full 경로로 falsy 승격되지 않는다.
 
-    병합 조건은 `is None` 이어야 한다 — `if not allowed_tools:` 로 느슨해지는 순간 다이제스트가
-    ALLOWED_TOOLS(Edit·Write·git commit) + PROJECT_EXTRA_TOOLS 를 통째로 받는다. 빈 목록이
-    실제 값으로 쓰이기 시작한 건 도구 0개 도입(2026-07-27) 이후라 이 구멍이 새로 생겼다.
+    분기 조건은 `is None` 이어야 한다 — `if not allowed_tools:` 로 느슨해지는 순간 다이제스트가
+    ALLOWED_TOOLS(Edit·Write)를 통째로 받는다. 빈 목록이 실제 값으로 쓰이기 시작한 건
+    도구 0개 도입(2026-07-27) 이후라 이 구멍이 새로 생겼다.
     """
     cap = _capture_argv(monkeypatch)
     run_claude("claude", str(tmp_path / "trading_info"), "task", timeout=30, allowed_tools=[])
     assert "--allowedTools" not in cap["cmd"]
-    assert not any(t in cap["cmd"] for t in (*bridge.ALLOWED_TOOLS, "Bash(php artisan test:*)"))
+    assert not any(t in cap["cmd"] for t in bridge.ALLOWED_TOOLS)
 
 
 # ── argv 골든 잠금 — run_claude 는 **모든 원격 작업**의 단일 통로다 ──────────
@@ -2031,8 +2021,8 @@ def _argv_case(label):
                 *bridge.ALLOWED_TOOLS,
             ],
         ),
-        # 폴더명은 **실제와 같은 하이픈**이라야 한다 — 언더스코어로 두면 조회가 영영 안 맞는
-        # 죽은 설정을 테스트가 초록으로 덮는다(2026-08-12 실사고).
+        # 프로젝트별 확장은 2026-08-16 제거 — trading-info 도 **full 과 똑같은 argv** 다.
+        # (되살리면 그 프로젝트에만 임의 셸이 다시 열린다: 콜론 접두 매칭도 체이닝을 못 막는다.)
         "full_extra": (
             "trading-info",
             {},
@@ -2041,7 +2031,6 @@ def _argv_case(label):
                 "--strict-mcp-config",
                 "--allowedTools",
                 *bridge.ALLOWED_TOOLS,
-                *bridge.PROJECT_EXTRA_TOOLS["trading-info"],
             ],
         ),
         "notify": (
@@ -3573,6 +3562,34 @@ def test_notify_check_tools_has_no_network_tool():
     # Bash 는 0개 — 접두 글롭의 `*` 가 문자열 끝까지 먹어 `git status --porcelain > victim.txt`·
     # `… && whoami` 가 승인창 없이 실행됐다(2026-08-12 실측). 한 항목이라도 남기면 그게 셸이다.
     assert not any(t.startswith("Bash") for t in bridge.NOTIFY_CHECK_TOOLS)
+
+
+def test_allowed_tools_has_no_bash_item():
+    """full 티어에 **Bash 항목 0개**(2026-08-16 security 게이트 D1).
+
+    다른 3티어(예약점검·다이제스트·선별)는 2026-08-12 에 이미 0개로 내려갔는데 full 만
+    `Bash(git add/commit/status/diff *)`·`Bash(ruff/mypy/pytest *)` 7개가 남아 있었다.
+    접두 글롭의 `*` 는 명령 끝이 아니라 **문자열 끝까지** 먹어 리다이렉션·`;`·`&&`·`|` 가 그대로
+    붙는다 — 즉 한 항목이 곧 임의 셸이고, 헤드리스라 승인창도 위험명령 훅도 없어
+    「임의 셸 → 같은 폴더 `.env` → 봇 토큰 → Discord API」가 열린다.
+    **부분 제거는 무의미하다**(`git commit -m "x" && …`). 커밋은 방식 B 로 브리지가 돈다.
+    """
+    assert not any(t.startswith("Bash") for t in bridge.ALLOWED_TOOLS)
+    assert not any("curl" in t or "://" in t for t in bridge.ALLOWED_TOOLS)
+    # 기능은 살아 있다 — 원격 작업(읽기·편집·웹조회)은 그대로.
+    assert {"Read", "Edit", "Write"} <= set(bridge.ALLOWED_TOOLS)
+
+
+def test_bridge_system_prompt_matches_toolset():
+    """프롬프트가 **없는 도구**로 커밋하라고 시키지 않는다(모순 = 인젝션의 지렛대).
+
+    NOTIFY_CHECK_SYSTEM_PROMPT 를 따로 만든 것과 같은 잣대 — 도구셋과 지시가 어긋나면 그 틈이
+    "커밋하려면 다른 수단을 찾아라"로 읽힌다.
+    """
+    p = bridge.BRIDGE_SYSTEM_PROMPT
+    assert "Bash 도구로" not in p and "`git add`" not in p
+    assert bridge._COMMIT_MARK in p  # 방식 B 보고 계약을 대신 알려준다
+    assert "push" in p  # push 금지 조항은 그대로
 
 
 def test_fetch_rest_probe_rejects_non_api_path(monkeypatch):

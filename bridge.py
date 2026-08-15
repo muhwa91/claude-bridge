@@ -10,9 +10,9 @@ discord_adapter.py)이 흡수하고, 이 코어는 정규화 `Event`/`Button` �
 - user_id 허용목록 필수. 미허용 이벤트는 무회신·로그만.
 - 메시지는 subprocess 리스트 인자(shell=False)로만 전달 — 셸 조립 금지.
 - 봇 토큰은 .env·어댑터 내부에만. os.environ·로그·자식 프로세스 env 어디에도 넣지 않는다.
-- claude 권한은 --allowedTools 최소 스코프(임의 셸·git push·네트워크 미부여). 프로젝트별로
-  그 스택의 **실제 테스트 명령 prefix 만** PROJECT_EXTRA_TOOLS 로 추가 허용
-  (예 trading-info = `php artisan test`·`vendor/bin/phpunit`·`npm run test`·`npx vitest`).
+- claude 권한은 --allowedTools 최소 스코프 — **전 티어 Bash 0개**(임의 셸·git·네트워크 미부여).
+  커밋은 claude 가 아니라 브리지가 직접 돌린다(방식 B: claude 는 `📦커밋:` 줄로 보고만,
+  commit_reported_changes 가 정화·검증 후 `_git_commit_paths`).
 """
 
 from __future__ import annotations
@@ -225,11 +225,14 @@ BRIDGE_SYSTEM_PROMPT = (
     "인사 없이 지시된 작업을 현재 작업 디렉터리에서 바로 수행하라. "
     "코드·프로젝트와 무관한 일반 질문(지식·방법·정보·시세 등)이면 프로젝트 작업 범위를 "
     "따지거나 거부하지 말고 그냥 아는 대로 답하라(#간단처리 채널은 이런 자유 질문 모드다). "
-    "코드나 파일을 실제로 변경했다면 작업 후 변경사항을 Conventional Commit 메시지로 "
-    "로컬 커밋하라. 변경이 없으면(단순 답변·조회) 커밋하지 마라. "
-    "커밋은 반드시 Bash 도구로 `git add` 와 `git commit` 을 실행해 수행하고, "
-    "git 관련 MCP 도구는 사용하지 마라(허용되지 않아 거부된다). "
-    "절대 push 하지 마라(push 는 관리자가 채팅에서 'push' 라고 답장해 승인한다). "
+    "코드나 파일을 실제로 변경했다면 커밋은 **네가 하지 마라** — 너에겐 셸·git 도구가 없다. "
+    "대신 응답 **마지막 줄**에 정확히 "
+    "`📦커밋: <Conventional Commit 메시지> :: <경로1>, <경로2>` 형식으로 보고하면 "
+    "브리지가 그 줄을 읽어 그 경로만 로컬 커밋한다. 경로는 네가 실제로 바꾼 파일만 "
+    "작업 디렉터리 기준 상대경로로, 콤마로 구분해 적는다. "
+    "변경이 없으면(단순 답변·조회) 이 줄을 쓰지 마라. "
+    "git 관련 MCP 도구도 사용하지 마라(허용되지 않아 거부된다). "
+    "push 는 관리자가 채팅에서 'push' 라고 답장해 승인하니 너는 요청하지 마라. "
     "보호 대상(_Template/Dev, 루트 CLAUDE.md, 모델 설정)은 변경하지 마라. "
     "결과는 무엇을 했는지 1~3줄로 간결히, 반드시 정중한 존댓말('~했습니다', '~됩니다')로 보고하라. "
     "회신은 채팅에 plain text 로 전송되어 마크다운 표(`| |`)·코드블록·헤더(#)·볼드(**)가 "
@@ -238,25 +241,33 @@ BRIDGE_SYSTEM_PROMPT = (
     "사용자에게 선택지를 물어야 하면 AskUserQuestion 대신(headless 라 응답 못 받음), "
     "응답 **마지막 줄**에 정확히 `❓선택: [라벨|값]|[라벨|값]` 형식으로만 출력하고 종료하라. "
     "선택지는 대괄호, 라벨과 짧은 값은 `|`, 선택지끼리는 `]|[` 로 잇는다. "
-    "고른 값이 다음 입력으로 전달되니 그때 이어서 진행하라."
+    "고른 값이 다음 입력으로 전달되니 그때 이어서 진행하라. "
+    "선택지 줄을 쓰는 응답에는 커밋 보고 줄을 함께 쓰지 마라(아직 작업 중이다 — "
+    "이어서 진행해 끝난 뒤에 보고한다)."
 )
 
-# claude CLI 허용 도구 화이트리스트(= 안전 경계). 일반 Bash(curl 등)·git push 미포함.
-# WebSearch/WebFetch(읽기전용 웹조회)는 허용 — #간단처리 등에서 시세·정보 질문에 답하기 위함.
-# (임의 셸·네트워크 쓰기는 여전히 차단 — 원격실행 표면 최소화 유지.)
+# claude CLI 허용 도구 화이트리스트(= 안전 경계). WebSearch/WebFetch(읽기전용 웹조회)는 허용 —
+# #간단처리 등에서 시세·정보 질문에 답하기 위함.
+# ▸ **Bash 는 한 항목도 없다 (2026-08-16 security 게이트 D1)**. 종전엔
+#   `Bash(git add/commit/status/diff *)`·`Bash(ruff/mypy/pytest *)` 7개가 남아 있었고,
+#   **그 7개가 곧 임의 셸이었다** — 접두 글롭의 `*` 는 명령 끝이 아니라 **문자열 끝까지** 먹어
+#   `git status --porcelain > victim.txt`(임의 파일 truncate)·`git diff && whoami` 가 승인창 없이
+#   통과한다(2026-08-12 `claude` 실측). 헤드리스라 확인창이 없고 위험명령 훅(check-danger)도 안
+#   붙어, 한 항목만 남아도 «임의 셸 → 같은 폴더 `.env` → 봇 토큰 → Discord API» 경로가 열린다.
+#   NOTIFY_CHECK_TOOLS·DIGEST_TOOLS·SCREEN_TOOLS 는 같은 실증으로 이미 0개였는데 full 만 남아
+#   있었다. **부분 제거는 무의미하다**(`git commit -m "x" && …` 로 똑같이 열린다).
+# ▸ 기능 손실 없음 — **커밋은 브리지가 직접 돈다(방식 B)**: claude 는 마지막 줄
+#   `📦커밋: <메시지> :: <경로>, <경로>` 로 **보고만** 하고, 브리지가 정화·레포 안 검증 후
+#   `_git_commit_paths` 로 커밋한다(commit_reported_changes). 폰 흐름
+#   「지시 → 로컬 커밋 → 나중에 ㅁ푸시해줘」는 그대로다.
+# ▸ 넓혀야 할 일이 생기면 **이 목록이 아니라 방식 B 를 늘려라** — 브리지가 ruff·pytest 를 직접
+#   돌려 출력을 프롬프트에 텍스트로 주입한다(NOTIFY_CHECK_TOOLS 주석과 같은 잣대).
 ALLOWED_TOOLS = [
     "Read",
     "Edit",
     "Write",
     "WebSearch",
     "WebFetch",
-    "Bash(git add *)",
-    "Bash(git commit *)",
-    "Bash(git status *)",
-    "Bash(git diff *)",
-    "Bash(ruff *)",
-    "Bash(mypy *)",
-    "Bash(pytest *)",
 ]
 
 # nb:ok 예약 점검용 **읽기 전용** 도구셋 — 이 티어는 파일을 바꿀 수단이 없다(주석의 주장이 아니라
@@ -305,31 +316,15 @@ NOTIFY_CHECK_SYSTEM_PROMPT = (
     "(마크다운 표·코드블록·인사·머리말 금지)."
 )
 
-# 프로젝트별 추가 화이트리스트 — basename(project_path) 로 lookup, 없으면 확장 없음.
-# 대상 스택의 **실제 테스트 명령 prefix 만** 추가(임의 셸 아님). full 경로(run_claude 의
-# allowed_tools=None — 텍스트 작업·사진)에서만 ALLOWED_TOOLS 에 병합. 예약 점검
-# (NOTIFY_CHECK_TOOLS)·게스트·다이제스트 같은 명시 스코프는 테스트를 안 돌리므로 확장 대상
-# 아님. 표준 콜론 prefix 문법(Bash(cmd:*)) —
-# prefix 매칭이라 --filter·--coverage 등 인자는 자동 커버(인자 열거 불필요).
-# ▸ 넓은 `Bash(php:*)`(→ php -r RCE)·`Bash(npm:*)`(→ npm install)·`Bash(npx:*)`(→ 임의 원격패키지)
-#   는 의도적으로 배제. 테스트 러너 이외 명령은 여전히 거부된다.
-# trading-info 실제 명령: 백엔드 `php artisan test`(주)·`vendor/bin/phpunit`(composer test 스크립트
-#   없음) / 프론트 package.json scripts.test = `vitest run`(→ `npm run test`·`npx vitest`).
-# php 는 반드시 8.4 라야 vendor 가 도는데 노트북 PATH 의 php 는 XAMPP 7.4 — 런처(run_loop.ps1)가
-# 봇 PATH 앞에 PHP 8.4 경로를 prepend 해 `php`=8.4 가 되게 한다(그래서 표준 `php` prefix 로 매칭).
-# ⚠️ 키는 **실제 폴더명 그대로**여야 한다 — 조회가 `Path(project_path).name` 이다(하이픈!).
-# 2026-08-12 점검에서 발견: 키가 옛 이름 `trading-info`(언더스코어)로 남아 있어 2026-07-26
-# 하이픈 개명 이후 **한 번도 매칭된 적이 없었다**(= trading-info 가 테스트 명령 권한을 못 받는
-# 죽은 설정). 테스트가 옛 이름의 폴더를 직접 만들어 넣어 병합 자체는 초록이라 안 드러났다.
-PROJECT_EXTRA_TOOLS: dict[str, list[str]] = {
-    "trading-info": [
-        "Bash(php artisan test:*)",
-        "Bash(php vendor/bin/phpunit:*)",
-        "Bash(npm run test:*)",
-        "Bash(npm test:*)",
-        "Bash(npx vitest:*)",
-    ],
-}
+# ⛔ **프로젝트별 추가 화이트리스트(PROJECT_EXTRA_TOOLS)는 2026-08-16 제거됐다 — 되살리지 마라.**
+# trading-info 에 `Bash(php artisan test:*)`·`Bash(npm run test:*)` 등 테스트 러너 5개를 얹던
+# dict 였는데, **콜론 접두 매칭도 접두 글롭과 똑같이 문자열 끝까지 먹는다** — `npm run test &&
+# type .env` 가 그대로 통과한다. 즉 이 dict 는 full 티어의 Bash 를 0으로 내려도 **trading-info
+# 한 프로젝트에만 임의 셸을 다시 여는 뒷문**이었다(위 ALLOWED_TOOLS 주석과 같은 실증).
+# 손실 확인: 이 설정은 2026-07-26 하이픈 개명부터 2026-08-12 키 수정까지 **17일간 한 번도
+# 매칭되지 않은 채**였고 아무도 알아채지 못했다 = 실사용 흔적 0. 테스트 실행이 실제로
+# 필요해지면 목록을 넓히지 말고 **방식 B**(브리지가 돌려 출력을 프롬프트에 텍스트 주입)로 간다.
+# 이제 full 티어 = ALLOWED_TOOLS **그대로**라, "full 에 Bash 0개" 단언 하나로 경계가 닫힌다.
 
 log = logging.getLogger("bridge")
 
@@ -1071,6 +1066,47 @@ def parse_choice_prompt(text: str) -> tuple[str, list[tuple[str, str]]] | None:
     if not choices:
         return None
     return (question or "선택하세요", choices)
+
+
+# 방식 B 커밋 계약 — claude 는 셸·git 도구가 0개라 **보고만** 하고 브리지가 커밋한다
+# (commit_reported_changes). `❓선택:` 과 같은 "마지막 줄 마커" 선례를 그대로 쓴다.
+_COMMIT_MARK = "📦커밋:"
+_COMMIT_SEP = "::"  # 메시지 :: 경로, 경로 — 경로 구분은 콤마(공백 포함 경로 대비)
+_COMMIT_MSG_MAXLEN = 200  # 커밋 제목 상한(외부 유래 문자열 — 길이를 코어가 정한다)
+_COMMIT_MAX_PATHS = 20  # 한 번에 커밋할 경로 상한(폭주 방지)
+
+
+def parse_commit_request(text: str) -> tuple[str, list[str]] | None:
+    """claude 최종 출력의 `📦커밋: <메시지> :: <경로>, <경로>` 파싱 → (메시지, [경로…]). 순수.
+
+    들어오는 문자열은 **외부 유래**다(모델 출력 = 인젝션이 실릴 수 있는 표면). 메시지·경로 모두
+    `strip_control_line` 으로 제어문자·개행을 접고 길이·개수를 자른다 — 개행을 남기면 회신에
+    가짜 줄을 심거나 커밋 메시지에 위조 트레일러를 붙일 수 있다. 경로의 **레포 이탈 검증은
+    `_resolve_commit_paths`** 가 따로 한다(여기선 문자열만 다룬다).
+    마커는 마지막 줄 규약이라 `rfind` 로 마지막 것만 보고, 그 줄만 읽는다(뒤 텍스트 무시).
+    형식 불충족(`::` 없음·빈 메시지·경로 0)은 None — 호출측이 "커밋 안 함"을 회신에 밝힌다.
+    """
+    idx = text.rfind(_COMMIT_MARK)
+    if idx == -1:
+        return None
+    line = text[idx + len(_COMMIT_MARK) :].split("\n", 1)[0]
+    raw_msg, sep, raw_paths = line.partition(_COMMIT_SEP)
+    if not sep:
+        return None
+    message = strip_control_line(raw_msg)[:_COMMIT_MSG_MAXLEN]
+    paths = [p for p in (strip_control_line(x) for x in raw_paths.split(",")) if p]
+    if not message or not paths:
+        return None
+    return (message, paths[:_COMMIT_MAX_PATHS])
+
+
+def strip_commit_mark(text: str) -> str:
+    """회신에서 `📦커밋:` 보고 줄만 걷어낸다 — 내부 규약이라 사용자에겐 커밋 **결과**만 보인다."""
+    idx = text.rfind(_COMMIT_MARK)
+    if idx == -1:
+        return text
+    nl = text.find("\n", idx)
+    return (text[:idx] + ("" if nl == -1 else text[nl + 1 :])).rstrip()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -4269,13 +4305,12 @@ def run_claude(
     거치므로, task 를 인자로 넘기면 큰따옴표+`&` 로 명령 인젝션(RCE)이 가능하다
     (shell=False·리스트 인자로도 못 막음). argv 엔 정적·신뢰 플래그만 남긴다.
     """
-    # full 경로(allowed_tools=None — 텍스트 작업·사진)면 전체 화이트리스트 + 프로젝트별 추가
-    # 도구를 병합한다. 예약 점검(NOTIFY_CHECK_TOOLS)·게스트·다이제스트 같은 명시 스코프는
-    # 그대로 둔다(테스트를 안 돌리므로 확장 대상 아님 — 최소권한 유지).
-    if allowed_tools is None:
-        tools = [*ALLOWED_TOOLS, *PROJECT_EXTRA_TOOLS.get(Path(project_path).name, [])]
-    else:
-        tools = allowed_tools
+    # full 경로(allowed_tools=None — 텍스트 작업·사진)면 전체 화이트리스트 **그대로**. 프로젝트별
+    # 확장(PROJECT_EXTRA_TOOLS)은 2026-08-16 제거됐다 — 그 한 갈래가 trading-info 에만 임의 셸을
+    # 다시 열고 있었다(위 상수 자리의 주석). 병합 분기가 사라져 full 티어 = ALLOWED_TOOLS 다.
+    # `is None` 검사는 그대로 유지한다 — `not allowed_tools` 로 느슨해지면 **도구 0개 티어**
+    # (다이제스트)가 falsy 승격돼 full 화이트리스트를 통째로 받는다.
+    tools = ALLOWED_TOOLS if allowed_tools is None else allowed_tools
     if not tools:
         _warn_context_leak(Path(project_path))  # 훅 차단이 못 막는 유입 경로 관측(경고만)
     cmd = [
@@ -4729,6 +4764,14 @@ def run_claude_with_progress(
         # 질문 본문·선택 버튼은 아래 _render_choices 가 한 메시지(V2)로 합쳐 갈라짐을 없앤다. 이때
         # 내부 마커(❓선택:)·값도 자연히 노출되지 않는다(reply 를 헤더로 통째 대체).
         reply = HEADER_CHOICE
+    # 커밋(방식 B) — claude 에겐 git 도구가 없다(ALLOWED_TOOLS Bash 0개). full 성공 실행에서만
+    # 마지막 줄 보고를 읽어 **브리지가** 커밋하고, 그 줄은 회신에서 걷어낸 뒤 결과 한 줄로 바꾼다.
+    # 선택지가 뜬 실행은 아직 미완이라 건너뛴다 — 이어서 진행한 다음 차례에 보고된다(호출측이
+    # git 상태 노트를 choice_rendered 로 건너뛰는 것과 같은 규칙).
+    if allowed_tools is None and choice is None and not data.get("is_error"):
+        note = commit_reported_changes(str(data.get("result", "")), Path(proj_path), REPO_ROOT)
+        if note is not None:
+            reply = f"{strip_commit_mark(reply)}\n\n{note}"
     # 완료: 진행 메시지를 최종 결과로 교체 편집(어댑터가 마스킹·오버플로 흡수).
     if message_id is not None:
         adapter.edit(channel_id, message_id, reply)
@@ -5112,6 +5155,61 @@ def _git_commit_paths(root: Path, paths: list[Path], message: str) -> bool:
         return _git(root, "commit", "-m", message, "--", *(str(p) for p in paths)).returncode == 0
     except OSError:
         return False
+
+
+def _resolve_commit_paths(raw: list[str], cwd: Path, repo_root: Path) -> list[Path] | None:
+    """보고된 경로 → 절대경로. **하나라도** 레포 밖·해석 불가면 None(전부 거부, fail-closed).
+
+    claude 출력은 외부 유래라 `../../..`·절대경로로 레포 밖 파일(다른 레포·홈)을 커밋 대상에
+    끼워 넣을 수 있다. 이탈분만 버리는 부분 수용은 하지 않는다 — 그러면 실제 커밋 내용이 회신
+    보고와 달라져, 사용자가 '무엇이 커밋됐는지'를 회신으로 신뢰할 수 없게 된다.
+    repo_root 자신(`.`)도 거부한다: 그건 사실상 `git add -A` 라 다른 세션의 미커밋 변경이
+    통째로 섞인다(헌법 공통 운영 규칙 14 — `_git_commit_paths` 주석과 같은 이유).
+    상대경로는 claude 의 cwd(=프로젝트 폴더) 기준으로 푼다. 절대경로가 오면 `Path.__truediv__`
+    가 그대로 그것을 쓰므로 두 형식 다 이 한 줄로 커버된다.
+    """
+    root = repo_root.resolve()
+    out: list[Path] = []
+    for r in raw:
+        try:
+            p = (cwd / r).resolve()
+        except (OSError, ValueError):  # 잘못된 문자·너무 긴 경로
+            return None
+        if p == root or not p.is_relative_to(root):
+            return None
+        out.append(p)
+    return out or None
+
+
+_COMMIT_BAD_FORMAT = "⚠️ 커밋 보고 형식이 올바르지 않아 커밋하지 않았습니다(수동 확인 필요)."
+_COMMIT_BAD_PATH = "⚠️ 커밋 대상 경로가 레포 밖이라 커밋하지 않았습니다(수동 확인 필요)."
+
+
+def commit_reported_changes(result: str, cwd: Path, repo_root: Path) -> str | None:
+    """claude 가 보고한 변경(`📦커밋:` 줄)을 **브리지가** 커밋 → 회신 한 줄. 보고 없으면 None.
+
+    방식 B 의 실행부 — claude 에겐 셸·git 도구를 주지 않고(ALLOWED_TOOLS Bash 0개) 브리지가
+    `subprocess` 로 돌린다. 실제 stage/commit 은 `_git_commit_paths` 재사용이라 경로가 `--` 뒤에
+    붙고 `git add -A` 는 어디에도 없다. push 는 여전히 사용자 승인(`ㅁ푸시해줘`) 전용이다.
+    실패(형식·경로 이탈·git 오류)는 **숨기지 않는다** — 변경이 커밋 안 된 채 남은 상태라
+    사용자가 수동 확인해야 한다(`_record_note` 와 같은 태도).
+    """
+    if _COMMIT_MARK not in result:
+        return None
+    parsed = parse_commit_request(result)
+    if parsed is None:
+        log.warning("커밋 보고 형식 불량 — 커밋하지 않음")
+        return _COMMIT_BAD_FORMAT
+    message, raw = parsed
+    paths = _resolve_commit_paths(raw, cwd, repo_root)
+    if paths is None:
+        log.warning("커밋 보고 경로 거부(레포 밖·해석 불가) 개수=%d", len(raw))
+        return _COMMIT_BAD_PATH
+    if not _git_commit_paths(repo_root, paths, message):
+        log.warning("브리지 커밋 실패 파일수=%d", len(paths))
+        return f"⚠️ 커밋 실패 — 파일 {len(paths)}개, 수동 확인 필요."
+    log.info("브리지 커밋 완료 파일수=%d", len(paths))
+    return f"📦 로컬 커밋 완료 (파일 {len(paths)}개) — {message}"
 
 
 _SKIP_NOTE = "⚠️ 작업일지에 세션부팅 블록이 없어 기록을 건너뛰었습니다"
@@ -6270,6 +6368,25 @@ def _selftest() -> None:
     # Bash 는 **한 항목도 없다**. 접두 글롭의 `*` 가 문자열 끝까지 먹어 `… > victim.txt`·
     # `… && whoami` 가 통과한다(실측) — "조회 하나만"은 접두 매칭으로 표현 불가(넓히려면 방식 B).
     assert not any(t.startswith("Bash") for t in NOTIFY_CHECK_TOOLS)
+    # full 티어도 **Bash 0개**(2026-08-16). 여기 한 항목이라도 되살아나면 그 항목이 곧 임의 셸이고,
+    # 헤드리스라 승인창도 위험명령 훅도 없다 → `.env`(봇 토큰)까지 한 번에 닿는다. 커밋이 필요하면
+    # 목록이 아니라 방식 B(commit_reported_changes)를 쓴다.
+    assert not any(t.startswith("Bash") for t in ALLOWED_TOOLS)
+    assert "Read" in ALLOWED_TOOLS and "Edit" in ALLOWED_TOOLS  # 원격 작업 자체는 그대로 된다
+    # 프롬프트도 함께 뒤집혔다 — 없는 도구로 커밋하라고 시키면 그 모순이 인젝션의 지렛대가 된다.
+    assert "Bash 도구로" not in BRIDGE_SYSTEM_PROMPT
+    assert _COMMIT_MARK in BRIDGE_SYSTEM_PROMPT
+    # 방식 B 커밋 계약: 정상 파싱 · 제어문자 접기 · 형식 불충족 거부 · 보고 줄 제거.
+    assert parse_commit_request("보고\n📦커밋: fix(x): y :: a.py, sub/b.py") == (
+        "fix(x): y",
+        ["a.py", "sub/b.py"],
+    )
+    assert parse_commit_request("📦커밋: fix\n: y :: a.py") is None  # 개행으로 줄을 못 늘린다
+    assert parse_commit_request("📦커밋: 메시지만 있고 경로 없음") is None
+    assert parse_commit_request("📦커밋:  :: a.py") is None  # 빈 메시지
+    assert parse_commit_request("커밋했습니다") is None
+    assert strip_commit_mark("본문\n📦커밋: m :: a.py") == "본문"
+    assert strip_commit_mark("본문만") == "본문만"
     # 점검 프롬프트에 커밋 지시가 없다(태스크의 "수정·커밋 금지"와 모순되지 않게).
     assert "커밋하라" not in NOTIFY_CHECK_SYSTEM_PROMPT
     assert "커밋" in NOTIFY_CHECK_SYSTEM_PROMPT  # "커밋하지 마라"는 있어야 한다

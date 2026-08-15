@@ -1359,7 +1359,11 @@ def dispatch_notifications(
         # 미처리 검증 건 리마인더는 **판정 대상이 아니라 알림**이라 버튼을 안 단다(누를 게 없다 —
         # 확인시작은 각 항목 카드에서, 졸업도 그 카드에서 한다). 나머지는 종전 3버튼.
         buttons = None if item_id == PENDING_CHECKS_NOTIFY_ID else notify_buttons(item_id)
-        adapter.send(channel, text, buttons)  # 역할 채널 1회
+        # ⚠️ try/except 로 감싸지 마라 — 계약상 예외를 던지지 않는다(§3.3: 실패는 로그+None).
+        # 되돌리지(fired 해제) 않는 이유는 위 미매핑 경로와 같다 — 일반 알림은 시각 창이 지나면
+        # 어차피 다시 안 잡혀 되살아나지 않는다. 그래서 로그만 남긴다(조용한 유실 방지).
+        if adapter.send(channel, text, buttons) is None:  # 역할 채널 1회
+            log.warning("%s 알림 %s 발송 실패 — 그날치 유실", target, item_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════

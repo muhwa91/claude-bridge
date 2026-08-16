@@ -9126,60 +9126,25 @@ def test_followup_buttons_are_not_emitted():
     assert a.sent == [] and a.edited == []  # 부작용 0
 
 
-# ══════════════════════════════════════════════
-# 1c 답장 이어가기 (계약 §4.6) — 2026-08-16
-# ══════════════════════════════════════════════
-# 이 기능의 위험은 «되는가»가 아니라 **격리와 폴백**이다:
-#   ① 남의 메시지에 답장해 남의 세션을 잇는 것(M-1) ② 미스일 때 사용자가 막히는 것.
-# 그래서 성공 경로 1개보다 경계 케이스를 더 촘촘히 잠근다.
 
+def test_reply_resume_is_not_wired():
+    """🔴 답장 이어가기(1c)는 2026-08-16 제거됐다 — ⑤ 채널 세션만 남는다.
 
-def _reset_resumable():
-    bridge.resumable.clear()
+    ⑤ 가 한 채널의 대화를 하나의 세션으로 이어 주므로 1c 가 하는 일이 없었다
+    (실사용 시험 3회 전부 ⑤ 가 답했다).
 
-
-def test_remember_reply_target_requires_session_id():
-    """session_id 없는 실행은 등재하지 않는다 — «이어갈 대상»이 아니다(계약 §4.6)."""
-    _reset_resumable()
-    bridge._remember_reply_target(10, None, "/p", 1)
-    bridge._remember_reply_target(11, "", "/p", 1)
-    bridge._remember_reply_target(None, "sid", "/p", 1)
-    assert bridge.resumable == {}
-    bridge._remember_reply_target(12, "sid-ok", "/p", 1)
-    assert bridge.resumable[12]["session_id"] == "sid-ok"
-
-
-def test_remember_reply_target_lru_bounded():
-    """소비가 없는 맵이라 상한이 없으면 장수 프로세스에서 단조 증가한다."""
-    _reset_resumable()
-    for i in range(bridge._RESUMABLE_MAX + 30):
-        bridge._remember_reply_target(i, f"s{i}", "/p", 1)
-    assert len(bridge.resumable) == bridge._RESUMABLE_MAX
-    assert 0 not in bridge.resumable  # 오래된 것부터 버린다
-    assert (bridge._RESUMABLE_MAX + 29) in bridge.resumable
-
-
-def test_find_reply_target_isolates_other_user():
-    """🔴 M-1 — 남의 결과에 답장해도 그 세션을 이어받지 못한다."""
-    _reset_resumable()
-    bridge._remember_reply_target(50, "sid", "/p", user_id=111)
-    assert bridge._find_reply_target(_txt(111, "이어서", reply_to=50)) is not None
-    assert bridge._find_reply_target(_txt(222, "이어서", reply_to=50)) is None
-
-
-def test_find_reply_target_miss_paths():
-    """reply_to 없음·모르는 mid 는 조용히 None — 일반 처리로 흘러야 한다."""
-    _reset_resumable()
-    bridge._remember_reply_target(60, "sid", "/p", 1)
-    assert bridge._find_reply_target(_txt(1, "x")) is None  # 답장 아님
-    assert bridge._find_reply_target(_txt(1, "x", reply_to=999)) is None  # 모르는 mid
-
-
-def test_find_reply_target_allows_unknown_owner():
-    """user_id 미상(None)으로 등재된 것은 막지 않는다 — 예약·자동 경로 무회귀."""
-    _reset_resumable()
-    bridge._remember_reply_target(70, "sid", "/p", user_id=None)
-    assert bridge._find_reply_target(_txt(999, "x", reply_to=70)) is not None
+    ⚠️ `Event.reply_to` 는 **어댑터 계약 §4.7 델타2** 라 남아 있다 —
+    어댑터가 채우기만 하고 코어가 안 쓴다. 그 상태를 못박는다.
+    """
+    assert not hasattr(bridge, "resumable")
+    assert not hasattr(bridge, "_find_reply_target")
+    assert not hasattr(bridge, "RESUMABLE_FILE")
+    # 계약 필드는 살아 있다(어댑터가 채운다)
+    assert "reply_to" in {f.name for f in __import__("dataclasses").fields(Event)}
+    # 답장을 달아 보내도 «그 실행 이어가기» 없이 평소 경로로 흐른다(부작용 0 아님 — 일반 실행)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ도움말", reply_to=12345), target_root="root")
+    assert a.sent and a.sent[0][1] == bridge.HELP_TEXT
 
 
 # ══════════════════════════════════════════════
@@ -9194,33 +9159,3 @@ def test_find_reply_target_allows_unknown_owner():
 # ══════════════════════════════════════════════
 # 위험은 «저장이 되는가»가 아니라 **엉뚱한 것을 실행하는 것**이다(인덱스 밀림·손상 파일).
 
-
-def test_resumable_survives_restart(tmp_path, monkeypatch):
-    """🔴 재기동 후에도 [다시 실행] 버튼이 살아야 한다.
-
-    1c(답장)는 채널 세션 폴백이 받지만 **1b(버튼)는 폴백이 없어 그냥 죽는다** —
-    실사용 시험에서 실제로 겪었다(2026-08-16). 재기동은 코드 반영마다 일어난다.
-    """
-    f = tmp_path / "r.json"
-    monkeypatch.setattr(bridge, "RESUMABLE_FILE", f)
-    bridge.resumable.clear()
-    bridge._remember_reply_target(90, "sid-x", "/p", 777, task="배포해줘", tools=["Read"])
-    assert f.exists(), "영속되지 않았다"
-
-    bridge.resumable.clear()  # 재기동 흉내
-    bridge.resumable.update(bridge.load_resumable(f))
-    e = bridge.resumable[90]
-    assert e["task"] == "배포해줘" and e["user_id"] == 777 and e["tools"] == ["Read"]
-
-
-def test_load_resumable_survives_broken_file(tmp_path):
-    """손상·이상 키는 조용히 버린다 — 파일 한 줄 때문에 버튼 기능 전체가 죽으면 안 된다."""
-    f = tmp_path / "r.json"
-    assert bridge.load_resumable(f) == {}
-    f.write_text("{ 깨진", encoding="utf-8")
-    assert bridge.load_resumable(f) == {}
-    f.write_text(
-        '{"12": {"session_id": "s"}, "x": {"session_id": "s"}, "13": {}}', encoding="utf-8"
-    )
-    got = bridge.load_resumable(f)
-    assert list(got) == [12]  # 정수 아닌 키·session_id 없는 항목은 버린다

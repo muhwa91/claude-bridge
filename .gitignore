@@ -11,9 +11,10 @@ logs/bridge.ready
 logs/notify_state.json
 logs/channel_map.json
 logs/channel_sessions.json
-# 1e 매크로 — 즐겨찾기·최근 실행. **작업 지시 원문이 들어간다**(프로젝트 경로·내부 사정).
+# 1b·1c·1e (재실행·답장 이어가기·매크로)가 쓰던 파일. **기능은 2026-08-16 폐기됐지만 이 두 줄은
+# 남긴다** — 작업 지시 원문이 들어 있고, 옛 브리지가 남긴 실물이 다른 클론에 아직 있을 수 있다.
+# 지우면 그게 커밋 후보로 올라온다(`_Temp_files/` 와 같은 사상).
 logs/macros.json
-# 1b·1c 재실행/답장 재료 — **작업 지시 원문**이 들어간다(macros.json 과 같은 이유).
 logs/resumable.json
 logs/restart_notice.json
 logs/photos/

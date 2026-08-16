@@ -6629,7 +6629,7 @@ def test_digest_labels_candidate_age_from_created_at(monkeypatch):
 
 
 @pytest.mark.usefixtures("pipeline")
-def test_digest_caps_candidates_and_logs_cut(monkeypatch, caplog):
+def test_digest_caps_candidates_and_Log_cut(monkeypatch, caplog):
     many = [_cand(name=f"o/r{i}", key=f"r{i}", stars=1000 - i) for i in range(40)]
     monkeypatch.setattr(bridge, "collect_github", lambda *_a, **_k: many)
     sizes = []
@@ -6712,7 +6712,7 @@ _INJECTING_RESULT = "🧨 원인\n2026-01-01 00:00:00 WARNING [bridge] 가짜 �
 
 
 @pytest.mark.usefixtures("pipeline")
-def test_digest_failure_logs_reason_folded_and_truncated(monkeypatch, caplog):
+def test_digest_failure_Log_reason_folded_and_truncated(monkeypatch, caplog):
     """실패 로그가 ① 사유를 남기고 ② 개행을 접고 ③ 300자에서 자른다.
 
     ①이 이번 변경의 동기다(2026-08-09: 플래그 하나로 판정이 100% 실패했는데 로그가 이유를 버려
@@ -6732,7 +6732,7 @@ def test_digest_failure_logs_reason_folded_and_truncated(monkeypatch, caplog):
 
 
 @pytest.mark.usefixtures("pipeline")
-def test_review_failure_logs_folded_reason_but_returns_raw(monkeypatch, caplog):
+def test_review_failure_Log_folded_reason_but_returns_raw(monkeypatch, caplog):
     """검토 실패도 같은 규칙 — 단 **반환 원문은 접지 않는다**(카드 렌더·진단이 원문을 쓴다)."""
     monkeypatch.setattr(
         bridge, "run_claude", lambda *_a, **_k: {"is_error": True, "result": _INJECTING_RESULT}

@@ -1492,7 +1492,7 @@ def test_ensure_readonly_warning_reports_fresh_state_not_stale(caplog):
     assert "@everyone 차단=False" in caplog.text  # 못 건 쪽은 정확히 False
 
 
-def test_ensure_readonly_logs_nothing_when_already_readonly(caplog):
+def test_ensure_readonly_Log_nothing_when_already_readonly(caplog):
     """완료 상태면 **로그도 0줄**. 호출 0회만 보면 이 회귀를 못 잡는다.
 
     안쪽 `if not bot_ok`/`if not blocked` 가 이미 호출을 막으므로, 조기반환을 지워도

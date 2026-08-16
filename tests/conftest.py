@@ -16,7 +16,7 @@ import bridge  # sys.path 주입 뒤에만 임포트 가능
 # 하나같이 monkeypatch 해서 실경로를 아무도 안 봤기 때문).
 LIVE_PATHS = {
     "BACKLOG_FILE": bridge.BACKLOG_FILE,
-    "PROJECT_LABELS": bridge.REPO_ROOT / "_Core" / "project_labels.json",
+    "PROJECT_LABELS": bridge.REPO_ROOT / "System" / "Core" / "project_labels.json",
     "SEEN_FILE": bridge.SEEN_FILE,
     "YT_TODAY_F": bridge.YT_TODAY_F,
     # 유튜브 산출 색인 — `BACKLOG_FILE` 과 **같은 부류의 위험**이다. 이 경로가 어긋나도

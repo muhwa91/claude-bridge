@@ -1721,7 +1721,7 @@ def test_guest_channel_web_only_and_isolated_cwd(monkeypatch):
     # L-1: 게스트 전용 최소 프롬프트 — 내부 명칭 미포함(인젝션 노출 차단).
     assert sysprompt == bridge.GUEST_SYSTEM_PROMPT
     assert (
-        "System/Template/Dev" not in sysprompt and "간단처리" not in sysprompt and "push" not in sysprompt
+        "_System/Template/Dev" not in sysprompt and "간단처리" not in sysprompt and "push" not in sysprompt
     )
 
 
@@ -8620,7 +8620,7 @@ def test_repo_paths_actually_exist():
     """상수가 가리키는 **실경로가 실재하는지** 단언한다.
 
     2026-08-14 실사고: `_Core/` 를 역할별 폴더로 재배치하면서 `BACKLOG_FILE` 만 옛 경로에
-    남았다. `Path` 연산자로 쪼개져 있어(`REPO_ROOT / "System" / "Core" / "OPTIMIZE_BACKLOG.md"`)
+    남았다. `Path` 연산자로 쪼개져 있어(`REPO_ROOT / "_System" / "Core" / "OPTIMIZE_BACKLOG.md"`)
     문자열 일괄 치환을 비껴갔고, docstring 은 새 경로로 갱신돼 **문서만 맞고 코드가 틀린**
     상태가 됐다. 그런데 테스트 1,362건이 전부 통과했다 — `BACKLOG_FILE` 을 쓰는 테스트가
     **하나같이 monkeypatch** 해서 실경로를 아무도 안 봤기 때문이다.

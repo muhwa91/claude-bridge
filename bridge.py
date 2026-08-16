@@ -201,7 +201,7 @@ GUEST_TOOLS = ["WebSearch"]
 # cwd 격리 폴더. **레포 밖**(시스템 temp)에 둔다 — 레포 하위면 Claude 가 cwd 상위로 CLAUDE.md 를
 # 거슬러 로드(루트 헌법·프로젝트 CLAUDE.md)해 격리가 깨지기 때문(레포 하위 .guest_sandbox 안 씀).
 GUEST_SANDBOX_DIR = Path(tempfile.gettempdir()) / "claude_bridge_guest_sandbox"
-# 게스트 전용 최소 시스템 프롬프트. 기본 BRIDGE_SYSTEM_PROMPT 는 내부 명칭(System/Template/Dev·CLAUDE.md
+# 게스트 전용 최소 시스템 프롬프트. 기본 BRIDGE_SYSTEM_PROMPT 는 내부 명칭(_System/Template/Dev·CLAUDE.md
 # ·push 흐름)을 담아 인젝션 시 구조가 노출될 여지가 있어, 게스트엔 이 최소본만 준다
 # (비밀·파일은 도구0이라 애초에 불가 — 명칭 노출까지 차단).
 GUEST_SYSTEM_PROMPT = (
@@ -210,7 +210,7 @@ GUEST_SYSTEM_PROMPT = (
     "사용자의 질문에만 답하라. 항상 한국어로 정중히 답한다."
 )
 
-# 방/프로젝트 한글 표시명은 repo 루트 System/Core/project_labels.json(단일 소스)에서 로드한다.
+# 방/프로젝트 한글 표시명은 repo 루트 _System/Core/project_labels.json(단일 소스)에서 로드한다.
 # 정의는 find_repo_root 뒤(load_project_labels)로 배치 — PROJECT_LABELS 는 아래에서 대입된다.
 
 # claude 헤드리스가 대상 폴더 상위의 루트 헌법(CLAUDE.md)을 로드하면 "세션 시작=신원 확인"
@@ -231,7 +231,7 @@ BRIDGE_SYSTEM_PROMPT = (
     "변경이 없으면(단순 답변·조회) 이 줄을 쓰지 마라. "
     "git 관련 MCP 도구도 사용하지 마라(허용되지 않아 거부된다). "
     "push 는 관리자가 채팅에서 'push' 라고 답장해 승인하니 너는 요청하지 마라. "
-    "보호 대상(System/Template/Dev, 루트 CLAUDE.md, 모델 설정)은 변경하지 마라. "
+    "보호 대상(_System/Template/Dev, 루트 CLAUDE.md, 모델 설정)은 변경하지 마라. "
     "결과는 무엇을 했는지 1~3줄로 간결히, 반드시 정중한 존댓말('~했습니다', '~됩니다')로 보고하라. "
     "회신은 채팅에 plain text 로 전송되어 마크다운 표(`| |`)·코드블록·헤더(#)·볼드(**)가 "
     "렌더되지 않고 기호 그대로 노출된다. 마크다운 표를 절대 쓰지 말고, 여러 항목은 "
@@ -1172,7 +1172,7 @@ def find_repo_root(start: Path) -> Path:
 
 
 def load_project_labels(path: Path) -> dict[str, str]:
-    """System/Core/project_labels.json → {폴더명: 표시명}. 파일 없음·손상·형식불일치는 빈 dict(방어적).
+    """_System/Core/project_labels.json → {폴더명: 표시명}. 파일 없음·손상·형식불일치는 빈 dict(방어적).
 
     utf-8-sig 로 BOM 을 조용히 흡수하고, ValueError(=JSONDecodeError·UnicodeDecodeError 계열)를
     함께 잡아 비-UTF8(cp949 등) 파일에도 모듈 import 가 죽지 않게 한다.
@@ -1192,9 +1192,9 @@ def load_project_labels(path: Path) -> dict[str, str]:
 REPO_ROOT = find_repo_root(PROJECT_DIR)
 # 방/프로젝트 한글 표시명 단일 소스(브리지·chiikawa_office 공통). 못 읽으면 빈 dict →
 # project_label 이 humanize 폴백. 표시 전용 — 라우팅·resolve_project·chat_selection 은 폴더명 기준.
-PROJECT_LABELS = load_project_labels(REPO_ROOT / "System" / "Core" / "project_labels.json")
+PROJECT_LABELS = load_project_labels(REPO_ROOT / "_System" / "Core" / "project_labels.json")
 # 🧩 다이제스트 [📌 백로그] 버튼이 한 줄 append 하는 개편 백로그(비보호 문서 — 워크스페이스 정본).
-BACKLOG_FILE = REPO_ROOT / "System" / "Core" / "기록" / "OPTIMIZE_BACKLOG.md"
+BACKLOG_FILE = REPO_ROOT / "_System" / "Core" / "기록" / "OPTIMIZE_BACKLOG.md"
 
 
 def load_notify_state(path: Path, today: str) -> tuple[set[tuple[str, str]], dict[str, str]]:
@@ -2748,7 +2748,7 @@ def backlog_line(day: str, entry: dict[str, Any]) -> str:
     """`- [YYYY-MM-DD] <이름> (<판정>) — <적용 한 줄> · <URL>` (형식 고정, 순수).
 
     name·apply·url 은 외부 유래(GitHub/HN 검색결과·판정 출력)다. 이 줄이 들어가는
-    `System/Core/기록/OPTIMIZE_BACKLOG.md` 는 헌법이 "클로드 개편 이어가자" 정본으로 지정한 문서라 **다음
+    `_System/Core/기록/OPTIMIZE_BACKLOG.md` 는 헌법이 "클로드 개편 이어가자" 정본으로 지정한 문서라 **다음
     세션의 풀권한 claude 가 읽는다** → 개행이 섞이면 2차 인젝션 저장고가 된다. 세 필드를 전부
     한 줄로 접고 200자로 자른다(결과는 반드시 한 줄).
     """
@@ -2781,7 +2781,7 @@ def _backlog_insert(text: str, line: str) -> str | None:
 
 
 def append_backlog(path: Path, line: str) -> bool:
-    """개편 백로그(System/Core/기록/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입. 성공 여부 반환.
+    """개편 백로그(_System/Core/기록/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입. 성공 여부 반환.
 
     브리지가 직접 쓴다(claude 무관 — graduate_notify 와 같은 사상). 저장은 원자적(tmp→replace).
     파일이 없으면 만들지 않고 False — 워크스페이스 정본을 브리지가 창조하지 않는다(오탐 방지).
@@ -3576,7 +3576,7 @@ _YT_JUDGE_FORMAT = """
 - 적용후보는 **축마다 0~3건**. 억지로 만들지 마라 — 없으면 한 줄도 쓰지 않는다.
 - **영상에 없는 제안임을 전제로 쓴다.** 영상이 시킨 일이 아니라 «해보면 어떨까»다.
 - 대상은 아래 «하네스 현황»에 실제로 있는 것이다. 없는 파일·도구를 지어내지 마라.
-- 보호 대상(루트 CLAUDE.md·System/Template/Dev)을 고치자는 제안은 쓰지 않는다.
+- 보호 대상(루트 CLAUDE.md·_System/Template/Dev)을 고치자는 제안은 쓰지 않는다.
 - **돈이 드는 해법을 제안하지 마라**(유료 서비스·구독·VPS·클라우드·유료 API).
   무료·기존 자원으로 푸는 길만 쓴다.
 """

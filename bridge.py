@@ -201,7 +201,8 @@ GUEST_TOOLS = ["WebSearch"]
 # cwd 격리 폴더. **레포 밖**(시스템 temp)에 둔다 — 레포 하위면 Claude 가 cwd 상위로 CLAUDE.md 를
 # 거슬러 로드(루트 헌법·프로젝트 CLAUDE.md)해 격리가 깨지기 때문(레포 하위 .guest_sandbox 안 씀).
 GUEST_SANDBOX_DIR = Path(tempfile.gettempdir()) / "claude_bridge_guest_sandbox"
-# 게스트 전용 최소 시스템 프롬프트. 기본 BRIDGE_SYSTEM_PROMPT 는 내부 명칭(_System/Template/Dev·CLAUDE.md
+# 게스트 전용 최소 시스템 프롬프트. 기본 BRIDGE_SYSTEM_PROMPT 는 내부 명칭
+# (_System/Template/Dev·CLAUDE.md
 # ·push 흐름)을 담아 인젝션 시 구조가 노출될 여지가 있어, 게스트엔 이 최소본만 준다
 # (비밀·파일은 도구0이라 애초에 불가 — 명칭 노출까지 차단).
 GUEST_SYSTEM_PROMPT = (
@@ -1172,7 +1173,9 @@ def find_repo_root(start: Path) -> Path:
 
 
 def load_project_labels(path: Path) -> dict[str, str]:
-    """_System/Core/project_labels.json → {폴더명: 표시명}. 파일 없음·손상·형식불일치는 빈 dict(방어적).
+    """_System/Core/project_labels.json → {폴더명: 표시명}.
+
+    파일 없음·손상·형식불일치는 빈 dict(방어적).
 
     utf-8-sig 로 BOM 을 조용히 흡수하고, ValueError(=JSONDecodeError·UnicodeDecodeError 계열)를
     함께 잡아 비-UTF8(cp949 등) 파일에도 모듈 import 가 죽지 않게 한다.
@@ -2748,7 +2751,8 @@ def backlog_line(day: str, entry: dict[str, Any]) -> str:
     """`- [YYYY-MM-DD] <이름> (<판정>) — <적용 한 줄> · <URL>` (형식 고정, 순수).
 
     name·apply·url 은 외부 유래(GitHub/HN 검색결과·판정 출력)다. 이 줄이 들어가는
-    `_System/Core/기록/OPTIMIZE_BACKLOG.md` 는 헌법이 "클로드 개편 이어가자" 정본으로 지정한 문서라 **다음
+    `_System/Core/기록/OPTIMIZE_BACKLOG.md` 는 헌법이 "클로드 개편 이어가자" 정본으로
+    지정한 문서라 **다음
     세션의 풀권한 claude 가 읽는다** → 개행이 섞이면 2차 인젝션 저장고가 된다. 세 필드를 전부
     한 줄로 접고 200자로 자른다(결과는 반드시 한 줄).
     """
@@ -2781,7 +2785,9 @@ def _backlog_insert(text: str, line: str) -> str | None:
 
 
 def append_backlog(path: Path, line: str) -> bool:
-    """개편 백로그(_System/Core/기록/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입. 성공 여부 반환.
+    """개편 백로그(_System/Core/기록/OPTIMIZE_BACKLOG.md)의 **열린/미결 절**에 한 줄 삽입.
+
+    성공 여부 반환.
 
     브리지가 직접 쓴다(claude 무관 — graduate_notify 와 같은 사상). 저장은 원자적(tmp→replace).
     파일이 없으면 만들지 않고 False — 워크스페이스 정본을 브리지가 창조하지 않는다(오탐 방지).

@@ -1721,7 +1721,9 @@ def test_guest_channel_web_only_and_isolated_cwd(monkeypatch):
     # L-1: 게스트 전용 최소 프롬프트 — 내부 명칭 미포함(인젝션 노출 차단).
     assert sysprompt == bridge.GUEST_SYSTEM_PROMPT
     assert (
-        "_System/Template/Dev" not in sysprompt and "간단처리" not in sysprompt and "push" not in sysprompt
+        "_System/Template/Dev" not in sysprompt
+        and "간단처리" not in sysprompt
+        and "push" not in sysprompt
     )
 
 

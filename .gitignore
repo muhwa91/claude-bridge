@@ -79,3 +79,9 @@ tools/.yt_cache.json
 tools/.yt_lastrun
 tools/.yt_today.md
 tools/.yt_running
+
+# 채널 평판(내부 판단 데이터) — 공개하지 않는다.
+# 실존 채널에 대한 «주의» 판정과 사유(퍼널·광고성 등)가 들어 있어, 공개 레포에 올리면
+# 제3자에 대한 부정적 평가를 게시하는 것이 된다. yt_pick.py 는 파일이 없으면 빈 dict 로
+# 진행하도록 돼 있어(load() 의 FileNotFoundError) 없어도 동작한다.
+tools/yt_channel_rep.json

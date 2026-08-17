@@ -148,9 +148,13 @@ class Adapter(Protocol):
         """
         ...
 
-    def play_music(self, channel_id: int, user_id: int) -> str:
+    def play_music(self, channel_id: int, user_id: int, query: str = "") -> str:
         """음성재생 capability(디스코드 전용) — 호출자(user_id)가 있는 음성채널에서 고정 재생목록을
         셔플·반복 재생하고 사용자 회신 문자열을 반환한다. 타 어댑터는 미지원(안내 문자열 반환).
+
+        `query`(선택, 'ㅁ재생 <제목>'): 주면 **그 곡을 먼저/지금** 재생한다 — 재생 중이면 현재 곡을
+        끊고 그 곡으로, 미재생이면 그 곡부터 시작. 큐에 없는 제목은 유튜브 검색으로 폴백해 한 번만
+        튼다(재생목록 자체엔 추가하지 않는다 — 그건 'ㅁ추가' 소관). 안 주면 종전 동작 그대로.
         """
         ...
 
@@ -174,6 +178,14 @@ class Adapter(Protocol):
         """
         ...
 
+    def dequeue_video(self, video_id: str) -> int:
+        """'ㅁ삭제' 로 뺀 곡을 재생 중인 큐에서도 제거(디스코드 전용). 제거한 곡수 반환.
+
+        재생 중이 아니거나 큐에 없으면 no-op 0. 지운 곡이 **현재 재생 중이면 다음 곡으로 넘긴다**.
+        큐가 통째로 비게 되는 경우엔 재생이 끊기므로 손대지 않고 0(enqueue_video 와 대칭).
+        """
+        ...
+
 
 # ── 플랫폼 무관 공유 유틸 ──────────────────────────────────────────────────
 # 코어·어댑터가 공유하므로 순환 import 를 피해 이 shared base 에 둔다(bridge 는 재-import 해
@@ -184,6 +196,13 @@ def mask_secrets(text: str, secrets: list[str]) -> str:
         if s:
             text = text.replace(s, "***")
     return text
+
+
+def fold_title(text: str) -> str:
+    """제목 매칭용 정규화(공백접기+casefold). 'ㅁ삭제'(유튜브 목록)와 'ㅁ재생'(재생 큐)이 같은
+    입력에 다른 곡을 고르면 안 되므로 **한 벌만** 둔다(youtube·discord_adapter 공용).
+    """
+    return "".join(text.split()).casefold()
 
 
 def _valid_id(s: object) -> bool:

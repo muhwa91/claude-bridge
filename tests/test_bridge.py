@@ -75,12 +75,15 @@ class FakeAdapter:
         clear_count=0,
         search=None,
         enqueue=0,
+        dequeue=0,
     ):
         self.secrets = secrets if secrets is not None else []
         self.searches = []  # search_video 로 넘어온 query 기록(yt-dlp 검색 스파이)
         self._search = search  # search_video 반환값((videoId, 제목) | None) — 테스트 지정
         self.enqueued = []  # enqueue_video 로 넘어온 (videoId, 제목) 기록(재생 큐 편입 스파이)
         self._enqueue = enqueue  # enqueue_video 반환값(편입 후 큐 곡수 int / no-op 0) — 테스트 지정
+        self.dequeued = []  # dequeue_video 로 넘어온 videoId 기록('ㅁ삭제' 큐 제거 스파이)
+        self._dequeue = dequeue  # dequeue_video 반환값(제거한 곡수 / 미재생 0) — 테스트 지정
         self.cleared = []  # clear_channel 로 넘어온 channel_id 기록(파괴적 청소 스파이)
         self._clear_count = clear_count  # clear_channel 반환할 삭제 건수(테스트가 지정)
         self.sent = []  # (channel_id, text, buttons)
@@ -139,8 +142,11 @@ class FakeAdapter:
         self.cleared.append(channel_id)
         return self._clear_count
 
-    def play_music(self, channel_id, user_id):
-        self.music.append(("play", channel_id, user_id))
+    def play_music(self, channel_id, user_id, query=""):
+        # query 없는 호출은 종전 3튜플 그대로 기록(기존 단언 보존), 'ㅁ재생'만 4튜플.
+        self.music.append(
+            ("play", channel_id, user_id, query) if query else ("play", channel_id, user_id)
+        )
         return "▶️ 재생 시작"
 
     def stop_music(self, channel_id):
@@ -158,6 +164,10 @@ class FakeAdapter:
     def enqueue_video(self, video_id, title):
         self.enqueued.append((video_id, title))
         return self._enqueue
+
+    def dequeue_video(self, video_id):
+        self.dequeued.append(video_id)
+        return self._dequeue
 
 
 def _btn(
@@ -1516,7 +1526,7 @@ def test_music_add_disallowed_user_blocked(monkeypatch):
 def test_youtube_add_video_dedup_skips_insert(monkeypatch):
     # youtube.add_video 중복 로직: list 에 이미 있으면 insert 안 하고 ('dup', 제목).
     monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
-    monkeypatch.setattr(youtube, "_list_video_ids", lambda _a: {"vid1": "제목1"})
+    monkeypatch.setattr(youtube, "_list_items", lambda _a: [("item1", "vid1", "제목1")])
     inserted = []
     monkeypatch.setattr(youtube, "_insert", lambda _a, v: inserted.append(v) or "새제목")
     assert youtube.add_video("vid1") == ("dup", "제목1")
@@ -1560,14 +1570,288 @@ def test_youtube_add_video_http_exception_caught(monkeypatch):
     def truncated(_access):
         raise http.client.IncompleteRead(b"partial")
 
-    monkeypatch.setattr(youtube, "_list_video_ids", truncated)
+    monkeypatch.setattr(youtube, "_list_items", truncated)
     assert youtube.add_video("vidx")[0] == "fail"
     # insert 경로도 동일 포집.
-    monkeypatch.setattr(youtube, "_list_video_ids", lambda _a: {})
+    monkeypatch.setattr(youtube, "_list_items", lambda _a: [])
     monkeypatch.setattr(
         youtube, "_insert", lambda _a, _v: (_ for _ in ()).throw(http.client.BadStatusLine("x"))
     )
     assert youtube.add_video("vidx")[0] == "fail"
+
+
+# ---------------------------------------------------------------------------
+# 'ㅁ삭제 <제목>'(재생목록에서 제거) · 'ㅁ재생 <제목>'(그 곡을 지금 재생)
+# ---------------------------------------------------------------------------
+
+
+def _del_env(monkeypatch, result=("removed", "곡", "vid1")):
+    """youtube.remove_video 를 목으로 대체하고 넘어온 query 리스트를 반환한다(네트워크 차단)."""
+    called = []
+
+    def fake_remove(query):
+        called.append(query)
+        return result
+
+    monkeypatch.setattr(bridge.youtube, "remove_video", fake_remove)
+    return called
+
+
+def test_is_music_del_prefix_match():
+    assert bridge.is_music_del("ㅁ삭제 아이유 좋은날")
+    assert bridge.is_music_del("  ㅁ삭제   곡제목  ")
+    assert bridge.is_music_del("ㅁ삭제")  # 인자 없어도 명령(핸들러가 안내를 준다 — ㅁ추가와 동일)
+    assert not bridge.is_music_del("ㅁ삭제곡")  # 붙여쓰기는 미발동(다른 토큰)
+    assert not bridge.is_music_del("이 파일 삭제해줘")  # 문장 미발동
+    assert not bridge.is_music_del("ㅁ추가 곡")
+
+
+def test_is_music_play_one_prefix_match():
+    assert bridge.is_music_play_one("ㅁ재생 아이유 좋은날")
+    assert bridge.is_music_play_one("ㅁ재생")  # 인자 없어도 명령(안내 회신)
+    assert not bridge.is_music_play_one("ㅁ재생곡")  # 붙여쓰기 미발동
+    assert not bridge.is_music_play_one("이 노래 재생해줘")
+    assert not bridge.is_music_play_one("ㅁ노래")
+
+
+def test_music_del_removed_and_dequeues(monkeypatch):
+    # removed → 🗑️ 회신 + 재생 큐 제거 위임(>0 이면 곡수 문구 추가).
+    called = _del_env(monkeypatch, ("removed", "아이유 좋은날", "vidzzz"))
+    a = FakeAdapter(dequeue=2)
+    _fire(a, _txt(777, "ㅁ삭제 좋은날", channel_role=_PL), target_root="root")
+    assert called == ["좋은날"]
+    assert a.dequeued == ["vidzzz"]
+    assert a.sent == [(777, "🗑️ 삭제됨: 아이유 좋은날\n(재생 큐에서 2곡 제거)", None)]
+
+
+def test_music_del_removed_without_playback(monkeypatch):
+    # 재생 중이 아니면 dequeue 는 0 → 큐 문구 없이 삭제 회신만.
+    _del_env(monkeypatch, ("removed", "곡A", "vidA"))
+    a = FakeAdapter(dequeue=0)
+    _fire(a, _txt(777, "ㅁ삭제 곡A"), target_root="root")
+    assert a.dequeued == ["vidA"]
+    assert a.sent == [(777, "🗑️ 삭제됨: 곡A", None)]
+
+
+def test_music_del_none_match(monkeypatch):
+    _del_env(monkeypatch, ("none", "없는곡", ""))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ삭제 없는곡"), target_root="root")
+    assert a.dequeued == []  # 못 찾았으면 큐도 안 건드린다
+    assert a.sent == [(777, "삭제 실패: '없는곡' 를 재생목록에서 못 찾았습니다.", None)]
+
+
+def test_music_del_many_matches_does_not_delete(monkeypatch):
+    # 다건은 지우지 않고 후보를 돌려준다(파괴적 경로 오삭제 방지).
+    _del_env(monkeypatch, ("many", "곡1 / 곡2", ""))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ삭제 곡"), target_root="root")
+    assert a.dequeued == []
+    assert a.sent == [(777, "여러 곡이 걸립니다 — 더 정확히 적어주세요:\n곡1 / 곡2", None)]
+
+
+def test_music_del_fail_reason(monkeypatch):
+    _del_env(monkeypatch, ("fail", "YouTube API 오류(HTTP 403)", ""))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ삭제 곡"), target_root="root")
+    assert a.sent == [(777, "삭제 실패: YouTube API 오류(HTTP 403)", None)]
+
+
+def test_music_del_empty_arg(monkeypatch):
+    called = _del_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ삭제", channel_role=_PL), target_root="root")
+    assert called == []  # 네트워크 호출 없이 안내만
+    assert a.sent == [(777, "삭제 실패: 지울 노래 제목을 주세요.", None)]
+
+
+def test_music_play_one_delegates_with_query():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ재생 아이유 좋은날", channel_role=_PL), target_root="root")
+    assert a.music == [("play", 777, 777, "아이유 좋은날")]  # play_music(cid, uid, query=…)
+    assert a.sent == [(777, "▶️ 재생 시작", None)]
+
+
+def test_music_play_one_empty_arg():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ재생"), target_root="root")
+    assert a.music == []  # 위임 전에 막는다
+    assert a.sent == [(777, "재생 실패: 노래 제목을 주세요.", None)]
+
+
+def test_music_del_and_play_one_not_help_fallthrough(monkeypatch):
+    # 삽입 위치 회귀: 별칭 해석·HELP 폴백보다 앞에 있어야 한다.
+    _del_env(monkeypatch)
+    for msg in ("ㅁ삭제 곡", "ㅁ재생 곡"):
+        a = FakeAdapter()
+        _fire(a, _txt(777, msg), target_root="root")
+        assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent), msg
+
+
+def test_youtube_remove_video_single_match_deletes(monkeypatch):
+    # 1건 매칭 → playlistItem id 로 delete(videoId 아님) 후 ('removed', 제목, videoId).
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(
+        youtube,
+        "_list_items",
+        lambda _a: [("itemA", "vidA", "아이유 - 좋은 날"), ("itemB", "vidB", "밤편지")],
+    )
+    deleted = []
+    monkeypatch.setattr(youtube, "_delete", lambda _a, i: deleted.append(i))
+    # 공백접기+casefold 부분 포함 매칭 — 띄어쓰기가 달라도 걸린다.
+    assert youtube.remove_video("좋은날") == ("removed", "아이유 - 좋은 날", "vidA")
+    assert deleted == ["itemA"]  # ⚠️ videoId 가 아니라 playlistItem id
+
+
+def test_youtube_remove_video_no_match(monkeypatch):
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(youtube, "_list_items", lambda _a: [("i1", "v1", "밤편지")])
+    monkeypatch.setattr(youtube, "_delete", lambda _a, _i: pytest.fail("삭제하면 안 된다"))
+    assert youtube.remove_video("없는곡") == ("none", "없는곡", "")
+
+
+def test_youtube_remove_video_many_matches_returns_candidates(monkeypatch):
+    # 2건 이상이면 삭제하지 않고 후보(최대 5개·40자)만 돌려준다.
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(
+        youtube,
+        "_list_items",
+        lambda _a: [(f"i{n}", f"v{n}", f"아이유 {n}번째 곡 " + "가" * 60) for n in range(7)],
+    )
+    monkeypatch.setattr(youtube, "_delete", lambda _a, _i: pytest.fail("삭제하면 안 된다"))
+    status, detail, vid = youtube.remove_video("아이유")
+    assert status == "many" and vid == ""
+    assert len(detail.split(" / ")) == 5  # 후보 상한 5
+    assert all(len(c) <= 40 for c in detail.split(" / "))  # 각 40자 절단
+
+
+class _FakeOpener:
+    """`_NOREDIRECT_OPENER` 대역 — 넘어온 Request 를 붙잡고 지정 status 를 돌려준다.
+
+    `read()` 를 일부러 두지 않는다: `_delete` 가 `_http_json`(JSON 파싱) 으로 되돌아가면 여기서
+    AttributeError 로 죽어 회귀가 잡힌다(docstring 이 "쓰면 안 된다"고 명시한 그 경로).
+    """
+
+    def __init__(self, status=204):
+        self.status = status
+        self.requests = []
+
+    def open(self, req, timeout=None):
+        self.requests.append((req, timeout))
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_a):
+        return False
+
+
+def test_youtube_delete_uses_http_delete_and_checks_status(monkeypatch):
+    # 파괴적 API 호출 — 메서드·대상·상태검사가 전부 무검증이었다(뮤테이션 생존자 B1).
+    opener = _FakeOpener(204)
+    monkeypatch.setattr(youtube, "_NOREDIRECT_OPENER", opener)
+    youtube._delete("tok", "item42")  # 204 무본문 = 성공(예외 없음)
+    req, timeout = opener.requests[0]
+    assert req.get_method() == "DELETE"  # GET 으로 바뀌면 아무것도 안 지워진다
+    assert "id=item42" in req.full_url  # videoId 가 아니라 playlistItem id
+    assert req.get_header("Authorization") == "Bearer tok"
+    assert timeout == youtube._TIMEOUT
+
+
+def test_youtube_delete_rejects_unexpected_status(monkeypatch):
+    monkeypatch.setattr(youtube, "_NOREDIRECT_OPENER", _FakeOpener(202))
+    with pytest.raises(ValueError):
+        youtube._delete("tok", "item42")
+
+
+def test_youtube_list_items_paginates_and_skips_missing_ids(monkeypatch):
+    # 50개 초과 재생목록(pageToken 순회)과 id 가드가 무검증이었다(B3).
+    pages = [
+        {
+            "items": [
+                {"id": "i1", "snippet": {"resourceId": {"videoId": "v1"}, "title": "곡1"}},
+                {"id": "i2", "snippet": {"resourceId": {}, "title": "videoId 없음"}},
+                {"snippet": {"resourceId": {"videoId": "v3"}, "title": "item id 없음"}},
+            ],
+            "nextPageToken": "p2",
+        },
+        {"items": [{"id": "i4", "snippet": {"resourceId": {"videoId": "v4"}}}]},
+    ]
+    urls = []
+
+    def fake_http_json(req):
+        urls.append(req.full_url)
+        return pages[len(urls) - 1]
+
+    monkeypatch.setattr(youtube, "_http_json", fake_http_json)
+    # 두 id 중 하나라도 없으면 배제한다(delete 가 playlistItem id 를 요구하므로 반쪽은 무용).
+    assert youtube._list_items("tok") == [("i1", "v1", "곡1"), ("i4", "v4", "v4")]
+    assert len(urls) == 2  # nextPageToken 이 있으면 계속 돈다
+    assert "pageToken" not in urls[0] and "pageToken=p2" in urls[1]
+
+
+def test_youtube_remove_video_exact_match_beats_substring(monkeypatch):
+    """🔴 정확일치 우선(M-3) — 부분일치만 쓰면 파괴적 경로가 두 가지로 잘못 움직인다.
+
+    ① 유일 부분일치라는 이유로 **엉뚱한 곡**이 확인 없이 지워진다.
+    ② 제목 A가 제목 B의 부분문자열이면(곡 ⊂ 곡 (Remix)) A를 정확히 쳐도 늘 many 라 못 지운다.
+    """
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(
+        youtube,
+        "_list_items",
+        lambda _a: [("i1", "v1", "좋은 날"), ("i2", "v2", "좋은날 (Remix)")],
+    )
+    deleted = []
+    monkeypatch.setattr(youtube, "_delete", lambda _a, i: deleted.append(i))
+    # 정확히 친 제목이 있으면 그 1건만 지운다(부분일치 2건이어도 many 로 안 떨어진다).
+    assert youtube.remove_video("좋은날") == ("removed", "좋은 날", "v1")
+    assert deleted == ["i1"]
+
+
+def test_youtube_remove_video_substring_multi_still_many(monkeypatch):
+    # 정확일치가 없고 부분일치가 여러 건이면 종전대로 many(지우지 않는다).
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(
+        youtube,
+        "_list_items",
+        lambda _a: [("i1", "v1", "좋은날 리믹스"), ("i2", "v2", "좋은날 어쿠스틱")],
+    )
+    monkeypatch.setattr(youtube, "_delete", lambda _a, _i: pytest.fail("삭제하면 안 된다"))
+    assert youtube.remove_video("좋은날")[0] == "many"
+
+
+def test_youtube_remove_video_empty_query_guard(monkeypatch):
+    # 빈 키는 모든 제목에 포함돼 곡 1개짜리 목록의 그 곡이 지워진다 → 파괴적 함수 자체에서 막는다
+    # (호출부 _handle_music_del 이 이미 막지만 가드가 호출자에만 있으면 안 된다).
+    monkeypatch.setattr(youtube, "_get_access", lambda: pytest.fail("API 호출도 하면 안 된다"))
+    monkeypatch.setattr(youtube, "_delete", lambda _a, _i: pytest.fail("삭제하면 안 된다"))
+    for q in ("", "   ", "\t\n"):
+        assert youtube.remove_video(q) == ("none", q, "")
+
+
+def test_youtube_remove_video_failure_reason_has_no_secrets(monkeypatch):
+    def boom():
+        raise OSError("refresh failed")
+
+    monkeypatch.setattr(youtube, "_get_access", boom)
+    status, detail, vid = youtube.remove_video("곡")
+    assert status == "fail" and vid == "" and "refresh failed" not in detail
+
+
+def test_youtube_remove_video_delete_failure(monkeypatch):
+    # delete 단계 실패도 삼켜 ('fail', 사유, '').
+    import http.client
+
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(youtube, "_list_items", lambda _a: [("i1", "v1", "곡")])
+
+    def truncated(_a, _i):
+        raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr(youtube, "_delete", truncated)
+    assert youtube.remove_video("곡")[0] == "fail"
 
 
 # ---------------------------------------------------------------------------
@@ -1586,6 +1870,37 @@ def test_playlist_bypass_pure():
     assert not bridge._playlist_bypass(_txt(999, "ㅁ노래", channel_role="간단처리"))  # 다른 채널
     assert not bridge._playlist_bypass(_btn(999, "push", channel_role=_PL))  # clean 외 버튼
     assert not bridge._playlist_bypass(_photo(999, channel_role=_PL, project=None))  # 사진
+
+
+def test_playlist_bypass_excludes_destructive_delete():
+    """★ 라우팅과 인가가 갈리는 지점(이 기능의 핵심 단언).
+
+    ㅁ삭제는 **라우팅은 허용**(개발자가 그 채널에서 써야 하니 _is_playlist_command=True)하되
+    **인가 우회는 불허**(파괴적이라 허용목록 유저만) — 둘을 한 함수로 합치면 안 된다.
+    ㅁ재생은 ㅁ노래·ㅁ다음과 같은 급이라 우회 허용.
+    """
+    assert bridge._is_playlist_command("ㅁ삭제 x")  # 라우팅 ○ (안 넣으면 개발자도 못 쓴다)
+    assert not bridge._playlist_bypass(_txt(999, "ㅁ삭제 x", channel_role=_PL))  # 인가 우회 ✗
+    assert bridge._is_playlist_command("ㅁ재생 x")
+    assert bridge._playlist_bypass(_txt(999, "ㅁ재생 x", channel_role=_PL))  # 재생 제어는 우회 ○
+
+
+def test_bypass_unauth_playlist_delete_blocked(monkeypatch):
+    # 비인가 서버 멤버의 'ㅁ삭제'는 무회신·remove_video 미호출(파괴적 경로 보안 회귀).
+    called = _del_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(999, "ㅁ삭제 곡", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert called == [] and a.sent == [] and a.dequeued == []
+    # 허용목록 유저는 같은 채널에서 그대로 동작한다(라우팅은 열려 있다).
+    a2 = FakeAdapter()
+    _fire(a2, _txt(777, "ㅁ삭제 곡", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert called == ["곡"] and a2.sent
+
+
+def test_bypass_unauth_playlist_play_one_passes():
+    a = FakeAdapter()
+    _fire(a, _txt(999, "ㅁ재생 곡", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert a.music == [("play", 999, 999, "곡")]  # 비인가라도 재생 제어는 통과
 
 
 def test_bypass_unauth_playlist_music_passes(monkeypatch):
@@ -9128,7 +9443,6 @@ def test_followup_buttons_are_not_emitted():
     assert a.sent == [] and a.edited == []  # 부작용 0
 
 
-
 def test_reply_resume_is_not_wired():
     """🔴 답장 이어가기(1c)는 2026-08-16 제거됐다 — ⑤ 채널 세션만 남는다.
 
@@ -9160,4 +9474,3 @@ def test_reply_resume_is_not_wired():
 # 1e 매크로 (계약 §4.5) — 2026-08-16
 # ══════════════════════════════════════════════
 # 위험은 «저장이 되는가»가 아니라 **엉뚱한 것을 실행하는 것**이다(인덱스 밀림·손상 파일).
-

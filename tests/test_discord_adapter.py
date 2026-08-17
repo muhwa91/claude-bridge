@@ -11,6 +11,7 @@ discord.py 미설치 환경(예: CI 최소셋)에서는 importorskip 으로 전�
 from __future__ import annotations
 
 import asyncio
+import time
 import urllib.error
 from types import SimpleNamespace
 
@@ -856,6 +857,500 @@ def test_enqueue_coro_fifo_after_playback_progressed():
     a._music_index = 1  # A 재생 중(지나감) — 뒤의 orig 는 queued 아님
     assert asyncio.run(a._enqueue_coro("D", "라")) == 4
     assert [e["id"] for e in a._music_entries] == ["cur", "A", "D", "orig"]  # index+1 에 삽입
+
+
+class _FakeVoice:
+    """discord.py VoiceClient 의 **실동작**을 최소로 흉내낸다.
+
+    🔴 `stop()` 을 «항상 먹는 것» 으로 만들면 A1 같은 결함군을 원리적으로 못 잡는다 — 실제로는
+    재생 중이 아니면 **no-op 이고 _after 도 안 뜬다**. 그 의미를 여기 반영해 둔다.
+    (play() 의 중복 재생 예외까지는 흉내내지 않는다 — 테스트는 _advance 를 직접 태운다.)
+    """
+
+    def __init__(self, played):
+        self._played = played
+        self.playing = False
+        self.stops = 0  # **먹은** stop() 횟수(미재생 no-op 은 세지 않는다)
+        self.connected = True
+
+    def is_connected(self):
+        return self.connected
+
+    def play(self, src, after=None):
+        self.playing = True
+        self._played.append((src, after))
+
+    def stop(self):
+        if not self.playing:
+            return  # 미재생 → no-op(_after 가 안 뜬다)
+        self.playing = False
+        self.stops += 1
+
+    async def disconnect(self, **_kw):
+        self.connected = False
+
+
+def _playing(monkeypatch, entries, index=0, *, text_ch=500):
+    """`_play_current`·`_advance` 를 **실제로 태울 수 있는** 어댑터 + (재생 기록, 발송 기록).
+
+    무력화하는 것은 재생 그 자체(yt-dlp 스트림 해석·ffmpeg·디스코드 전송)뿐이라, 알림 배선과
+    인덱스 이동은 진짜 코드가 돈다 — 손으로 `+1` 을 흉내내면 _advance 의 wrap·재셔플 분기
+    변경을 못 잡는다(리뷰 2).
+    """
+    a = _adapter()
+    a._music_entries = [dict(e) for e in entries]
+    a._music_index = index
+    a._music_text_ch = text_ch
+    a._extract_stream = lambda _entry: "http://stream"  # type: ignore[method-assign]
+    a._ffmpeg_log_off = True  # 테스트가 logs/ffmpeg.log 를 만들지 않게(핸들 검증은 전용 테스트)
+    monkeypatch.setattr(discord, "FFmpegPCMAudio", lambda *_a, **_k: object())
+    played: list[object] = []
+    a._voice = _FakeVoice(played)
+    sent: list[tuple[int, str]] = []
+
+    async def fake_send_coro(cid, payload, _view):
+        sent.append((cid, payload))
+        return 1
+
+    a._send_coro = fake_send_coro  # type: ignore[method-assign]
+    return a, played, sent
+
+
+def test_play_current_announces_title(monkeypatch):
+    # 🔴 요구사항 ①의 유일한 배선 단언 — _play_current 의 알림 한 줄을 지우면 이 테스트가 깨진다.
+    a, played, sent = _playing(monkeypatch, [{"id": "v1", "title": "밤편지"}])
+    asyncio.run(a._play_current())
+    assert len(played) == 1  # 재생은 시작됐고
+    assert sent == [(500, "▶️ Play - 밤편지")]  # 제목이 채널로 나갔다
+
+
+def test_play_current_rechecks_voice_after_await(monkeypatch):
+    """A1: 스트림 해석(await, 실사용 1~3초) 사이에 ㅁ정지가 들어와도 죽지 않아야 한다.
+
+    루프 머리의 `not self._music_stopping` 검사는 이 await **이전**에 끝난다. 재검사가 없으면
+    _music_stop_coro 가 만든 `_voice = None` 위로 play() 를 쳐서 AttributeError 가 나고,
+    _advance 는 맨 태스크라 아무도 그 예외를 받지 않는다("Task exception was never retrieved").
+    """
+    a, played, _sent = _playing(monkeypatch, [{"id": "v1", "title": "곡1"}])
+    a._extract_stream = lambda _e: (time.sleep(0.05), "http://stream")[1]  # 끼어들 창을 연다
+
+    async def scenario():
+        task = asyncio.create_task(a._play_current())
+        await asyncio.sleep(0.01)  # 추출이 실행기 스레드에서 도는 동안
+        await a._music_stop_coro()  # 그 창에서 ㅁ정지 — _voice 를 None 으로 만든다
+        await task  # 예외가 나면 여기서 터진다(= 회귀)
+
+    asyncio.run(scenario())
+    assert played == []  # 정지된 뒤라 play() 는 호출되지 않았다
+    assert a._voice is None
+
+
+def test_play_current_gives_up_after_one_full_round(monkeypatch):
+    """A2: 전곡 추출 실패 시 무한 스핀하지 않고 빠져나오며 이유를 1회 알린다.
+
+    탈출 조건이 없으면 2초에 18,737회 돌며 회전 없는 bridge.log 를 채운다(실측).
+    """
+    a, played, sent = _playing(monkeypatch, [{"id": f"v{i}", "title": f"곡{i}"} for i in range(3)])
+
+    def boom(_entry):
+        raise RuntimeError("403")
+
+    a._extract_stream = boom
+
+    async def bounded():
+        await asyncio.wait_for(a._play_current(), 2.0)  # 무한 스핀이면 TimeoutError
+
+    asyncio.run(bounded())
+    assert played == []
+    assert sent == [(500, "⚠️ 재생 가능한 곡이 없습니다.")]  # 무음의 이유를 알 수 있게
+
+
+def test_extract_stream_avoids_broken_dash_clients(monkeypatch):
+    """재생 403 회귀 — 오디오 전용(opus 251)을 주는 클라이언트가 목록에 있으면 안 된다.
+
+    셋(android_vr·web_embedded·tv_downgraded) 다 통짜 GET 이 403 이라 ffmpeg 이 90ms 만에 죽는다.
+    ⚠️ «폴백» 으로 하나만 남겨도 소용없다 — bestaudio 는 클라이언트 순서가 아니라 오디오 품질로
+    골라서 고장난 251 을 다시 뽑는다. 네트워크는 타지 않는다(yt-dlp 를 통째로 모킹).
+    """
+    seen: dict = {}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            seen.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def extract_info(self, ref, **_kw):
+            return {"url": f"http://stream/{ref}"}
+
+    monkeypatch.setattr(discord_adapter.yt_dlp, "YoutubeDL", FakeYDL)
+    assert _adapter()._extract_stream({"id": "vid1"}) == "http://stream/vid1"
+    clients = seen["extractor_args"]["youtube"]["player_client"]
+    assert clients == ["android", "tv_simply"]
+    assert not ({"android_vr", "web_embedded", "tv_downgraded"} & set(clients))
+
+
+def test_play_current_passes_stderr_to_ffmpeg(monkeypatch, tmp_path):
+    """🔴 stderr 를 안 넘기면 ffmpeg 의 403 이 통째로 사라진다(3주간 결함이 숨은 이유).
+
+    핸들은 어댑터 수명에 1회만 연다 — 곡마다 열지 않는다.
+    """
+    a, _played, _sent = _playing(monkeypatch, [{"id": "v1", "title": "곡1"}, {"id": "v2"}])
+    monkeypatch.setattr(discord_adapter, "FFMPEG_LOG_FILE", tmp_path / "logs" / "ffmpeg.log")
+    a._ffmpeg_log_off = False  # _playing 이 껐던 것을 이 테스트에서만 켠다
+    handles = []
+
+    def fake_ffmpeg(*_a, **kw):
+        handles.append(kw.get("stderr"))
+        return object()
+
+    monkeypatch.setattr(discord, "FFmpegPCMAudio", fake_ffmpeg)
+    asyncio.run(a._play_current())
+    asyncio.run(a._advance())
+    assert handles[0] is not None and handles[0] is handles[1]  # 같은 핸들 재사용(곡마다 열지 않음)
+    assert (tmp_path / "logs" / "ffmpeg.log").exists()  # logs/ 는 없으면 만든다
+    a.close()
+    assert handles[0].closed  # close() 가 핸들을 정리한다
+
+
+def test_ffmpeg_stderr_opens_unbuffered_append(monkeypatch, tmp_path):
+    # 🔴 buffering=0 이 이 기능의 핵심 — 봇은 상시 프로세스라 flush 시점이 오지 않는다.
+    # 버퍼링이 켜지면 403 이 디스크에 안 닿아 stderr 를 넘긴 의미가 통째로 사라진다.
+    seen: dict = {}
+    real = tmp_path / "ffmpeg.log"
+
+    class FakePath:
+        parent = SimpleNamespace(mkdir=lambda **_kw: None)
+
+        def open(self, mode, **kw):
+            seen["mode"] = mode
+            seen.update(kw)
+            return real.open("ab", buffering=0)
+
+    monkeypatch.setattr(discord_adapter, "FFMPEG_LOG_FILE", FakePath())
+    a = _adapter()
+    assert a._ffmpeg_stderr() is not None
+    assert seen == {"mode": "ab", "buffering": 0}  # append + 무버퍼
+    a.close()
+
+
+def test_ffmpeg_stderr_open_failure_does_not_block_playback(monkeypatch, tmp_path):
+    # 로그를 못 열어도(권한·경로) 재생은 계속돼야 한다 — stderr=None 으로 진행, 재시도는 안 한다.
+    a = _adapter()
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")  # 파일 밑에는 폴더를 못 만든다 → mkdir 이 OSError
+    monkeypatch.setattr(discord_adapter, "FFMPEG_LOG_FILE", blocker / "logs" / "ffmpeg.log")
+    assert a._ffmpeg_stderr() is None
+    assert a._ffmpeg_log_off is True  # 곡마다 경고가 도배되지 않게 한 번만 시도
+    a.close()  # 핸들이 없어도 안전
+
+
+def test_advance_plays_next_and_announces(monkeypatch):
+    # 실제 _advance 를 태운다(손으로 +1 흉내내지 않는다).
+    a, _played, sent = _playing(
+        monkeypatch, [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}], index=0
+    )
+    asyncio.run(a._advance())
+    assert a._music_index == 1 and sent == [(500, "▶️ Play - B")]
+
+
+def test_advance_wraps_and_reshuffles(monkeypatch):
+    # 마지막 곡에서 넘어가면 재셔플 + 처음부터(무한 반복). 재셔플이 queued 마커도 지운다.
+    a, _played, sent = _playing(
+        monkeypatch,
+        [{"id": "a", "title": "A", "queued": True}, {"id": "b", "title": "B"}],
+        index=1,
+    )
+    asyncio.run(a._advance())
+    assert a._music_index == 0
+    assert all("queued" not in e for e in a._music_entries)
+    assert len(sent) == 1 and sent[0][1].startswith("▶️ Play - ")
+
+
+def test_notify_music_sends_via_send_coro():
+    # 음악 알림은 _send_coro 를 직접 await 한다 — self.send() 는 _run 동기대기라 루프 위에서
+    # 부르면 데드락(§3.2). 채널 미상(0)이면 건너뛰고, 전송 실패는 삼킨다(재생이 끊기면 안 된다).
+    a = _adapter()
+    sent = []
+
+    async def fake_send_coro(cid, payload, view):
+        sent.append((cid, payload, view))
+        return 1
+
+    a._send_coro = fake_send_coro  # type: ignore[method-assign]
+    a._music_text_ch = 0
+    asyncio.run(a._notify_music("▶️ Play - 밤편지"))
+    assert sent == []  # 재생 채널 미상 → 스킵
+    a._music_text_ch = 500
+    asyncio.run(a._notify_music("▶️ Play - 밤편지"))
+    assert sent == [(500, "▶️ Play - 밤편지", None)]
+
+    async def boom(_cid, _payload, _view):
+        raise discord.DiscordException("권한 없음")
+
+    a._send_coro = boom  # type: ignore[method-assign]
+    asyncio.run(a._notify_music("▶️ Play - 곡"))  # 예외 전파 없음(재생 계속)
+
+
+def test_play_current_falls_back_to_id_when_title_missing(monkeypatch):
+    # 알림 제목은 title, 없으면 id.
+    a, _played, sent = _playing(monkeypatch, [{"id": "v2"}])
+    asyncio.run(a._play_current())
+    assert sent == [(500, "▶️ Play - v2")]
+
+
+def test_dequeue_coro_shifts_index_when_removing_before_current():
+    # 'ㅁ삭제'로 현재 곡 **앞**의 곡을 빼면 _music_index 를 그만큼 당겨야 한다 —
+    # 안 당기면 재생 중인 곡이 바뀐 것처럼 밀려 다음 곡이 어긋난다(인덱스 보정 회귀).
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: pytest.fail("현재곡 아님"))
+    a._music_entries = [{"id": "x"}, {"id": "dup"}, {"id": "cur"}, {"id": "dup"}, {"id": "y"}]
+    a._music_index = 2  # cur 재생 중
+    assert asyncio.run(a._dequeue_coro("dup")) == 2  # 앞뒤로 1건씩 제거
+    assert [e["id"] for e in a._music_entries] == ["x", "cur", "y"]
+    assert a._music_entries[a._music_index]["id"] == "cur"  # 여전히 같은 곡을 가리킨다
+
+
+def test_dequeue_coro_skips_to_next_when_removing_current(monkeypatch):
+    # 현재 곡을 지우면 stop() → (실제)_advance 가 '지운 곡의 다음 곡'을 튼다(한 곡 건너뜀 방지).
+    a, _played, sent = _playing(
+        monkeypatch,
+        [{"id": "a", "title": "A"}, {"id": "cur", "title": "현재"}, {"id": "b", "title": "B"}],
+        index=1,
+    )
+    assert asyncio.run(a._dequeue_coro("cur")) == 1
+    assert [e["id"] for e in a._music_entries] == ["a", "b"]
+    asyncio.run(a._advance())  # _after 가 하는 일을 실제로 태운다
+    assert sent == [(500, "▶️ Play - B")]
+
+
+def test_dequeue_current_at_index_zero_then_advance(monkeypatch):
+    # 현재 곡이 맨 앞이면 보정 후 _music_index 가 -1 이 된다 — 도달하는 경로가 _advance(선 +1)
+    # 뿐이라 entries[-1] 을 읽는 일이 없다(전수 검증 확인분). 실제로 태워 다음 곡이 맞는지 본다.
+    a, _played, sent = _playing(
+        monkeypatch,
+        [{"id": "cur", "title": "현재"}, {"id": "b", "title": "B"}],
+        index=0,
+    )
+    assert asyncio.run(a._dequeue_coro("cur")) == 1
+    assert a._music_index == -1
+    asyncio.run(a._advance())
+    assert a._music_index == 0 and sent == [(500, "▶️ Play - B")]
+
+
+def test_dequeue_last_entry_wraps_to_reshuffle(monkeypatch):
+    # 목록 **마지막** 곡을 재생 중에 지우면 다음이 없다 → _advance 가 wrap 해 재셔플·처음부터.
+    a, _played, sent = _playing(
+        monkeypatch,
+        [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}, {"id": "cur", "title": "현재"}],
+        index=2,
+    )
+    assert asyncio.run(a._dequeue_coro("cur")) == 1
+    assert a._music_index == 1  # 남은 [A,B] 의 마지막 → 다음 +1 이 곧 wrap
+    asyncio.run(a._advance())
+    assert a._music_index == 0 and len(sent) == 1
+    assert sent[0][1] in ("▶️ Play - A", "▶️ Play - B")  # 재셔플이라 순서는 무작위
+
+
+def test_dequeue_coro_noop_when_queue_would_empty():
+    # 전부 지우면 재생이 끊긴다 → 손대지 않고 0(빈 목록 방어는 _play_current 의 while 이 담당).
+    a = _adapter()
+    a._voice = SimpleNamespace(
+        is_connected=lambda: True, stop=lambda: pytest.fail("건드리면 안 됨")
+    )
+    a._music_entries = [{"id": "only"}]
+    assert asyncio.run(a._dequeue_coro("only")) == 0
+    assert [e["id"] for e in a._music_entries] == ["only"]
+    # 큐에 없는 id·미재생·정지 중도 no-op.
+    assert asyncio.run(a._dequeue_coro("없는id")) == 0
+    a._music_stopping = True
+    assert asyncio.run(a._dequeue_coro("only")) == 0
+    a._voice = None
+    assert asyncio.run(a._dequeue_coro("only")) == 0
+
+
+def test_music_play_one_coro_moves_queued_song_next(monkeypatch):
+    # 'ㅁ재생 <제목>': 큐에서 그 곡을 꺼내 현재 곡 바로 뒤로 옮기고 stop() → _advance 가 그 곡으로.
+    a, _played, sent = _playing(
+        monkeypatch,
+        [
+            {"id": "v0", "title": "곡0"},
+            {"id": "v1", "title": "현재곡"},
+            {"id": "v2", "title": "밤편지"},
+        ],
+        index=1,
+    )
+    a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "밤편지")) == "⏭️ 밤편지"
+    assert a._music_stopping is False  # stopping 을 건드리면 advance 가 죽는다
+    assert len(a._music_entries) == 3  # 이동일 뿐 중복 삽입 아님
+    asyncio.run(a._advance())  # 실제 _advance 로 확인
+    assert sent == [(500, "▶️ Play - 밤편지")]
+
+
+def test_music_play_one_coro_restarts_current_song(monkeypatch):
+    # 재생 중인 곡 **자신**을 지정하면 그 곡을 처음부터 다시 튼다(인덱스가 어긋나지 않는다).
+    a, _played, sent = _playing(
+        monkeypatch,
+        [{"id": "a", "title": "A"}, {"id": "cur", "title": "현재곡"}, {"id": "b", "title": "B"}],
+        index=1,
+    )
+    a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "현재곡")) == "⏭️ 현재곡"
+    assert [e["id"] for e in a._music_entries] == ["a", "cur", "b"]  # 구성 불변
+    asyncio.run(a._advance())
+    assert sent == [(500, "▶️ Play - 현재곡")]
+
+
+def test_music_play_one_coro_search_fallback_and_failure():
+    # 큐에 없으면 유튜브 검색 폴백(재생목록엔 추가 안 함 — 임시 편입). 검색도 실패면 안내 문자열.
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: None)
+    a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
+    a._music_entries = [{"id": "v0", "title": "곡0"}]
+    a._music_index = 0
+    a.search_video = lambda _q: ("newvid", "새로운곡")  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "새로운곡")) == "⏭️ 새로운곡"
+    assert [e["id"] for e in a._music_entries] == ["v0", "newvid"]
+    a.search_video = lambda _q: None  # type: ignore[method-assign]
+    assert "찾지 못했습니다" in asyncio.run(a._music_play_one_coro(1, 2, "없는곡"))
+    assert len(a._music_entries) == 2  # 실패는 큐를 건드리지 않는다
+
+
+def test_music_play_one_failure_does_not_echo_raw_markdown():
+    """L-1: 실패 회신이 사용자 입력을 원문 그대로 되돌리면 안 된다.
+
+    플레이리스트 채널은 비인가 서버 멤버가 우회 허용 대상이라, 마크다운 링크를 치면 **봇 명의로**
+    피싱 링크가 게시된다(멘션은 막았지만 링크는 아니다). 코드스팬 + 길이 절단 + 백틱 제거.
+    """
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: None)
+    a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
+    a._music_entries = [{"id": "v0", "title": "곡0"}]
+    a.search_video = lambda _q: None  # type: ignore[method-assign]
+    reply = asyncio.run(a._music_play_one_coro(1, 2, "[지금 확인](https://피싱주소)"))
+    assert reply == "재생 실패: `[지금 확인](https://피싱주소)` 를 찾지 못했습니다."
+    # 백틱을 섞어 코드스팬을 닫고 빠져나오려는 시도도 무력화된다.
+    out = asyncio.run(a._music_play_one_coro(1, 2, "`](https://x) @everyone"))
+    assert "`" not in out[len("재생 실패: `") : -len("` 를 찾지 못했습니다.")]
+    # 긴 입력은 잘린다(회신 도배 방지).
+    assert asyncio.run(a._music_play_one_coro(1, 2, "가" * 200)).count("가") == 80
+
+
+def _startable(monkeypatch, flat, search=None):
+    """**미재생 상태**에서 `_music_play_coro` 를 실제로 태울 수 있는 어댑터(음성 연결만 가짜).
+
+    'ㅁ재생 <제목>' 을 안 틀어져 있을 때 쓰는 경로 = 요구사항의 절반인데 실행 0줄이었다(B2).
+    """
+    a, played, sent = _playing(monkeypatch, [])
+    voice = a._voice
+    a._voice = None  # 아직 미연결
+    a._music_playlist_url = "https://pl"
+    a._extract_flat = lambda: [dict(e) for e in flat]  # type: ignore[method-assign]
+    a.search_video = lambda _q: search  # type: ignore[method-assign]
+
+    async def connect(**_kw):
+        a._voice = voice
+        return voice
+
+    a._caller_voice_channel = lambda _uid: SimpleNamespace(connect=connect)  # type: ignore[method-assign]
+    return a, played, sent
+
+
+def _now_playing(a):
+    return a._music_entries[a._music_index]
+
+
+def test_music_play_coro_query_hits_queue(monkeypatch):
+    # ㅁ재생 <제목>: 재생목록에 있으면 셔플 첫 곡 대신 **그 곡부터** 시작한다.
+    flat = [
+        {"id": "a", "title": "곡A"},
+        {"id": "b", "title": "밤편지"},
+        {"id": "c", "title": "곡C"},
+    ]
+    a, _played, sent = _startable(monkeypatch, flat)
+    assert asyncio.run(a._music_play_coro(500, 7, "밤편지")) == "🎵 3곡 재생목록"
+    assert _now_playing(a)["id"] == "b"
+    assert sent == [(500, "▶️ Play - 밤편지")]
+
+
+def test_music_play_coro_query_search_fallback(monkeypatch):
+    # 재생목록에 없으면 유튜브 검색으로 끌어와 맨 앞에 끼우고 그 곡부터.
+    flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "곡B"}]
+    a, _played, sent = _startable(monkeypatch, flat, search=("newvid", "새로운곡"))
+    assert asyncio.run(a._music_play_coro(500, 7, "새로운곡")) == "🎵 3곡 재생목록"
+    assert _now_playing(a) == {"id": "newvid", "title": "새로운곡", "queued": True}
+    assert sent == [(500, "▶️ Play - 새로운곡")]
+
+
+def test_music_play_coro_query_search_failure_starts_shuffled(monkeypatch):
+    # 검색까지 실패하면 재생 자체를 막지 않는다 — 셔플 첫 곡(index 0)으로 시작.
+    flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "곡B"}]
+    a, _played, sent = _startable(monkeypatch, flat, search=None)
+    assert asyncio.run(a._music_play_coro(500, 7, "없는곡")) == "🎵 2곡 재생목록"
+    assert a._music_index == 0 and len(a._music_entries) == 2  # 끼워넣지 않았다
+    assert sent[0][1].startswith("▶️ Play - 곡")
+
+
+def test_music_play_coro_without_query_keeps_legacy_reply(monkeypatch):
+    # 🔴 회신 접두사 분기(02_계약 동결 문구) — 'ㅁ노래' 는 종전 그대로 곡수를 알린다.
+    flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "곡B"}]
+    a, _played, _sent = _startable(monkeypatch, flat)
+    assert asyncio.run(a._music_play_coro(500, 7)) == "▶️ Play - 2곡"
+
+
+def test_music_play_one_coro_requires_caller_in_voice_channel():
+    # M-2: 음성채널에 안 들어온 user 는 재생을 못 끊는다 — 검색(yt-dlp)까지 가면 안 된다.
+    a = _adapter()
+    a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: pytest.fail("stop 금지"))
+    a._music_entries = [{"id": "v0", "title": "곡0"}]
+    a._caller_voice_channel = lambda _uid: None  # type: ignore[method-assign]
+    a.search_video = lambda _q: pytest.fail("검색하면 안 된다")  # type: ignore[method-assign]
+    assert (
+        asyncio.run(a._music_play_one_coro(1, 2, "없는곡")) == "🔊 먼저 음성채널에 들어가 주세요."
+    )
+    assert len(a._music_entries) == 1  # 큐 무변형
+
+
+def test_music_play_one_coro_delegates_while_stopping():
+    # 정지 진행 중이면 큐를 만져봐야 _advance 가 즉시 return 해 아무것도 안 나온다 →
+    # 통상 재생으로 위임(_music_play_coro 가 _music_stopping 을 리셋하며 정상 시작).
+    a = _adapter()
+    a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
+    a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: pytest.fail("stop 금지"))
+    a._music_entries = [{"id": "v0", "title": "곡0"}]
+    a._music_stopping = True
+    calls = []
+
+    async def fake_play(cid, uid, q=""):
+        calls.append((cid, uid, q))
+        return "🎵 1곡 재생목록"
+
+    a._music_play_coro = fake_play  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "곡0")) == "🎵 1곡 재생목록"
+    assert calls == [(1, 2, "곡0")]
+    assert len(a._music_entries) == 1  # 큐 무변형
+
+
+def test_client_blocks_all_mentions():
+    # 🔴 M-1: 유튜브 제목이 곡마다 채널로 나가므로 멘션을 뿌리(클라이언트)에서 막는다.
+    # 이 줄이 없으면 디스코드가 본문의 @everyone·유저 멘션을 파싱해 봇 명의로 핑을 쏜다.
+    am = _adapter()._client.allowed_mentions
+    assert (am.everyone, am.users, am.roles, am.replied_user) == (False, False, False, False)
+
+
+def test_find_title_folds_spaces_and_case():
+    # 큐 매칭 = 공백접기+casefold(adapter.fold_title) 부분 포함. ⚠️ 정규화만 remove_video 와
+    # 공유하고 선택 규칙은 다르다(삭제=정확일치 우선, 재생=부분 첫 곡 — 계약 §1 동결분).
+    entries = [{"id": "v1", "title": "밤편지"}, {"id": "v2", "title": "IU - Good Day"}]
+    assert discord_adapter._find_title(entries, "good day") == 1
+    assert discord_adapter._find_title(entries, "  밤 편지 ") == 0
+    assert discord_adapter._find_title(entries, "없는곡") is None
+    assert discord_adapter._find_title([{"id": "vid_only"}], "vid_only") == 0  # title 없으면 id
 
 
 def test_enqueue_coro_noop_when_not_playing():

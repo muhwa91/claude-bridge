@@ -128,6 +128,10 @@ MUSIC_SKIP_WORDS = frozenset({"ㅁ다음"})
 MUSIC_STOP_WORDS = frozenset({"ㅁ정지"})
 # 'ㅁ추가 <링크|검색어>' — 유튜브 재생목록 추가. 접두 매칭(뒤에 인자를 받음, 위 3종은 단독매칭).
 MUSIC_ADD_WORDS = frozenset({"ㅁ추가"})
+# 'ㅁ삭제 <제목>' — 유튜브 재생목록에서 제거(파괴적). 'ㅁ재생 <제목>' — 그 곡을 지금 재생.
+# 둘 다 ㅁ추가와 같은 접두 매칭. ⚠️ 인가는 갈린다 — _playlist_bypass 는 ㅁ삭제만 우회에서 뺀다.
+MUSIC_DEL_WORDS = frozenset({"ㅁ삭제"})
+MUSIC_PLAY_ONE_WORDS = frozenset({"ㅁ재생"})
 
 
 def music_action(text: str) -> str | None:
@@ -158,10 +162,31 @@ def extract_video_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _is_prefix_cmd(text: str, words: frozenset[str]) -> bool:
+    """접두 명령 판정(순수) — 첫 토큰이 words 에 있으면 True. 붙여쓰기('ㅁ추가곡')는 미발동."""
+    parts = text.strip().split(maxsplit=1)
+    return bool(parts) and parts[0] in words
+
+
+def _cmd_arg(text: str) -> str:
+    """'ㅁ명령 <인자>' 의 인자 부분(공백 정리). 인자가 없으면 ''."""
+    parts = text.strip().split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 def is_music_add(text: str) -> bool:
     """'ㅁ추가' 명령 여부(접두 매칭 — 인자는 뒤에 붙는다). 'ㅁ추가곡' 등 붙여쓰기는 미발동."""
-    parts = text.strip().split(maxsplit=1)
-    return bool(parts) and parts[0] in MUSIC_ADD_WORDS
+    return _is_prefix_cmd(text, MUSIC_ADD_WORDS)
+
+
+def is_music_del(text: str) -> bool:
+    """'ㅁ삭제' 명령 여부(접두 매칭). 재생목록에서 곡을 빼는 파괴적 명령 — 인가 우회 대상 아님."""
+    return _is_prefix_cmd(text, MUSIC_DEL_WORDS)
+
+
+def is_music_play_one(text: str) -> bool:
+    """'ㅁ재생' 명령 여부(접두 매칭). 제목으로 그 곡을 지금 트는 명령(ㅁ노래=목록 전체 재생)."""
+    return _is_prefix_cmd(text, MUSIC_PLAY_ONE_WORDS)
 
 
 # 명령 접두 'ㅁ' 통일(개인용 — 한글 자판 1키). 슬래시('/help'·'/프로젝트')·접두 없는 평문
@@ -4676,6 +4701,8 @@ HELP_TEXT = (
     "\n"
     "### 음악 — ㅁ노래\n"
     "음성채널에 들어가 배경음악을 재생합니다. 정지 ㅁ정지 · 다음곡 ㅁ다음.\n"
+    "ㅁ재생 <제목> 은 그 곡을 지금 틀고(목록에 없으면 유튜브에서 찾아 한 번 재생), "
+    "ㅁ삭제 <제목> 은 재생목록에서 그 곡을 뺍니다.\n"
     "\n"
     "### 오라클 상태 — 오라클\n"
     "무료 서버(오라클 클라우드) 재고 잡이가 도는 중인지 현재 상태를 알려줍니다.\n"
@@ -5674,13 +5701,21 @@ def _find_awaiting(channel_id: int, user_id: int) -> tuple[int, dict[str, Any]] 
 
 
 def _is_playlist_command(text: str) -> bool:
-    """플레이리스트 채널 화이트리스트 판정: ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가만 True(순수).
+    """플레이리스트 채널 화이트리스트 판정: ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가·ㅁ삭제·ㅁ재생(순수).
 
-    실제 처리 분기(music_action·'ㅁ청소'·is_music_add)와 정확히 같은 조건이어야 한다 —
+    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one)와 정확히 같은 조건이어야 한다 —
     게이트만 통과하고 아래 분기에 안 걸리면 HELP 폴백이 새어 채널에 안내가 뜬다(§ 무반응 계약).
+    ⚠️ 이건 **라우팅**(그 채널에서 처리되는가)이지 인가가 아니다 — ㅁ삭제도 여기선 True 여야 개발자가
+    그 채널에서 쓸 수 있다. 비인가 멤버 차단은 _playlist_bypass 가 따로 한다.
     """
     stripped = text.strip()
-    return music_action(stripped) is not None or stripped == "ㅁ청소" or is_music_add(stripped)
+    return (
+        music_action(stripped) is not None
+        or stripped == "ㅁ청소"
+        or is_music_add(stripped)
+        or is_music_del(stripped)
+        or is_music_play_one(stripped)
+    )
 
 
 def _playlist_bypass(event: Event) -> bool:
@@ -5689,8 +5724,11 @@ def _playlist_bypass(event: Event) -> bool:
     True 를 반환할 때만 handle_event 가 비인가 user_id 를 통과시킨다(서버 멤버 누구나 음악 제어,
     개발자 결정). 조건을 의도적으로 좁게 유지한다:
       · (channel_role == "playlist")  AND
-      · text  → 화이트리스트 명령(_is_playlist_command: ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가)
+      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제는 뺀다**
         button → clean:ok/x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
+    ⚠️ ㅁ삭제(재생목록에서 곡 제거)만 우회에서 제외한다 — **파괴적**이라 허용목록 유저(is_allowed)만
+    쓴다. 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
+    무반응이다. ㅁ재생은 ㅁ노래·ㅁ다음과 같은 급(재생 제어)이라 우회를 허용한다.
     그 외(다른 채널·비화이트리스트 텍스트·사진·위험명령 ㅁ프로젝트/ㅁ푸시/ㅁ재시작/일반 실행)는
     False → 기존 is_allowed 인가 그대로. 위험명령은 플레이리스트 게이트가 이미 무시하므로 비인가
     user 에게 도달 불가(이중 방어). channel_role 은 어댑터가 channel_map 으로 채운 신뢰값.
@@ -5698,7 +5736,7 @@ def _playlist_bypass(event: Event) -> bool:
     if event.channel_role not in _MUSIC_ONLY_ROLES:
         return False
     if event.kind == "text":
-        return _is_playlist_command(event.text)
+        return _is_playlist_command(event.text) and not is_music_del(event.text)
     if event.kind == "button":
         return event.action in ("clean:ok", "x")
     return False
@@ -5750,8 +5788,7 @@ def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
     재생목록 전용 링크(videoId 없음)는 개별 실패. 네트워크는 위임 — list/insert 는 youtube 모듈
     (stdlib urllib), 검색은 adapter.search_video(yt-dlp). 여기선 파싱·라우팅·회신만 한다.
     """
-    parts = text.strip().split(maxsplit=1)
-    arg = parts[1].strip() if len(parts) > 1 else ""
+    arg = _cmd_arg(text)
     if not arg:
         adapter.send(channel_id, "추가 실패: 유튜브 링크나 검색어를 주세요.")
         return
@@ -5774,6 +5811,31 @@ def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
     adapter.send(channel_id, _add_one_line(adapter, video_id))
 
 
+def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
+    """'ㅁ삭제 <제목>' 처리 — 유튜브 재생목록에서 제거(+재생 중이면 큐에서도 뺀다).
+
+    판정·삭제는 youtube.remove_video 소관(stdlib Data API — 추가와 대칭). 여러 곡이 걸리면
+    지우지 않고 후보를 돌려주므로(오삭제 방지) 여기선 그 4갈래를 회신 문구로 옮기기만 한다.
+    """
+    arg = _cmd_arg(text)
+    if not arg:
+        adapter.send(channel_id, "삭제 실패: 지울 노래 제목을 주세요.")
+        return
+    status, detail, video_id = youtube.remove_video(arg)
+    if status == "removed":
+        line = f"🗑️ 삭제됨: {detail}"
+        dropped = adapter.dequeue_video(video_id)  # 재생 중이 아니면 0(no-op)
+        if dropped > 0:
+            line += f"\n(재생 큐에서 {dropped}곡 제거)"
+    elif status == "none":
+        line = f"삭제 실패: '{arg}' 를 재생목록에서 못 찾았습니다."
+    elif status == "many":
+        line = f"여러 곡이 걸립니다 — 더 정확히 적어주세요:\n{detail}"
+    else:
+        line = f"삭제 실패: {detail}"
+    adapter.send(channel_id, line)
+
+
 def _handle_text(
     adapter: Adapter,
     event: Event,
@@ -5786,7 +5848,7 @@ def _handle_text(
     """텍스트 메시지 처리(구 handle_update 텍스트 분기). 명령·push·프로젝트 실행·직접입력 라우팅."""
     channel_id = event.channel_id
     text = event.text
-    # 플레이리스트 채널 게이트(최상단): 화이트리스트(ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가)만 통과.
+    # 플레이리스트 채널 게이트(최상단): 화이트리스트(ㅁ노래·정지·다음·청소·추가·삭제·재생)만 통과.
     # 그 외(잡담·사진 캡션·다른 ㅁ명령·순수 링크·빈 메시지)는 반응·안내 없이 조용히 무시한다.
     if event.channel_role in _MUSIC_ONLY_ROLES and not _is_playlist_command(text):
         return
@@ -5866,6 +5928,24 @@ def _handle_text(
     if is_music_add(stripped):
         log.info("chat=%s cmd=music add", channel_id)
         _handle_music_add(adapter, channel_id, stripped)
+        return
+
+    # 'ㅁ삭제 <제목>' — 재생목록에서 제거(파괴적). 인가 우회 대상이 아니라 여기 도달하는 비인가
+    # user 는 없다(_playlist_bypass 가 뺀다) — 이 분기는 허용목록 user 전용.
+    if is_music_del(stripped):
+        log.info("chat=%s cmd=music del", channel_id)
+        _handle_music_del(adapter, channel_id, stripped)
+        return
+
+    # 'ㅁ재생 <제목>' — 그 곡을 지금 재생(큐에 없으면 어댑터가 유튜브 검색으로 폴백).
+    # 재생 자체는 디스코드 음성 소관 → play_music(query=…) capability 로 위임(코어는 파싱·회신만).
+    if is_music_play_one(stripped):
+        log.info("chat=%s cmd=music play-one", channel_id)
+        arg = _cmd_arg(stripped)
+        if not arg:
+            adapter.send(channel_id, "재생 실패: 노래 제목을 주세요.")
+        else:
+            adapter.send(channel_id, adapter.play_music(channel_id, event.user_id, query=arg))
         return
 
     # push('ㅁ푸시해줘'). 별칭 해석 이전에 둔다 — 공백접기 매칭('ㅁ 푸시 해줘')이 아래 help

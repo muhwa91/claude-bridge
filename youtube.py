@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""youtube.py — 유튜브 재생목록에 영상 추가(OAuth refresh→access→list/insert). stdlib urllib 전용.
+"""youtube.py — 유튜브 재생목록 영상 추가·제거(OAuth refresh→access→list/insert/delete).
 
-코어(bridge.py)가 'ㅁ추가' 처리에서 호출한다. 검색(yt-dlp)은 어댑터 소관이고, 이 모듈은 순수
-HTTP(YouTube Data API v3) — 코어 stdlib 원칙을 지킨다. 크리덴셜은 프로젝트 루트의
-`.oauth_client.json`/`.oauth_token.json`(gitignore·커밋 금지)에서 **읽기만** 하며 값(토큰·시크릿)은
-어디에도 로깅·노출하지 않는다. insert 전에 playlistItems.list 로 중복을 확인해 스킵한다.
+stdlib urllib 전용. 코어(bridge.py)가 'ㅁ추가'·'ㅁ삭제' 처리에서 호출한다. 검색(yt-dlp)은 어댑터
+소관이고, 이 모듈은 순수 HTTP(YouTube Data API v3) — 코어 stdlib 원칙을 지킨다. 크리덴셜은
+프로젝트 루트의 `.oauth_client.json`/`.oauth_token.json`(gitignore·커밋 금지)에서 **읽기만** 하며
+값(토큰·시크릿)은 어디에도 로깅·노출하지 않는다. insert 전에 playlistItems.list 로 중복을 확인해
+스킵하고, delete 는 2건 이상 매칭이면 지우지 않는다(remove_video — 오삭제 방지).
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from adapter import _NOREDIRECT_OPENER
+from adapter import _NOREDIRECT_OPENER, fold_title
 
 _ROOT = Path(__file__).resolve().parent
 CLIENT_FILE = _ROOT / ".oauth_client.json"  # {"installed":{"client_id","client_secret",...}}
@@ -80,9 +81,14 @@ def _get_access() -> str:
     return _access_token
 
 
-def _list_video_ids(access: str) -> dict[str, str]:
-    """대상 재생목록의 {videoId: 제목}. 50개씩 pageToken 순회."""
-    out: dict[str, str] = {}
+def _list_items(access: str) -> list[tuple[str, str, str]]:
+    """대상 재생목록의 (playlistItem id, videoId, 제목) 목록. 50개씩 pageToken 순회.
+
+    ⚠️ **playlistItems.delete 는 videoId 가 아니라 playlistItem id 를 받는다** — 삭제까지 쓰려면
+    두 id 를 함께 들고 있어야 해서 {videoId: 제목} 대신 3튜플로 돌려준다(추가의 중복확인은
+    add_video 가 여기서 {videoId: 제목} 을 만들어 쓴다 — 순회는 하나로 공유).
+    """
+    out: list[tuple[str, str, str]] = []
     page = ""
     while True:
         params = {"part": "snippet", "playlistId": PLAYLIST_ID, "maxResults": "50"}
@@ -96,8 +102,9 @@ def _list_video_ids(access: str) -> dict[str, str]:
         for item in payload.get("items", []):
             snip = item.get("snippet", {})
             vid = snip.get("resourceId", {}).get("videoId")
-            if vid:
-                out[vid] = snip.get("title", vid)
+            item_id = item.get("id")
+            if vid and item_id:
+                out.append((str(item_id), str(vid), str(snip.get("title", vid))))
         page = payload.get("nextPageToken", "")
         if not page:
             return out
@@ -127,6 +134,22 @@ def _insert(access: str, video_id: str) -> str:
     return str(snip.get("title", video_id))
 
 
+def _delete(access: str, item_id: str) -> None:
+    """playlistItems.delete(파괴적) — 성공은 **204 무본문**이라 _http_json 을 쓰면 안 된다.
+
+    JSON 파싱이 빈 본문에서 터져 성공을 실패로 오판한다. 그래서 여기만 opener 를 직접 열어
+    상태코드만 본다(리다이렉트 미추종은 _http_json 과 동일 — Bearer 재전송 차단).
+    """
+    req = urllib.request.Request(
+        f"{_API}?{urllib.parse.urlencode({'id': item_id})}",
+        headers={"User-Agent": _UA, "Authorization": f"Bearer {access}"},
+        method="DELETE",
+    )
+    with _NOREDIRECT_OPENER.open(req, timeout=_TIMEOUT) as resp:  # 비2xx 는 HTTPError 로 올라온다
+        if resp.status not in (200, 204):
+            raise ValueError(f"삭제 거부(HTTP {resp.status})")
+
+
 def _reason(e: Exception) -> str:
     """실패 사유(비밀값 노출 없이) — HTTPError 는 status, 그 외는 예외 타입만.
 
@@ -154,7 +177,7 @@ def add_video(video_id: str) -> tuple[str, str]:
     """
     try:
         access = _get_access()
-        existing = _list_video_ids(access)
+        existing = {vid: title for _item, vid, title in _list_items(access)}
     # URLError/HTTPError ⊂ OSError, json ⊂ ValueError, 응답 잘림(IncompleteRead 등) = HTTPException
     # (OSError 아님 — fetch_rest_probe 선례처럼 명시 포집해야 회신 유실 없이 사유로 변환).
     except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
@@ -165,3 +188,44 @@ def add_video(video_id: str) -> tuple[str, str]:
         return ("added", _insert(access, video_id))
     except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
         return ("fail", _reason(e))
+
+
+def remove_video(query: str) -> tuple[str, str, str]:
+    """제목으로 재생목록에서 영상 1건 제거. 반환 (status, detail, videoId):
+
+    - ("removed", 제목, videoId): 1건만 매칭 → 삭제 완료
+    - ("none", query, ""): 매칭 0건
+    - ("many", "제목1 / 제목2 …", ""): **2건 이상이면 지우지 않고** 후보를 돌려준다(파괴적 경로라
+      오삭제 방지 — 사용자가 더 정확히 적어 다시 부른다). 후보는 최대 5개·제목 40자로 자른다.
+    - ("fail", 사유, ""): 인증·네트워크·API 오류(비밀값 미포함 — 이 회신은 비인가 서버 멤버도 본다)
+
+    매칭 = 공백접기+casefold(fold_title) **정확일치 우선, 없을 때만 부분 포함**.
+    이것이 고치는 것은 «제목 A가 제목 B의 부분문자열이면(곡 ⊂ 곡 (Remix)) A를 정확히 쳐도 늘
+    many 라 영영 못 지운다» 쪽이다.
+    ⚠️ **오삭제를 없애지는 못한다** — 정확일치가 0건이면 그대로 부분일치로 떨어지므로,
+    'ㅁ삭제 좋은날' 인데 목록에 "좋은날 리믹스" 하나뿐이면 그 곡이 확인 없이 지워진다.
+    **감수한 트레이드오프**다: 부분일치 단독도 many 로 막으면 긴 제목을 통째로 정확히 쳐야만
+    삭제돼 명령이 사실상 못 쓰게 된다. 회신이 지운 제목을 그대로 알려주고 'ㅁ추가' 로 되돌릴 수
+    있다는 것이 이 선택의 근거다. 예외 포집은 add_video 와 동일 집합.
+    """
+    key = fold_title(query)
+    if (
+        not key
+    ):  # 빈 키는 모든 제목에 포함돼 곡이 1개뿐인 목록의 그 곡을 지운다(파괴적 함수 자체 가드)
+        return ("none", query, "")
+    try:
+        items = _list_items(_get_access())
+    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+        return ("fail", _reason(e), "")
+    exact = [it for it in items if fold_title(it[2]) == key]
+    hits = exact or [it for it in items if key in fold_title(it[2])]
+    if not hits:
+        return ("none", query, "")
+    if len(hits) > 1:
+        return ("many", " / ".join(title[:40] for _item, _vid, title in hits[:5]), "")
+    item_id, video_id, title = hits[0]
+    try:
+        _delete(_get_access(), item_id)
+    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+        return ("fail", _reason(e), "")
+    return ("removed", title, video_id)

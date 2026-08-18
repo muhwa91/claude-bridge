@@ -301,6 +301,15 @@ _T_NOISE_PAREN = re.compile(
 # 🔴 붙여 쓴 슬래시는 넣지 마라 — 곡명 `O/W` 가 `O` 로 잘린다(2026-08-18 실측 사고).
 _T_SEG_SPLIT = re.compile(r"[ㅣ|\uff5c]|\s+/\s+")
 _T_DECOR = re.compile(r"[♬♪🔗❣️⭐️]+")  # 업로더 장식 문자 — 정보가 없다
+# 「가수 - 곡명」 구분자 — 하이픈·en대시(U+2013)·em대시(U+2014) 를 **같게** 본다. 업로더가 섞어
+# 써서 하이픈만 보면 `백지영 (U+2013) 다시는 사랑하지 않고` 가 「가수 없음」으로 떨어졌다(실측).
+# 🔴 대시를 보는 규칙은 **이 문자클래스 하나를 공유한다** — 따로 적으면 하나가 빠진다(실측: 종전
+# `_TOPIC_SUFFIX` 는 리터럴 `" - Topic"` 이라 `ZUTOMAYO (U+2013) Topic` 을 Topic 채널로 못 봤다).
+# (이스케이프로 쓴다 — 세 글자는 소스에서 눈으로 구분되지 않는다)
+_DASH = r"[-\u2013\u2014]"
+_T_DASHED = re.compile(rf"\s{_DASH}\s")  # 판정: 「A - B」 꼴인가
+_T_PART_SPLIT = re.compile(rf"\s+{_DASH}\s+|\s+_\s+")  # 분할: 아티스트/곡명
+_T_STRIP = " -_|·\u2013\u2014"  # 조각 양끝에서 떼는 구분자 잔재
 # 조각 끝에 남은 `가사`·`Lyrics` 류 꼬리표(가사영상이 목록의 절반이라 흔하다).
 # 🔴 `+` 로 **반복** 매칭한다 — 1회만 지우면 `… 가사 해석` 에서 `가사` 가 남는다(실측).
 _T_TAIL_TAG = re.compile(r"(?:[ ,/]*(?:가사|해석|발음|lyrics?|inst))+\s*$", re.IGNORECASE)
@@ -332,6 +341,9 @@ def clean_track_title(title: str) -> str:
     예: `오반 (OVAN) - 행복 Happiness [Music Video]` → `오반 - 행복`.
     폴백(원본 반환)이 있어야 알림이 빈 줄로 나가지 않는다.
     """
+    title = title[:300]  # 길이 상한 — 아래 정규식이 겹쳐 최악 O(n²) 다(4000자 = 370ms 실측).
+    # 코어는 단일 스레드라 그동안 다른 이벤트가 멈춘다. 표시 한도가 100자(escape_reply)라 손실 0.
+    # 「유튜브 제목은 100자」라는 정책에만 기대던 방어선을 코드로 들인다.
     t = _T_DECOR.sub(" ", title)
     t = _T_BRACKET.sub(" ", t)
     for _ in range(3):  # (A)(B)(C) 처럼 여러 번 붙는다 — 중첩이 아니라 반복이라 3회로 충분(실측)
@@ -345,12 +357,16 @@ def clean_track_title(title: str) -> str:
     # `노래모음 / 케이시 (Kassy) - 사진첩`). 슬래시도 같은 분기로 처리한다 — 종전의 «꼬리부터
     # 잘라내기»는 `A / B` 에서 **앞 조각**을 남겨 곡명 쪽을 버렸다.
     segs = [x.strip() for x in _T_SEG_SPLIT.split(t) if x.strip()]
-    dashed = [x for x in segs if " - " in x]
+    # 🔴 **ASCII 하이픈 조각을 먼저** 고르고, 하나도 없을 때만 en/em대시로 넓힌다 — **분할 확장과
+    # 조각 선택 확장은 다르다.** `max(len)` 은 «대시 든 조각은 하나뿐» 을 전제하는데, 세 대시를
+    # 같게 보면 홍보 조각이 후보에 들어와 **더 길어서 이긴다**(실측 회귀:
+    # `아이유 - 좋은날 ㅣ … 플레이리스트 (U+2013) 노래 모음 best` 의 곡명이 홍보 문구로 바뀌었다).
+    dashed = [x for x in segs if " - " in x] or [x for x in segs if _T_DASHED.search(x)]
     t = max(dashed, key=len) if dashed else (segs[0] if segs else t)
     # 아티스트/곡명 분해. `_` 구분자도 받는다(업로더가 `아티스트 _ 곡명` 으로 쓰는 경우가 있다).
-    parts = [p.strip() for p in re.split(r"\s+-\s+|\s+_\s+", t) if p.strip()]
+    parts = [p.strip() for p in _T_PART_SPLIT.split(t) if p.strip()]
     parts = [_drop_ascii_tail(p) if i else p for i, p in enumerate(parts)]  # i==0(아티스트)은 보존
-    parts = [re.sub(r"\s{2,}", " ", p).strip(" -_|·") for p in parts if p.strip(" -_|·")]
+    parts = [re.sub(r"\s{2,}", " ", p).strip(_T_STRIP) for p in parts if p.strip(_T_STRIP)]
     parts = [_T_TAIL_TAG.sub("", p).strip() for p in parts]
     parts = [p for p in parts if p]  # 위 제거로 빈 조각이 생길 수 있다
     # 3조각 이상이면 앞 2개(아티스트·곡명)만 — 뒤는 부제·설명이다.
@@ -358,10 +374,51 @@ def clean_track_title(title: str) -> str:
     return re.sub(r"\s{2,}", " ", out).strip() or title
 
 
-# 회신에 실을 때 지워야 하는 제어문자: 개행(가짜 UI 를 만든다)·U+200B~200F(제로폭·RTL/LTR 마크)·
-# U+202A~202E(양방향 override — 글자 순서를 뒤집어 다른 문장으로 보이게 한다).
+# 유튜브 자동생성 아티스트 채널(`더 크로스 - Topic`) 판정. 대시 3종을 위와 **같은 클래스**로 본다.
+_TOPIC_CHANNEL = re.compile(rf"\s{_DASH}\sTopic$")
+_ARTIST_LIMIT = 30  # 회신에 싣는 가수 상한 — 긴 채널명이 한 줄을 먹어 곡명이 밀리면 본말전도다
+
+
+def display_title(title: str, channel: str = "") -> str:
+    """회신·알림에 싣는 표시 제목(순수) — `clean_track_title` + **Topic 채널일 때만** 가수 채우기.
+
+    ⚠️ **표시 전용 휴리스틱이다.** `<가수> - Topic` 은 유튜브가 자동생성하는 아티스트 채널의 관례적
+    형태지만, **유튜브가 이 접미사를 예약한다는 근거는 확인하지 못했다** — 누구나 채널명을 그렇게
+    지을 수 있고 그것을 막는 코드도 없다. 실측 101곡이 증명한 것은 «Topic 이 아닌 채널에 붙이면
+    틀린다» 이지 그 역이 아니다. 틀려도 손해는 **표시 제목 한 줄**이다(매칭·삭제는 원본 제목으로
+    한다 — 위 정리 블록 주석).
+    정리 결과에 「가수 - 곡명」 구분자가 없을 때만 그 가수를 앞에 붙인다(`사랑하니까` →
+    `더 크로스 - 사랑하니까`).
+    🔴 **Topic 이 아닌 채널로 넓히지 마라 — 틀린 가수를 붙인다.** 실측(재생목록 101곡): 가수가
+    안 붙는 21곡 중 Topic 은 2곡뿐이고 나머지 19곡은 가사채널·팬업로드라 채널명이 가수가 아니다
+    (`Magical Syndrome`/채널 `글집`, `DAY6 Sweet Chaos`/채널 `Lemoring`).
+    채널을 모르는 경로(`ㅁ추가 <URL>`·채널 없는 엔트리)는 정리된 제목 그대로 — 폴백이 기본값이다.
+    제목이 비거나 **공백뿐이면 '' 를 준다** — 호출부의 `or videoId` 폴백이 살아나야 한다.
+    """
+    t = clean_track_title(title).strip()
+    topic = _TOPIC_CHANNEL.search(channel)
+    if not t or topic is None or _T_DASHED.search(t):
+        return t
+    # 🔴 채널명에 clean_track_title 을 태우지 마라 — **제목용** 규칙이라 홍보 문구 분할이 걸려
+    # `츄ㅣ츄 - Topic` 이 `츄` 로 잘린다. 접미사를 떼고 공백만 정리한다.
+    artist = re.sub(r"\s{2,}", " ", channel[: topic.start()]).strip()
+    # 안 붙이는 경우: ① 가수가 없다 ② 채널명 안에 또 구분자가 있다(`A - B - Topic` — 「가수 -
+    # 곡명」 2조각 불변식이 깨진다) ③ 곡명이 이미 그 가수로 시작한다(`아이유 - 아이유 좋은날`).
+    if not artist or _T_DASHED.search(artist) or t.casefold().startswith(artist.casefold()):
+        return t
+    return f"{artist[:_ARTIST_LIMIT].strip()} - {t}"
+
+
+# 회신에 실을 때 지워야 하는 제어·서식 문자: 개행(가짜 UI 를 만든다)·제로폭·양방향 제어 전부.
+# 🔴 **범위를 좁히지 마라.** 종전엔 `\r\n`·U+200B~200F·U+202A~202E 뿐이라 아래 docstring 이 선언한
+# 「양방향 override 차단」이 절반만 됐다 — Trojan Source 가 실제로 쓰는 isolate 4종(U+2066~2069)·
+# 아랍문자 마크(U+061C)·줄/문단 구분자(U+2028·2029)·soft hyphen(U+00AD)·BOM(U+FEFF)·태그 문자
+# (U+E0000~E007F)가 그대로 통과했다(2026-08-18 실측).
 # (이스케이프로 쓴다 — 소스에 실문자로 넣으면 **눈에 보이지 않아** 나중에 지워진다)
-_UNSAFE_CTRL = re.compile(r"[\r\n\u200b-\u200f\u202a-\u202e]")
+_UNSAFE_CTRL = re.compile(
+    r"[\r\n\u00ad\u061c\u200b-\u200f\u2028\u2029\u202a-\u202e"
+    r"\u2060-\u2064\u2066-\u206f\ufeff\U000e0000-\U000e007f]"
+)
 
 
 def escape_reply(text: str, limit: int = 100) -> str:
@@ -369,7 +426,8 @@ def escape_reply(text: str, limit: int = 100) -> str:
 
     감싸는 대상은 두 가지이고 **위협은 같다**:
       · 사용자 입력(`ㅁ추가 <검색어>`) — 이 채널은 비인가 서버 멤버도 쓴다(_playlist_bypass)
-      · 🔴 **제3자가 올린 유튜브 제목** — 후보 목록·`ㅁ목록`·추가/삭제 결과·곡 전환 알림으로
+      · 🔴 **제3자가 올린 유튜브 제목**(과 그 **채널명** — 가수 채우기로 회신에 실리는 새 입력원)
+        — `ㅁ목록`·추가/삭제 결과·곡 전환 알림으로
         나간다. 멤버 누구나 `ㅁ추가` 로 「제목이 마크다운 링크인 영상」을 넣으면 **봇 명의로**
         피싱 링크가 게시되고, 곡이 돌 때마다 다시 뜬다. `ㅁ삭제` 는 인가가 필요해 공격자는
         지우지도 못한다(멘션은 클라이언트에서 전면 차단했지만 링크·서식은 아니다).
@@ -4918,7 +4976,7 @@ HELP_TEXT = (
     "ㅁ재생 <제목> 은 그 곡을 지금 틀고(목록에 없으면 유튜브에서 찾아 한 번 재생), "
     "ㅁ삭제 <제목> 은 재생목록에서 그 곡을 뺍니다.\n"
     "ㅁ목록 은 재생목록 전곡을 번호·제목으로 보여줍니다.\n"
-    "ㅁ추가 <검색어> #N 은 검색 결과 N번째를 넣습니다(회신에 붙는 후보 번호). "
+    "ㅁ추가 <검색어> #N 은 검색 결과 N번째를 넣습니다(번호는 검색 순번). "
     "번호를 안 주면 방송무대·교차편집·직캠을 걸러 고릅니다.\n"
     "\n"
     "### 오라클 상태 — 오라클\n"
@@ -5987,51 +6045,32 @@ def _guest_bypass(event: Event) -> bool:
     return bool(text) and not text.startswith("ㅁ")
 
 
-def _format_add_result(result: tuple[str, str]) -> str:
-    """youtube.add_video 결과(status, detail) → 회신 한 줄.
+def _format_add_result(result: tuple[str, str], channel: str = "") -> str:
+    """youtube.add_video 결과(status, detail) → 회신 **한 줄**(2026-08-18 운영자 요청 형식).
 
-    added/dup 의 detail 은 **유튜브가 준 제목**(제3자 입력)이라 escape_reply 로 감싼다.
+    added/dup 의 detail 은 **유튜브가 준 제목**(제3자 입력)이라 display_title 로 다듬은 뒤
+    escape_reply 로 감싼다. channel 은 가수 채우기용(Topic 채널일 때만 쓰인다 — display_title).
     fail 의 detail 은 youtube._reason 이 만든 내부 문구라 감싸지 않는다(비밀값·외부 입력 없음).
     """
     status, detail = result
     if status == "added":
-        return f"✅ 추가됨: {escape_reply(detail)}"
+        return f"✅ 추가({escape_reply(display_title(detail, channel))})"
     if status == "dup":
-        return f"이미 있어요: {escape_reply(detail)}"
-    return f"추가 실패: {detail}"
+        return f"이미 있음({escape_reply(display_title(detail, channel))})"
+    return f"추가 실패({detail})"
 
 
-def _add_one_line(adapter: Adapter, video_id: str) -> str:
+def _add_one_line(adapter: Adapter, video_id: str, channel: str = "") -> str:
     """영상 1건 추가 + (신규추가 & 재생 중이면) 재생 큐 실시간 편입. 회신 한 줄.
 
     중복(dup)은 이미 재생목록에 있어 큐에도 있으므로 편입 안 함. 재생 중 아니면 enqueue_video 가
-    no-op(False) → 문구 변화 없음(다음 ㅁ노래에 자연 포함).
+    no-op(0) → 어차피 다음 ㅁ노래에 자연 포함된다.
+    🔴 편입 결과는 **회신에 싣지 않는다**(2026-08-18 운영자 지시 — 회신은 한 줄). 동작은 그대로다.
     """
     result = youtube.add_video(video_id)
-    line = _format_add_result(result)
     if result[0] == "added":
-        queued = adapter.enqueue_video(video_id, result[1])  # 편입 후 큐 곡수(재생 중 아니면 0)
-        if queued > 0:
-            # 뜻: "지금 재생 중인 큐에 넣었고 큐가 N곡". 옛 문구 `▶️ Play - N곡` 은 'ㅁ노래' 회신과
-            # 글자 모양이 같아 「재생이 시작됐다」로 읽혔다(2026-08-18 운영자가 실제로 혼동).
-            line += f"\n🔀 재생 큐에 편입 ({queued}곡)"
-    return line
-
-
-def _add_candidates_block(query: str, candidates: list[tuple[str, str, str]], picked: int) -> str:
-    """추가 회신에 붙일 '다른 후보' 블록. 고른 것은 빼고 번호는 검색 순번(1-based) 그대로.
-
-    번호를 다시 매기지 않는다 — 그 번호가 그대로 '#N' 재지정 인자다. 후보가 1건뿐이면 ''.
-    🔴 후보 제목은 **제3자가 올린 문자열**이라 escape_reply 를 반드시 통과시킨다.
-    """
-    others = [
-        f" {i}. {escape_reply(title)}"
-        for i, (_v, title, _c) in enumerate(candidates, 1)
-        if i - 1 != picked
-    ]
-    if not others:
-        return ""
-    return "\n".join([f"다른 후보 — ㅁ추가 {escape_reply(query)} #N", *others])
+        adapter.enqueue_video(video_id, result[1])
+    return _format_add_result(result, channel)
 
 
 def _handle_music_list(adapter: Adapter, channel_id: int) -> None:
@@ -6061,11 +6100,13 @@ def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
     링크+캡션 = 링크만 처리(캡션 무시). 다중 링크 = 각각 처리(중복은 add_video 가 개별 스킵).
     재생목록 전용 링크(videoId 없음)는 개별 실패. 네트워크는 위임 — list/insert 는 youtube 모듈
     (stdlib urllib), 검색은 adapter.search_candidates(yt-dlp) **1회**. 여기선 파싱·선택(pick_index)·
-    회신만 한다. 검색어 경로는 '#N' 으로 순번을 직접 고를 수 있고, 회신에 나머지 후보를 붙인다.
+    회신만 한다. 검색어 경로는 '#N' 으로 순번을 직접 고를 수 있다.
+    🔴 **성공 회신은 한 줄**(`✅ 추가(<제목>)`)이다 — 후보 목록·큐 편입 문구는 2026-08-18 운영자
+    지시로 뺐다. `#N` 은 후보가 안 보여도 그대로 쓸 수 있게 **유지**한다(되살리지 말 것).
     """
     arg = _cmd_arg(text)
     if not arg:
-        adapter.send(channel_id, "추가 실패: 유튜브 링크나 검색어를 주세요")
+        adapter.send(channel_id, "추가 실패(유튜브 링크나 검색어를 주세요)")
         return
     url_tokens = [t for t in arg.split() if is_youtube_url(t)]
     if url_tokens:  # 링크 우선(캡션 무시) — 각 링크를 개별 처리
@@ -6073,9 +6114,9 @@ def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
         for t in url_tokens:
             vid = extract_video_id(t)
             if vid is None:  # 재생목록 전용 링크 등 videoId 없음
-                lines.append("추가 실패: 개별 영상 링크를 주세요")
+                lines.append("추가 실패(개별 영상 링크를 주세요)")
             else:
-                lines.append(_add_one_line(adapter, vid))
+                lines.append(_add_one_line(adapter, vid))  # 링크는 채널을 모른다 → 가수 채우기 없음
         adapter.send(channel_id, "\n".join(lines))
         return
     query, index = parse_add_index(arg)
@@ -6084,13 +6125,15 @@ def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
     if picked is None:
         if candidates:  # 후보는 있는데 '#N' 이 범위 밖 — 조용히 다른 곡으로 바꿔치지 않는다
             n = len(candidates)
-            adapter.send(channel_id, f"추가 실패: #{index} 번 후보가 없습니다(1~{n})")
+            # 괄호 안에 괄호를 겹치지 않는다 — `실패(#5 번 … 없습니다(1~1))` 는 읽기 어려웠다.
+            adapter.send(
+                channel_id, f"추가 실패(#{index} 번 후보가 없습니다 — 1~{n} 중에서 고르세요)"
+            )
         else:
-            adapter.send(channel_id, f"추가 실패: {escape_reply(query)} 검색 결과가 없습니다")
+            adapter.send(channel_id, f"추가 실패({escape_reply(query)} 검색 결과가 없습니다)")
         return
-    line = _add_one_line(adapter, candidates[picked][0])
-    others = _add_candidates_block(query, candidates, picked)
-    adapter.send(channel_id, f"{line}\n{others}" if others else line)
+    vid, _title, ch = candidates[picked]
+    adapter.send(channel_id, _add_one_line(adapter, vid, ch))
 
 
 def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
@@ -6110,7 +6153,13 @@ def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
         if dropped > 0:
             line += f"\n(재생 큐에서 {dropped}곡 제거)"
     elif status == "none":
-        line = f"삭제 실패: {escape_reply(arg)} 를 재생목록에서 못 찾았습니다"
+        # 🔴 힌트를 붙인다 — 화면에 뜬 제목을 그대로 쳐도 안 걸릴 수 있다. display_title 이 **원본에
+        # 없는 가수**를 앞에 붙여 보여주기 때문이다(`사랑하니까` → `더 크로스 - 사랑하니까`).
+        # 매칭을 느슨하게 푸는 쪽으로 해결하지 마라 — 파괴적 명령이라 오삭제가 더 비싸다.
+        line = (
+            f"삭제 실패: {escape_reply(arg)} 를 재생목록에서 못 찾았습니다"
+            " (가수 부분을 빼고 곡명만 쳐보세요)"
+        )
     elif status == "many":
         line = f"여러 곡이 걸립니다 — 더 정확히 적어주세요:\n{escape_reply(detail, 250)}"
     else:
@@ -7011,8 +7060,18 @@ def _selftest() -> None:
     assert not is_stage_clip("Oasis - Live Forever")  # 'live' 단독은 곡명이다
     assert not is_stage_clip('선미 "24시간이 모자라" M/V')  # 'N시간'은 루프 문맥이 있을 때만
     assert is_stage_clip("좋은날 1시간 연속 재생")  # 루프 영상은 그대로 거른다
-    assert _format_add_result(("added", "곡")) == "✅ 추가됨: `곡`"
-    assert _format_add_result(("dup", "곡")) == "이미 있어요: `곡`"
+    assert _format_add_result(("added", "곡")) == "✅ 추가(`곡`)"
+    assert _format_add_result(("dup", "곡")) == "이미 있음(`곡`)"
+    assert _format_add_result(("fail", "사유")) == "추가 실패(사유)"
+    # 가수 채우기 — Topic 채널일 때만(다른 채널은 채널명이 가수가 아니다).
+    assert _format_add_result(("added", "사랑하니까"), "더 크로스 - Topic") == (
+        "✅ 추가(`더 크로스 - 사랑하니까`)"
+    )
+    assert _format_add_result(("added", "사랑하니까"), "글집") == "✅ 추가(`사랑하니까`)"
+    # 채널명도 제3자 문자열이다 — bidi isolate(U+2066~2069 = Trojan Source 가 쓰는 집합)를 지운다.
+    assert _format_add_result(("added", "곡"), "\u2066\u2067관리자 공지\u2069 - Topic") == (
+        "✅ 추가(`관리자 공지 - 곡`)"
+    )
     # ★ 외부 문자열 이스케이프 — 제3자 유튜브 제목이 봇 명의 링크가 되는 것을 막는다.
     assert escape_reply("[지금 확인](https://phish.example)") == (
         "`[지금 확인](https://phish.example)`"

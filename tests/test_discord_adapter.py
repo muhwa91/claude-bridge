@@ -937,6 +937,36 @@ def test_play_current_announce_is_two_lines_and_cleaned(monkeypatch):
     assert a._music_entries[0]["title"] == "오반 (OVAN) - 행복 Happiness [Music Video]"
 
 
+def test_play_current_fills_artist_only_for_topic_channel(monkeypatch):
+    """🔴 곡 알림의 가수 채우기는 **Topic 채널일 때만** — 넓히면 틀린 가수가 곡마다 나간다.
+
+    실측(재생목록 101곡, 현행 코드 기준): 가수가 안 붙는 21곡 중 Topic 은 2곡뿐이고 나머지
+    19곡은 가사채널·팬업로드다.
+    """
+    a, _p, sent = _playing(
+        monkeypatch, [{"id": "v1", "title": "사랑하니까", "channel": "더 크로스 - Topic"}]
+    )
+    asyncio.run(a._play_current())
+    assert sent == [(500, "💿 현재 재생 곡\n`더 크로스 - 사랑하니까`")]
+    # 비-Topic 채널(가사채널)은 채널명이 가수가 아니다 → 정리된 제목만.
+    a2, _p2, sent2 = _playing(
+        monkeypatch, [{"id": "v2", "title": "Magical Syndrome", "channel": "글집"}]
+    )
+    asyncio.run(a2._play_current())
+    assert sent2 == [(500, "💿 현재 재생 곡\n`Magical Syndrome`")]
+    # channel 키가 없는 엔트리(큐 편입분)는 폴백 — 정리된 제목만.
+    a3, _p3, sent3 = _playing(monkeypatch, [{"id": "v3", "title": "사랑하니까"}])
+    asyncio.run(a3._play_current())
+    assert sent3 == [(500, "💿 현재 재생 곡\n`사랑하니까`")]
+    # 🔴 공백뿐인 제목 → display_title 이 '' 를 줘야 `or entry["id"]` 폴백이 산다(종전엔 공백을
+    # 그대로 돌려줘 truthy 로 통과, `X -    ` 가 알림으로 나갔다).
+    a4, _p4, sent4 = _playing(
+        monkeypatch, [{"id": "v4", "title": "   ", "channel": "가수 - Topic"}]
+    )
+    asyncio.run(a4._play_current())
+    assert sent4 == [(500, "💿 현재 재생 곡\n`v4`")]
+
+
 def test_play_current_announce_header_only_when_no_title_and_no_id(monkeypatch):
     # 제목도 id 도 없으면 빈 둘째 줄을 붙이지 않고 머리글만 보낸다.
     a, _played, sent = _playing(monkeypatch, [{"title": ""}])

@@ -63,7 +63,7 @@ from bridge import (
     HEADER_NOTE,
     PROJECT_LABELS,
     STATUS_LEADERS,
-    clean_track_title,
+    display_title,
     escape_reply,
     pick_index,
 )
@@ -842,9 +842,16 @@ class DiscordAdapter:
             self._voice.play(src, after=self._after)
             # 2줄 알림: 머리글 + 정리한 제목. 제목이 비면 videoId, 그것도 없으면 머리글만
             # (빈 줄을 붙이지 않는다). 정리는 표시 전용 — entry 의 원본 title 은 그대로 둔다.
-            # 🔴 escape_reply 는 **clean_track_title 바깥**에 둔다 — 정리가 실패하면 그 함수가
+            # channel 을 함께 넘겨 「가수 없는 제목」에 가수를 채운다(Topic 채널일 때만 — 그 밖의
+            # 채널명은 가수가 아니다. display_title docstring 참조). 큐 편입 엔트리엔 channel 이
+            # 없어 폴백(정리된 제목)으로 나간다.
+            # 🔴 escape_reply 는 **display_title 바깥**에 둔다 — 정리가 실패하면 그 함수가
             # `or title` 로 **원본을 되살리므로**, 안쪽에서 감싸면 그 폴백 경로가 새어나간다.
-            title = clean_track_title(entry.get("title") or "") or entry.get("id") or ""
+            title = (
+                display_title(entry.get("title") or "", str(entry.get("channel") or ""))
+                or entry.get("id")
+                or ""
+            )
             name = escape_reply(title)
             await self._notify_music(f"{MUSIC_NOW_HEADER}\n{name}" if name else MUSIC_NOW_HEADER)
             return

@@ -1446,7 +1446,7 @@ def test_music_add_url_extracts_and_adds(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/dQw4w9WgXcQ", channel_role=_PL), target_root="root")
     assert called == ["dQw4w9WgXcQ"]
-    assert a.sent == [(777, "✅ 추가됨: `Never Gonna Give You Up`", None)]
+    assert a.sent == [(777, "✅ 추가(`Never Gonna Give You Up`)", None)]
     assert a.searches == []  # 링크는 yt-dlp 검색 안 함
 
 
@@ -1468,7 +1468,7 @@ def test_music_add_multiple_links_each(monkeypatch):
         target_root="root",
     )
     assert called == ["aaaaaaaaaaa", "bbbbbbbbbbb"]
-    assert a.sent[0][1].count("✅ 추가됨") == 2
+    assert a.sent[0][1].count("✅ 추가(") == 2  # 링크마다 한 줄(다중 링크는 현행 유지)
 
 
 def test_music_add_playlist_link_rejected(monkeypatch):
@@ -1477,32 +1477,34 @@ def test_music_add_playlist_link_rejected(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ추가 https://www.youtube.com/playlist?list=PLx"), target_root="root")
     assert called == []  # insert 시도 안 함
-    assert "개별 영상 링크" in a.sent[0][1]
+    # 🔴 완전일치 — 부분일치면 문구 형식이 되돌아가도 안 죽는다(2026-08-18 변이로 실증).
+    assert a.sent == [(777, "추가 실패(개별 영상 링크를 주세요)", None)]
 
 
 def test_music_add_search_query(monkeypatch):
-    # URL 이 아니면 yt-dlp 검색 후보 중 필터가 고른 1건을 추가(후보 1건이면 후보 블록 없음).
+    # URL 이 아니면 yt-dlp 검색 후보 중 필터가 고른 1건을 추가. 회신은 **한 줄**.
     called = _add_env(monkeypatch, ("added", "아이유 좋은날"))
     a = FakeAdapter(search=[("vidsearch01", "아이유 좋은날", "1theK")])
     _fire(a, _txt(777, "ㅁ추가 아이유 좋은날", channel_role=_PL), target_root="root")
     assert a.searches == ["아이유 좋은날"]
     assert called == ["vidsearch01"]
-    assert a.sent == [(777, "✅ 추가됨: `아이유 좋은날`", None)]
+    assert a.sent == [(777, "✅ 추가(`아이유 좋은날`)", None)]
 
 
 def test_music_add_search_no_result(monkeypatch):
     _add_env(monkeypatch)
     a = FakeAdapter(search=None)  # 무결과
     _fire(a, _txt(777, "ㅁ추가 없는곡xyz"), target_root="root")
-    assert any("검색 결과가 없" in t for _c, t, _b in a.sent)
+    assert a.sent == [(777, "추가 실패(`없는곡xyz` 검색 결과가 없습니다)", None)]  # 완전일치
 
 
-def test_music_add_skips_broadcast_stage_and_lists_candidates(monkeypatch):
-    """1위가 방송무대면 건너뛰고, 회신에 나머지 후보를 '#N' 재지정 안내와 함께 붙인다.
+def test_music_add_skips_broadcast_stage_and_replies_one_line(monkeypatch):
+    """1위가 방송무대면 건너뛴다. 🔴 회신은 **한 줄** — 후보 목록을 붙이지 않는다.
 
     실측 근거: 2026-08-18 재생목록에서 관측한 11곡이 ytsearch1 1위를 그대로 받은
     방송무대·팬편집이었다
     (그 11곡은 같은 날 원곡 버전으로 교체돼 **지금 재생목록엔 없다** — bridge.py 상수 주석 참조).
+    후보 목록은 2026-08-18 운영자 지시로 뺐다(줄 수가 많다) — 되살리지 말 것. '#N' 은 유지된다.
     """
     called = _add_env(monkeypatch, ("added", "[가사] 좋은날"))
     a = FakeAdapter(
@@ -1515,11 +1517,9 @@ def test_music_add_skips_broadcast_stage_and_lists_candidates(monkeypatch):
     _fire(a, _txt(777, "ㅁ추가 좋은날", channel_role=_PL), target_root="root")
     assert called == ["v2"]  # 1위(교차편집)는 건너뛴다
     text = a.sent[0][1]
-    assert text.startswith("✅ 추가됨: `[가사] 좋은날`")
-    assert "다른 후보 — ㅁ추가 `좋은날` #N" in text
-    assert " 1. `좋은날 교차편집 stage mix`" in text  # 번호는 검색 순번 그대로(= '#N' 인자)
-    assert " 3. `좋은날 cover by J.Fla`" in text
-    assert " 2. " not in text  # 고른 것은 후보 줄에서 뺀다
+    assert text == "✅ 추가(`좋은날`)"  # 한 줄 · 대괄호 부가표기는 정리됐다
+    assert "\n" not in text and "다른 후보" not in text
+    assert "교차편집" not in text and "cover" not in text  # 후보 제목이 새지 않는다
 
 
 def test_music_add_index_overrides_filter(monkeypatch):
@@ -1537,7 +1537,8 @@ def test_music_add_index_out_of_range(monkeypatch):
     a = FakeAdapter(search=[("v1", "좋은날", "1theK")])
     _fire(a, _txt(777, "ㅁ추가 좋은날 #5", channel_role=_PL), target_root="root")
     assert called == []
-    assert "#5 번 후보가 없습니다(1~1)" in a.sent[0][1]
+    # 괄호 중첩(`…없습니다(1~1)`)을 풀었다 — 완전일치라 문구가 되돌아가면 여기서 죽는다.
+    assert a.sent == [(777, "추가 실패(#5 번 후보가 없습니다 — 1~1 중에서 고르세요)", None)]
 
 
 def test_music_add_all_filtered_falls_back_to_first(monkeypatch):
@@ -1707,6 +1708,34 @@ def test_clean_track_title_regressions_2026_08_18_gate():
     # ③ 꼬리표 제거가 1회만 돌아 '가사 해석' 에서 '가사' 가 남았다 — 반복 적용.
     assert bridge.clean_track_title("아이유 - 좋은날 가사 해석") == "아이유 - 좋은날"
     assert bridge.clean_track_title("아이유 - 좋은날 Lyrics 가사") == "아이유 - 좋은날"
+    # ④ 🔴 조각 선택이 en/em대시까지 넓혀지자 **홍보 조각이 더 길어서 이겼다**(2026-08-18 회귀).
+    #    ASCII 하이픈 조각을 우선한다 — 분할 확장과 조각 선택 확장은 다르다.
+    assert (
+        bridge.clean_track_title(
+            "아이유 - 좋은날 \u3163 비 오는 날 듣기 좋은 감성 플레이리스트 \u2013 노래 모음 best"
+        )
+        == "아이유 - 좋은날"
+    )
+    # ⑤ 길이 상한 300자 — 정규식이 겹쳐 O(n²) 라 4000자 제목이 370ms 를 먹었다(코어는 단일 스레드).
+    assert len(bridge.clean_track_title("x" * 4000)) == 300
+
+
+def test_clean_track_title_accepts_en_and_em_dash():
+    """en대시(U+2013)·em대시(U+2014) 도 「가수 - 곡명」 구분자다.
+
+    하이픈만 보면 실측 제목 `백지영 <U+2013> 다시는 사랑하지 않고` 가 **2조각으로 분해되지 않아**
+    「가수 없음」으로 떨어졌다(그 곡 채널은 `gyeranbbang` 이라 가수 채우기 대상은 아니었다 —
+    실제 효과는 «대시 정규화 + 2조각 분해» 다).
+    대시는 **이스케이프로 쓴다** — 소스에서 하이픈과 구분되지 않는다.
+    """
+    assert bridge.clean_track_title("백지영 \u2013 다시는 사랑하지 않고") == (
+        "백지영 - 다시는 사랑하지 않고"
+    )
+    assert bridge.clean_track_title("태연 \u2014 사계 Four Seasons") == "태연 - 사계"
+    # 「A - B」 조각 고르기도 같은 판정을 쓴다(홍보 문구 앞조각을 버린다).
+    assert bridge.clean_track_title("노래모음 / 케이시 \u2013 사진첩") == "케이시 - 사진첩"
+    # 가수가 이미 있으므로(en대시) 가수 채우기 대상이 아니다.
+    assert bridge.display_title("백지영 \u2013 다시는", "누군가 - Topic") == "백지영 - 다시는"
 
 
 def test_escape_reply_blocks_markdown_mention_and_control_chars():
@@ -1732,14 +1761,13 @@ def test_music_replies_escape_hostile_youtube_titles(monkeypatch):
     링크가 게시되고, ㅁ삭제는 인가가 필요해 공격자는 지우지도 못한다.
     """
     evil = "[지금 확인 →](https://phish.example)"
-    # ① 'ㅁ추가' 결과 + 다른 후보 블록
+    # ① 'ㅁ추가' 결과 — 제목 정리가 통째로 실패해 원본을 되살려도(clean_track_title 의 `or title`)
+    #    바깥의 escape_reply 가 코드스팬으로 감싼다. 회신은 한 줄이라 노출면은 이것 하나뿐이다.
     _add_env(monkeypatch, ("added", evil))
     a = FakeAdapter(search=[("v1", evil, "ch"), ("v2", evil + "2", "ch")])
     _fire(a, _txt(777, "ㅁ추가 곡", channel_role=_PL), target_root="root")
     text = a.sent[0][1]
-    assert text.startswith("✅ 추가됨: `" + evil + "`")
-    assert " 2. `" + evil + "2`" in text
-    assert "](https" not in text.replace("`" + evil, "").replace(evil + "2`", "")
+    assert text == "✅ 추가(`" + evil + "`)"  # 링크는 코드스팬 안에만 있다
     # ② 'ㅁ목록'
     _list_env(monkeypatch, ("", [("v1", evil)]))
     a2 = FakeAdapter()
@@ -1777,35 +1805,37 @@ def test_music_add_empty_arg(monkeypatch):
     _add_env(monkeypatch)
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ추가", channel_role=_PL), target_root="root")
-    assert any("링크나 검색어" in t for _c, t, _b in a.sent)
+    assert a.sent == [(777, "추가 실패(유튜브 링크나 검색어를 주세요)", None)]  # 완전일치
 
 
 def test_music_add_dedup_passthrough(monkeypatch):
-    # add_video 가 dup 을 주면 "이미 있어요" 회신.
+    # add_video 가 dup 을 주면 "이미 있음" 회신(성공과 같은 한 줄 모양).
     _add_env(monkeypatch, ("dup", "이미있는곡"))
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/ccccccccccc"), target_root="root")
-    assert a.sent == [(777, "이미 있어요: `이미있는곡`", None)]
+    assert a.sent == [(777, "이미 있음(`이미있는곡`)", None)]
 
 
 def test_music_add_enqueues_when_playing(monkeypatch):
-    # 재생 중(enqueue_video>0) + 신규추가 → 유튜브 저장 + 큐 편입 + "🔀 재생 큐에 편입 (N곡)".
-    # 🔴 접두를 'ㅁ노래' 회신(▶️ Play - N곡)과 달리 둔다 — 같은 모양이면 재생 시작으로 읽힌다.
+    """재생 중 + 신규추가 → 유튜브 저장 + 큐 편입. 🔴 **편입 문구는 회신에 싣지 않는다.**
+
+    2026-08-18 운영자 지시로 `🔀 재생 큐에 편입 (N곡)` 을 뺐다(회신은 한 줄) — 동작은 그대로다.
+    """
     called = _add_env(monkeypatch, ("added", "새곡"))
     a = FakeAdapter(enqueue=30)
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/eeeeeeeeeee", channel_role=_PL), target_root="root")
     assert called == ["eeeeeeeeeee"]
-    assert a.enqueued == [("eeeeeeeeeee", "새곡")]
-    assert a.sent == [(777, "✅ 추가됨: `새곡`\n🔀 재생 큐에 편입 (30곡)", None)]
+    assert a.enqueued == [("eeeeeeeeeee", "새곡")]  # 큐 편입 동작은 그대로
+    assert a.sent == [(777, "✅ 추가(`새곡`)", None)]  # 회신엔 편입 문구가 없다
 
 
-def test_music_add_no_enqueue_suffix_when_not_playing(monkeypatch):
-    # 재생 꺼짐(enqueue no-op 0) → enqueue 호출은 하되 문구는 기존 "✅ 추가됨"만.
+def test_music_add_reply_is_same_when_not_playing(monkeypatch):
+    # 재생 꺼짐(enqueue no-op 0) → enqueue 호출은 하되 회신은 재생 중일 때와 **같은 한 줄**.
     _add_env(monkeypatch, ("added", "새곡"))
     a = FakeAdapter(enqueue=0)
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/fffffffffff"), target_root="root")
     assert a.enqueued == [("fffffffffff", "새곡")]
-    assert a.sent == [(777, "✅ 추가됨: `새곡`", None)]
+    assert a.sent == [(777, "✅ 추가(`새곡`)", None)]
 
 
 def test_music_add_dup_does_not_enqueue(monkeypatch):
@@ -1814,7 +1844,77 @@ def test_music_add_dup_does_not_enqueue(monkeypatch):
     a = FakeAdapter(enqueue=30)
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/ggggggggggg"), target_root="root")
     assert a.enqueued == []  # dup → 편입 시도 안 함
-    assert a.sent == [(777, "이미 있어요: `이미있는곡`", None)]
+    assert a.sent == [(777, "이미 있음(`이미있는곡`)", None)]
+
+
+def test_music_add_fills_artist_only_for_topic_channel(monkeypatch):
+    """🔴 핵심 단언 — 가수 채우기는 **Topic 채널일 때만**. 넓히면 틀린 가수를 붙인다.
+
+    실측(재생목록 101곡, 현행 코드 기준): 가수가 안 붙는 21곡 중 Topic 은 2곡뿐이고, 나머지
+    19곡은 채널이 가수가 아니다(가사채널 `글집`·팬업로드 `Lemoring` 등).
+    """
+    # ① Topic 채널 → 채널명에서 ' - Topic' 을 떼어 가수로 앞에 붙인다.
+    _add_env(monkeypatch, ("added", "사랑하니까"))
+    a = FakeAdapter(search=[("v1", "사랑하니까", "더 크로스 - Topic")])
+    _fire(a, _txt(777, "ㅁ추가 더크로스 사랑하니까", channel_role=_PL), target_root="root")
+    assert a.sent == [(777, "✅ 추가(`더 크로스 - 사랑하니까`)", None)]
+    # ② 비-Topic 채널 → 채널명이 가수가 아니므로 **안 붙인다**.
+    a2 = FakeAdapter(search=[("v1", "Magical Syndrome", "글집")])
+    _add_env(monkeypatch, ("added", "Magical Syndrome"))
+    _fire(a2, _txt(777, "ㅁ추가 magical syndrome", channel_role=_PL), target_root="root")
+    assert a2.sent == [(777, "✅ 추가(`Magical Syndrome`)", None)]
+    # ③ 링크 경로는 채널을 모른다 → 정리된 제목만(폴백).
+    a3 = FakeAdapter()
+    _add_env(monkeypatch, ("added", "사랑하니까"))
+    _fire(a3, _txt(777, "ㅁ추가 https://youtu.be/hhhhhhhhhhh"), target_root="root")
+    assert a3.sent == [(777, "✅ 추가(`사랑하니까`)", None)]
+
+
+def test_display_title_pure():
+    """display_title 단위 — 가수 채우기 규칙(Topic 전용) + 이미 「가수 - 곡명」이면 무변경."""
+    assert bridge.display_title("사랑하니까", "더 크로스 - Topic") == "더 크로스 - 사랑하니까"
+    assert bridge.display_title("사랑하니까", "글집") == "사랑하니까"  # 비-Topic
+    assert bridge.display_title("사랑하니까") == "사랑하니까"  # 채널 모름(링크 경로)
+    # 이미 가수가 있으면 채널이 Topic 이어도 덧붙이지 않는다.
+    assert bridge.display_title("아이유 - 좋은날", "아이유 - Topic") == "아이유 - 좋은날"
+    # 채널이 ' - Topic' 뿐이면 붙일 가수가 없다(빈 가수 방지).
+    assert bridge.display_title("좋은날", " - Topic") == "좋은날"
+    # 🔴 Topic 판정도 대시 3종을 같게 본다 — 실측 `ZUTOMAYO <U+2013> Topic`.
+    assert bridge.display_title("Byoushinwo Kamu", "ZUTOMAYO \u2013 Topic") == (
+        "ZUTOMAYO - Byoushinwo Kamu"
+    )
+
+
+def test_display_title_edge_cases():
+    """경계 4종 — 여기서 죽는 것이 회신 한 줄이 통째로 망가지는 것보다 싸다."""
+    # ① 공백뿐인 제목 → '' 를 준다. 그래야 호출부의 `display_title(...) or entry["id"]` 폴백이
+    #    산다(공백을 그대로 돌려주면 truthy 라 `X -    ` 같은 회신이 나갔다).
+    assert bridge.display_title("   ", "X - Topic") == ""
+    assert bridge.display_title("", "X - Topic") == ""
+    # ② 가수 == 곡명(또는 곡명이 이미 가수로 시작) → 붙이지 않는다.
+    assert bridge.display_title("좋은날", "좋은날 - Topic") == "좋은날"
+    assert bridge.display_title("아이유 좋은날", "아이유 - Topic") == "아이유 좋은날"
+    # ③ 채널명에는 clean_track_title 을 태우지 않는다(제목용 규칙이라 홍보 문구 분할이 걸린다).
+    #    `츄ㅣ츄` 가 `츄` 로 잘리던 자리 — 접미사만 떼고 공백만 정리한다.
+    assert bridge.display_title("곡명", "츄\u3163츄 - Topic") == "츄\u3163츄 - 곡명"
+    assert bridge.display_title("이 밤", "구추 (Goochu) - Topic") == "구추 (Goochu) - 이 밤"
+    # ④ 채널명 안에 구분자가 또 있으면 「가수 - 곡명」 2조각 불변식이 깨진다 → 채우지 않는다.
+    assert bridge.display_title("곡명", "A - B - Topic") == "곡명"
+    # ⑤ 긴 채널명이 회신 한 줄(100자)을 먹지 않게 가수는 30자에서 자른다.
+    assert bridge.display_title("곡", "가" * 50 + " - Topic") == "가" * 30 + " - 곡"
+
+
+def test_music_add_escapes_hostile_channel_name(monkeypatch):
+    """★ 채널명도 제3자 문자열이다 — 가수 채우기로 회신에 실리므로 코드스팬 안에 갇혀야 한다.
+
+    종전 이스케이프 테스트는 적대적 «제목»만 봤다. 채널은 2026-08-18 에 생긴 **새 입력원**이다.
+    """
+    _add_env(monkeypatch, ("added", "곡"))
+    a = FakeAdapter(search=[("v1", "곡", "[클릭](https://phish.example) - Topic")])
+    _fire(a, _txt(777, "ㅁ추가 곡", channel_role=_PL), target_root="root")
+    assert a.sent == [(777, "✅ 추가(`[클릭](https://phish.example) - 곡`)", None)]
+    # 코드스팬 밖으로 새는 링크가 없다(백틱 사이를 지우면 '](https' 가 남지 않아야 한다).
+    assert "](https" not in a.sent[0][1].replace("`[클릭](https://phish.example) - 곡`", "")
 
 
 def test_music_add_disallowed_user_blocked(monkeypatch):
@@ -1940,7 +2040,15 @@ def test_music_del_none_match(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ삭제 없는곡"), target_root="root")
     assert a.dequeued == []  # 못 찾았으면 큐도 안 건드린다
-    assert a.sent == [(777, "삭제 실패: `없는곡` 를 재생목록에서 못 찾았습니다", None)]
+    # 🔴 힌트가 붙는다 — display_title 이 원본에 없는 가수를 앞에 붙여 보여주므로, 화면 제목을
+    # 그대로 치면 안 걸린다(`더 크로스 - 사랑하니까` 로 보이지만 원본은 `사랑하니까`).
+    assert a.sent == [
+        (
+            777,
+            "삭제 실패: `없는곡` 를 재생목록에서 못 찾았습니다 (가수 부분을 빼고 곡명만 쳐보세요)",
+            None,
+        )
+    ]
 
 
 def test_music_del_many_matches_does_not_delete(monkeypatch):

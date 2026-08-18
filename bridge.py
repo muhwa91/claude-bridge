@@ -6191,18 +6191,24 @@ def _handle_text(
     # 음악 재생 명령('ㅁ노래'·'ㅁ정지'·'ㅁ다음'). 별칭 해석 이전에 둬야 한다 — 아래 cmd 분기의
     # `cmd.startswith("ㅁ") and cmd not in COMMANDS → HELP` 폴백으로 이 명령이 새는 것 방지.
     # 재생은 디스코드 음성 소관 → adapter capability 로 위임(코어는 판정만, clear_channel 패턴).
+    # 🔴 빈 문자열 = 미발송(adapter.play/stop/skip_music 공통 계약) — 어댑터가 이미 보냈거나
+    # 보낼 것이 없다는 뜻이다. 'ㅁ노래' 회신은 곡 전환 알림보다 **먼저** 나가야 해서 어댑터가
+    # 재생 시작 전에 직접 보낸다(코어는 반환 뒤에야 send 할 수 있어 순서가 뒤집힌다).
     act = music_action(stripped)
     if act == "play":
         log.info("chat=%s cmd=music play", channel_id)
-        adapter.send(channel_id, adapter.play_music(channel_id, event.user_id))
+        if reply := adapter.play_music(channel_id, event.user_id):
+            adapter.send(channel_id, reply)
         return
     if act == "stop":
         log.info("chat=%s cmd=music stop", channel_id)
-        adapter.send(channel_id, adapter.stop_music(channel_id))
+        if reply := adapter.stop_music(channel_id):
+            adapter.send(channel_id, reply)
         return
     if act == "skip":
         log.info("chat=%s cmd=music skip", channel_id)
-        adapter.send(channel_id, adapter.skip_music(channel_id))
+        if reply := adapter.skip_music(channel_id):
+            adapter.send(channel_id, reply)
         return
 
     # 'ㅁ목록' — 재생목록 전곡 조회(읽기 전용). 여러 메시지로 나눠 보낸다.
@@ -6234,8 +6240,9 @@ def _handle_text(
         arg = _cmd_arg(stripped)
         if not arg:
             adapter.send(channel_id, "재생 실패(노래 제목 필요)")
-        else:
-            adapter.send(channel_id, adapter.play_music(channel_id, event.user_id, query=arg))
+        # 성공 회신은 ""(위 계약) — 곧 나갈 '💿 현재 재생 곡' 알림이 같은 곡을 이미 말한다.
+        elif reply := adapter.play_music(channel_id, event.user_id, query=arg):
+            adapter.send(channel_id, reply)
         return
 
     # push('ㅁ푸시해줘'). 별칭 해석 이전에 둔다 — 공백접기 매칭('ㅁ 푸시 해줘')이 아래 help

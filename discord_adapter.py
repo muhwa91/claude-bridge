@@ -509,6 +509,9 @@ class DiscordAdapter:
         """호출자(user_id)가 있는 음성채널에서 고정 재생목록을 셔플·반복 재생. 회신 문자열 반환.
         _run 이 루프 미준비·예외를 삼켜 None 을 줄 수 있으므로 str 아니면 안내 폴백.
 
+        🔴 **성공은 ""**(= 코어 미발송, adapter.py 계약) — 회신을 곡 알림보다 **먼저** 내보내야
+        해서 어댑터가 재생 시작 전에 직접 보낸다. 실패 회신만 문자열로 돌아온다.
+
         `query`('ㅁ재생 <제목>')가 있으면 그 곡을 먼저/지금 재생한다 — 재생 중이면 큐에서 찾아
         현재 곡을 끊고 그 곡으로, 미재생이면 그 곡부터 시작(_music_play_one_coro). 큐에 없으면
         유튜브 검색 폴백. timeout 은 query 유무와 무관하게 음성 경로 기준 60(연결·추출 여유).
@@ -679,6 +682,12 @@ class DiscordAdapter:
         return str(info["url"])
 
     async def _music_play_coro(self, channel_id: int, user_id: int, query: str = "") -> str:
+        """'ㅁ노래'(+미재생 상태의 'ㅁ재생') — 재생목록을 셔플·반복 재생. 성공은 ""(코어 미발송).
+
+        🔴 성공 회신은 **여기서 직접** 내보낸다(반환값이 아니라). 코어가 반환값을 보내면
+        _play_current 의 '💿 현재 재생 곡' 알림보다 **뒤에** 붙어 "곡 알림 → 회신" 순으로
+        보인다(운영자 지적). 실패 회신만 문자열로 돌려준다 — 없애면 아무 반응이 없다.
+        """
         if not self._music_playlist_url:
             return "⚠️재생목록 설정필요"
         ch = self._caller_voice_channel(user_id)
@@ -703,11 +712,14 @@ class DiscordAdapter:
         self._music_entries = flat
         self._music_index = await self._start_index(flat, query) if query else 0
         self._music_stopping = False
+        # _notify_music 이 이 값으로 보낸다 — 회신을 재생 **전에** 내보내려면 먼저 세팅돼야 한다.
         self._music_text_ch = channel_id
+        # 'ㅁ재생 <제목>'(query) 경로는 회신이 없다 — 바로 뒤 '💿 현재 재생 곡' 알림이 같은 곡을
+        # 이미 말한다(운영자 요청: 같은 말 두 번 금지). 'ㅁ노래' 만 곡수를 알린다.
+        if not query:
+            await self._notify_music(f"▶️ Play - {len(flat)}곡")
         await self._play_current()
-        # 'ㅁ재생' 경로는 접두사를 달리한다 — 곡 알림(💿 2줄)이 바로 뒤따라 붙는데 같은 접두사
-        # 두 줄이 겹치면 개발자가 요청한 형식이 흐려진다. 'ㅁ노래' 회신(▶️ Play - N곡)은 그대로.
-        return f"🎵 {len(flat)}곡 재생목록" if query else f"▶️ Play - {len(flat)}곡"
+        return ""
 
     async def _start_index(self, flat: list[dict[str, Any]], query: str) -> int:
         """'ㅁ재생 <제목>' 으로 시작할 때 첫 곡 인덱스. 목록에 없으면 검색해 맨 앞에 끼우고 0.
@@ -757,8 +769,9 @@ class DiscordAdapter:
         entry["queued"] = True
         self._music_entries.insert(self._music_index + 1, entry)
         self._voice.stop()  # → _after → _advance(index+1) = 방금 끼운 곡
-        # 제목은 재생목록·검색에서 온 **제3자 문자열**이라 escape_reply 를 통과시킨다.
-        return f"⏭️ {escape_reply(str(entry.get('title') or entry.get('id') or ''))}"
+        # 성공 회신 없음("") — 곧 _advance → _play_current 가 '💿 현재 재생 곡' 으로 같은 곡을
+        # 알린다. 종전의 '⏭️ <제목>' 은 그 알림과 같은 말을 두 번 하는 꼴이었다(운영자 지적).
+        return ""
 
     async def _await_dave_ready(self) -> None:
         """E2EE(DAVE) 음성채널이면 재생 전 세션 준비(can_encrypt)를 최대 ~15초 폴링한다.

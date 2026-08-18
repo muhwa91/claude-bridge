@@ -97,6 +97,9 @@ class FakeAdapter:
         self.runs = []  # run_claude_with_progress 스파이용(테스트가 채움)
         self.setup_names = None  # setup_channels 스파이
         self.music = []  # (action, *args) 음악 capability 호출 스파이(play/stop/skip)
+        # play/stop/skip_music 이 돌려줄 값. None = 기본 회신 문자열, ""= 어댑터가 이미 보냈다는
+        # 계약(코어는 send 하지 않아야 한다).
+        self.music_reply = None
         self._roles = roles or {}  # role -> channel_id(#알림·#봇상태 라우팅)
         self._projects = projects or {}  # 프로젝트명 -> channel_id(예약 확인 실행 라우팅)
         self._send_ids = iter(send_ids) if send_ids is not None else None
@@ -143,20 +146,24 @@ class FakeAdapter:
         self.cleared.append(channel_id)
         return self._clear_count
 
+    def _music_result(self, default):
+        """music_reply 를 지정하면 그 값(""=미발송 계약 검증용), 기본은 실패·안내 회신."""
+        return default if self.music_reply is None else self.music_reply
+
     def play_music(self, channel_id, user_id, query=""):
         # query 없는 호출은 종전 3튜플 그대로 기록(기존 단언 보존), 'ㅁ재생'만 4튜플.
         self.music.append(
             ("play", channel_id, user_id, query) if query else ("play", channel_id, user_id)
         )
-        return "▶️ 재생 시작"
+        return self._music_result("▶️ 재생 시작")
 
     def stop_music(self, channel_id):
         self.music.append(("stop", channel_id))
-        return "⏹️ 정지"
+        return self._music_result("⏹️ 정지")
 
     def skip_music(self, channel_id):
         self.music.append(("skip", channel_id))
-        return "⏭️ 다음"
+        return self._music_result("⏭️ 다음")
 
     def search_candidates(self, query):
         self.searches.append(query)
@@ -1357,6 +1364,19 @@ def test_music_skip_delegates_to_adapter():
     _fire(a, _txt(777, "ㅁ다음"), target_root="root")
     assert a.music == [("skip", 777)]
     assert a.sent == [(777, "⏭️ 다음", None)]
+
+
+def test_music_empty_reply_is_not_sent():
+    """🔴 빈 문자열 = 미발송(adapter play/stop/skip 공통 계약).
+
+    'ㅁ노래' 회신은 곡 전환 알림보다 **먼저** 나가야 해서 어댑터가 재생 전에 직접 보낸다 —
+    코어가 반환값을 또 보내면 빈 메시지 발송으로 죽거나 같은 말을 두 번 한다.
+    """
+    for text in ("ㅁ노래", "ㅁ정지", "ㅁ다음", "ㅁ재생 밤편지"):
+        a = FakeAdapter()
+        a.music_reply = ""
+        _fire(a, _txt(777, text, channel_role=_PL), target_root="root")
+        assert len(a.music) == 1 and a.sent == [], text  # 위임은 하되 회신은 없다
 
 
 def test_music_disallowed_user_no_reply():

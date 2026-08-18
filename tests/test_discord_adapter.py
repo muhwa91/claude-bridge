@@ -1252,7 +1252,8 @@ def test_music_play_one_coro_moves_queued_song_next(monkeypatch):
         index=1,
     )
     a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "밤편지")) == "⏭️ `밤편지`"
+    assert asyncio.run(a._music_play_one_coro(1, 2, "밤편지")) == ""  # 성공 회신 없음
+    assert sent == []  # 이 시점엔 아무것도 안 나갔다 — 알림은 _advance 뒤 1건뿐
     assert a._music_stopping is False  # stopping 을 건드리면 advance 가 죽는다
     assert len(a._music_entries) == 3  # 이동일 뿐 중복 삽입 아님
     asyncio.run(a._advance())  # 실제 _advance 로 확인
@@ -1267,7 +1268,7 @@ def test_music_play_one_coro_restarts_current_song(monkeypatch):
         index=1,
     )
     a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "현재곡")) == "⏭️ `현재곡`"
+    assert asyncio.run(a._music_play_one_coro(1, 2, "현재곡")) == ""
     assert [e["id"] for e in a._music_entries] == ["a", "cur", "b"]  # 구성 불변
     asyncio.run(a._advance())
     assert sent == [(500, "💿 현재 재생 곡\n`현재곡`")]
@@ -1281,7 +1282,7 @@ def test_music_play_one_coro_search_fallback_and_failure():
     a._music_entries = [{"id": "v0", "title": "곡0"}]
     a._music_index = 0
     a.search_video = lambda _q, _i=0: ("newvid", "새로운곡")  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "새로운곡")) == "⏭️ `새로운곡`"
+    assert asyncio.run(a._music_play_one_coro(1, 2, "새로운곡")) == ""
     assert [e["id"] for e in a._music_entries] == ["v0", "newvid"]
     a.search_video = lambda _q, _i=0: None  # type: ignore[method-assign]
     assert asyncio.run(a._music_play_one_coro(1, 2, "없는곡")) == "재생 실패(제목 검색 실패)"
@@ -1338,7 +1339,7 @@ def test_music_play_coro_query_hits_queue(monkeypatch):
         {"id": "c", "title": "곡C"},
     ]
     a, _played, sent = _startable(monkeypatch, flat)
-    assert asyncio.run(a._music_play_coro(500, 7, "밤편지")) == "🎵 3곡 재생목록"
+    assert asyncio.run(a._music_play_coro(500, 7, "밤편지")) == ""
     assert _now_playing(a)["id"] == "b"
     assert sent == [(500, "💿 현재 재생 곡\n`밤편지`")]
 
@@ -1347,7 +1348,7 @@ def test_music_play_coro_query_search_fallback(monkeypatch):
     # 재생목록에 없으면 유튜브 검색으로 끌어와 맨 앞에 끼우고 그 곡부터.
     flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "곡B"}]
     a, _played, sent = _startable(monkeypatch, flat, search=("newvid", "새로운곡"))
-    assert asyncio.run(a._music_play_coro(500, 7, "새로운곡")) == "🎵 3곡 재생목록"
+    assert asyncio.run(a._music_play_coro(500, 7, "새로운곡")) == ""
     assert _now_playing(a) == {"id": "newvid", "title": "새로운곡", "queued": True}
     assert sent == [(500, "💿 현재 재생 곡\n`새로운곡`")]
 
@@ -1356,16 +1357,44 @@ def test_music_play_coro_query_search_failure_starts_shuffled(monkeypatch):
     # 검색까지 실패하면 재생 자체를 막지 않는다 — 셔플 첫 곡(index 0)으로 시작.
     flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "곡B"}]
     a, _played, sent = _startable(monkeypatch, flat, search=None)
-    assert asyncio.run(a._music_play_coro(500, 7, "없는곡")) == "🎵 2곡 재생목록"
+    assert asyncio.run(a._music_play_coro(500, 7, "없는곡")) == ""
     assert a._music_index == 0 and len(a._music_entries) == 2  # 끼워넣지 않았다
     assert sent[0][1].startswith("💿 현재 재생 곡\n`곡")
 
 
-def test_music_play_coro_without_query_keeps_legacy_reply(monkeypatch):
-    # 🔴 회신 접두사 분기(02_계약 동결 문구) — 'ㅁ노래' 는 종전 그대로 곡수를 알린다.
+def test_music_play_coro_sends_reply_before_now_playing(monkeypatch):
+    """🔴 'ㅁ노래' 는 **회신 → 곡 알림** 순서다(2026-08-18 운영자 지적).
+
+    코어가 반환값을 보내던 종전 구조에서는 _play_current 의 '💿' 알림이 먼저 나가 순서가
+    뒤집혔다. 그래서 어댑터가 재생 **전에** 직접 보내고 반환은 ""(= 코어 미발송)이다.
+    """
     flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "곡B"}]
-    a, _played, _sent = _startable(monkeypatch, flat)
-    assert asyncio.run(a._music_play_coro(500, 7)) == "▶️ Play - 2곡"
+    a, _played, sent = _startable(monkeypatch, flat)
+    assert asyncio.run(a._music_play_coro(500, 7)) == ""  # 코어가 또 보내지 않게
+    assert len(sent) == 2
+    assert sent[0] == (500, "▶️ Play - 2곡")  # ① 회신이 먼저
+    assert sent[1][1].startswith(f"{discord_adapter.MUSIC_NOW_HEADER}\n")  # ② 곡 알림이 뒤
+
+
+def test_music_play_coro_failures_still_reply(monkeypatch):
+    """🔴 성공만 "" 다 — 실패는 회신이 남아야 한다(없애면 아무 반응이 없어 죽은 것처럼 보인다)."""
+    a, _played, sent = _startable(monkeypatch, [{"id": "a", "title": "곡A"}])
+    a._music_playlist_url = ""
+    assert asyncio.run(a._music_play_coro(500, 7)) == "⚠️재생목록 설정필요"
+    a._music_playlist_url = "https://pl"
+    a._caller_voice_channel = lambda _uid: None  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_coro(500, 7)) == "🔊 먼저 음성채널에 들어가 주세요"
+    assert sent == []  # 실패 경로는 어댑터가 직접 보내지 않는다(코어가 회신을 보낸다)
+    # 루프 미준비(_run → None)면 공개 표면이 안내로 폴백한다 — ""(미발송)로 새면 안 된다.
+    assert _adapter().play_music(1, 2) == "⚠️오류 발생"
+
+
+def test_music_play_coro_query_has_no_reply(monkeypatch):
+    # 'ㅁ재생 <제목>'(미재생 상태) — '🎵 N곡 재생목록' 회신을 없앴다. 💿 알림 1건만 나간다.
+    flat = [{"id": "a", "title": "곡A"}, {"id": "b", "title": "밤편지"}]
+    a, _played, sent = _startable(monkeypatch, flat)
+    assert asyncio.run(a._music_play_coro(500, 7, "밤편지")) == ""
+    assert sent == [(500, "💿 현재 재생 곡\n`밤편지`")]
 
 
 def test_music_play_one_coro_requires_caller_in_voice_channel():
@@ -1391,10 +1420,10 @@ def test_music_play_one_coro_delegates_while_stopping():
 
     async def fake_play(cid, uid, q=""):
         calls.append((cid, uid, q))
-        return "🎵 1곡 재생목록"
+        return ""
 
     a._music_play_coro = fake_play  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "곡0")) == "🎵 1곡 재생목록"
+    assert asyncio.run(a._music_play_one_coro(1, 2, "곡0")) == ""
     assert calls == [(1, 2, "곡0")]
     assert len(a._music_entries) == 1  # 큐 무변형
 

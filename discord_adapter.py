@@ -63,11 +63,18 @@ from bridge import (
     HEADER_NOTE,
     PROJECT_LABELS,
     STATUS_LEADERS,
+    clean_track_title,
+    escape_reply,
+    pick_index,
 )
 
 log = logging.getLogger("bridge")
 
 DISCORD_LIMIT = 2000  # 디스코드 메시지 한도(§2.1) — 초과 장문은 청킹.
+# 곡 전환 알림 머리글의 이모지 — 운영자 선택(2026-08-18). 바꾸려면 이 한 줄만 고치면 된다.
+MUSIC_NOW_EMOJI = "💿"
+MUSIC_NOW_HEADER = f"{MUSIC_NOW_EMOJI} 현재 재생 곡"  # 알림 첫 줄(둘째 줄 = 정리한 곡 제목)
+_SEARCH_MAX = 5  # 'ㅁ추가' 검색 후보 수(ytsearch5) — 필터가 거른 뒤 고를 여지 + 회신에 보여줄 목록.
 _CUSTOM_ID_LIMIT = 100  # 디스코드 custom_id 한도(§1.3). 우리 콜백 문자열은 항상 이 안(id·name≤64).
 _CALL_TIMEOUT = 30  # run_coroutine_threadsafe().result() 타임아웃(§3.2).
 # fetch_file 다운로드 도메인 고정(§2.4 — 임의 URL 다운로드=SSRF 차단).
@@ -450,7 +457,7 @@ class DiscordAdapter:
         self._music_entries: list[dict[str, Any]] = []  # 셔플된 flat 재생목록 엔트리
         self._music_index = 0
         self._music_stopping = False  # 정지 중 플래그(_after 가 advance 하지 않게)
-        self._music_text_ch = 0  # 재생 시작 채널(곡 전환 '▶️ Play - 제목' 통지 대상)
+        self._music_text_ch = 0  # 재생 시작 채널(곡 전환 '💿 현재 재생 곡' 통지 대상)
         self._ffmpeg_log: IO[bytes] | None = (
             None  # ffmpeg stderr(지연 open·재사용, close 에서 정리)
         )
@@ -512,38 +519,58 @@ class DiscordAdapter:
             else self._music_play_coro(channel_id, user_id)
         )
         r = self._run(coro, timeout=60)
-        return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
+        return r if isinstance(r, str) else "⚠️오류 발생"
 
     def stop_music(self, channel_id: int) -> str:  # noqa: ARG002 (Protocol 계약 시그니처)
         """재생 정지 + 음성채널 퇴장. 회신 문자열 반환(폴백은 안내). 단일 세션이라 채널 무관."""
         r = self._run(self._music_stop_coro(), timeout=60)
-        return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
+        return r if isinstance(r, str) else "⚠️오류 발생"
 
     def skip_music(self, channel_id: int) -> str:  # noqa: ARG002 (Protocol 계약 시그니처)
         """현재 곡 건너뛰기(→ after 가 다음 곡 재생). 회신 문자열 반환(폴백은 안내). 채널 무관."""
         r = self._run(self._music_skip_coro(), timeout=60)
-        return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
+        return r if isinstance(r, str) else "⚠️오류 발생"
 
-    def search_video(self, query: str) -> tuple[str, str] | None:
-        """'ㅁ추가 <검색어>' → yt-dlp ytsearch1 첫 결과 (videoId, 제목). 무결과·실패는 None.
+    def search_candidates(self, query: str) -> list[tuple[str, str, str]]:
+        """'ㅁ추가 <검색어>' → yt-dlp ytsearch5 후보 (videoId, 제목, 채널) 최대 5건. 실패는 [].
 
         음성 재생(_run 경유 이벤트루프)과 달리 순수 메타 추출이라 워커 스레드에서 직접(블로킹)
         실행한다 — voice client·on_ready 무관. 익명·무료(YouTube Data API search.list 미사용).
+        ⚠️ **extract_flat 를 유지한다** — full 추출로 바꾸면 후보당 ~1초가 붙어 5건이면 5초다.
+        검색 요청 자체는 ytsearch1 때와 같은 1회(개수만 5로 늘렸다).
+        채널명은 flat 엔트리의 channel/uploader — 없으면 ""(제목 규칙만으로 판정된다).
         """
         try:
             opts = {"quiet": True, "skip_download": True, "extract_flat": "in_playlist"}
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        except Exception as e:  # yt-dlp 추출 실패(네트워크·차단·무결과 파싱 등) — None 폴백
+                info = ydl.extract_info(f"ytsearch{_SEARCH_MAX}:{query}", download=False)
+        except Exception as e:  # yt-dlp 추출 실패(네트워크·차단·무결과 파싱 등) — [] 폴백
             log.warning("유튜브 검색 실패: %s", type(e).__name__)
+            return []
+        out: list[tuple[str, str, str]] = []
+        for entry in (info or {}).get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            vid = entry.get("id")
+            if not vid:
+                continue
+            channel = entry.get("channel") or entry.get("uploader") or ""
+            out.append((str(vid), str(entry.get("title") or vid), str(channel)))
+        return out[:_SEARCH_MAX]
+
+    def search_video(self, query: str, index: int = 0) -> tuple[str, str] | None:
+        """단건 검색 (videoId, 제목) — 후보 중 코어(pick_index)가 고른 하나. 무결과·범위 밖 None.
+
+        검색은 search_candidates 1회뿐이다(코어가 후보 목록을 따로 받아 회신에 쓸 때도 그쪽이
+        직접 search_candidates 를 부르므로 같은 명령에서 두 번 검색하지 않는다).
+        query 를 pick_index 에 함께 넘긴다 — 검색어 자체가 필터 규칙에 걸리면 필터를 끈다
+        ('ㅁ재생 Live Forever' 가 5후보 전부 적중해 무관한 영상으로 떨어지던 결함).
+        """
+        candidates = self.search_candidates(query)
+        pos = pick_index(candidates, index, query)
+        if pos is None:
             return None
-        entries = (info or {}).get("entries") or []
-        if not entries or not isinstance(entries[0], dict):
-            return None
-        vid = entries[0].get("id")
-        if not vid:
-            return None
-        return (str(vid), str(entries[0].get("title") or vid))
+        return (candidates[pos][0], candidates[pos][1])
 
     def enqueue_video(self, video_id: str, title: str) -> int:
         """재생 중이면 새 곡을 현재 곡 바로 뒤에 실시간 편입하고 편입 후 큐 곡수를 반환.
@@ -653,12 +680,12 @@ class DiscordAdapter:
 
     async def _music_play_coro(self, channel_id: int, user_id: int, query: str = "") -> str:
         if not self._music_playlist_url:
-            return "⚠️ 재생목록이 설정되지 않았습니다."
+            return "⚠️재생목록 설정필요"
         ch = self._caller_voice_channel(user_id)
         if ch is None:
-            return "🔊 먼저 음성채널에 들어가 주세요."
+            return "🔊 먼저 음성채널에 들어가 주세요"
         if self._voice is not None and self._voice.is_connected():
-            return "🎵 이미 재생 중입니다."
+            return "🎵 현재 재생 중"
         loop = asyncio.get_running_loop()
         try:
             flat = await loop.run_in_executor(None, self._extract_flat)
@@ -666,7 +693,7 @@ class DiscordAdapter:
             log.warning("재생목록 추출 실패: %s", type(e).__name__)
             flat = []
         if not flat:
-            return "⚠️ 재생목록을 불러오지 못했습니다."
+            return "⚠️재생목록 불러오기 실패"
         self._voice = await ch.connect(timeout=30.0, reconnect=True)
         conn = getattr(self._voice, "_connection", None)
         log.info("음성 연결됨 can_encrypt=%s", getattr(conn, "can_encrypt", None))
@@ -678,8 +705,8 @@ class DiscordAdapter:
         self._music_stopping = False
         self._music_text_ch = channel_id
         await self._play_current()
-        # 'ㅁ재생' 경로는 접두사를 달리한다 — 곡 알림('▶️ Play - <제목>')이 바로 뒤따라 붙어
-        # 같은 접두사 두 줄이 겹치면 개발자가 요청한 형식이 흐려진다. 'ㅁ노래' 회신은 그대로.
+        # 'ㅁ재생' 경로는 접두사를 달리한다 — 곡 알림(💿 2줄)이 바로 뒤따라 붙는데 같은 접두사
+        # 두 줄이 겹치면 개발자가 요청한 형식이 흐려진다. 'ㅁ노래' 회신(▶️ Play - N곡)은 그대로.
         return f"🎵 {len(flat)}곡 재생목록" if query else f"▶️ Play - {len(flat)}곡"
 
     async def _start_index(self, flat: list[dict[str, Any]], query: str) -> int:
@@ -707,7 +734,7 @@ class DiscordAdapter:
         # 없으면 미참가 멤버가 'ㅁ재생 <난수>' 를 반복해 현재 곡을 계속 끊고 yt-dlp 를 돌릴 수 있다
         # (코어 루프가 단일 스레드 직렬이라 소유자 명령이 그 뒤에 줄을 선다).
         if self._caller_voice_channel(user_id) is None:
-            return "🔊 먼저 음성채널에 들어가 주세요."
+            return "🔊 먼저 음성채널에 들어가 주세요"
         # _music_stopping 이면 정지 진행 중 — 큐를 변형해도 _advance 가 즉시 return 해 아무것도
         # 재생되지 않는다. 통상 재생으로 위임하면 _music_play_coro 가 플래그를 리셋하며 정상 시작.
         if self._voice is None or not self._voice.is_connected() or self._music_stopping:
@@ -721,17 +748,17 @@ class DiscordAdapter:
             loop = asyncio.get_running_loop()
             found = await loop.run_in_executor(None, self.search_video, query)
             if found is None:
-                # L-1: 사용자 입력을 **원문 그대로** 되돌리면 안 된다 — 이 채널은 비인가 서버 멤버가
-                # 우회 허용 대상이라, `ㅁ재생 [지금 확인](https://피싱주소)` 를 치면 **봇 명의로**
-                # 마크다운 링크가 게시된다(멘션은 막았지만 링크는 아니다). 코드스팬으로 감싸 렌더를
-                # 죽이고 80자로 자른다. 백틱은 제거한다 — 남겨두면 코드스팬을 닫고 빠져나온다.
-                echo = query[:80].replace("`", "")
-                return f"재생 실패: `{echo}` 를 찾지 못했습니다."
+                # L-1: 사용자 입력을 **되돌리지 않는다** — 이 채널은 비인가 서버 멤버가 우회 허용
+                # 대상이라, `ㅁ재생 [지금 확인](https://피싱주소)` 를 그대로 실으면 **봇 명의로**
+                # 마크다운 링크가 게시된다(멘션은 막았지만 링크는 아니다). 입력을 아예 빼서
+                # 되돌린다 — 코드스팬 이스케이프를 신경 쓸 필요가 없어지는 쪽이 더 안전하다.
+                return "재생 실패(제목 검색 실패)"
             entry = {"id": found[0], "title": found[1]}
         entry["queued"] = True
         self._music_entries.insert(self._music_index + 1, entry)
         self._voice.stop()  # → _after → _advance(index+1) = 방금 끼운 곡
-        return f"⏭️ {entry.get('title') or entry.get('id')}"
+        # 제목은 재생목록·검색에서 온 **제3자 문자열**이라 escape_reply 를 통과시킨다.
+        return f"⏭️ {escape_reply(str(entry.get('title') or entry.get('id') or ''))}"
 
     async def _await_dave_ready(self) -> None:
         """E2EE(DAVE) 음성채널이면 재생 전 세션 준비(can_encrypt)를 최대 ~15초 폴링한다.
@@ -800,10 +827,16 @@ class DiscordAdapter:
                 getattr(conn, "dave_protocol_version", None),
             )
             self._voice.play(src, after=self._after)
-            await self._notify_music(f"▶️ Play - {entry.get('title') or entry.get('id') or ''}")
+            # 2줄 알림: 머리글 + 정리한 제목. 제목이 비면 videoId, 그것도 없으면 머리글만
+            # (빈 줄을 붙이지 않는다). 정리는 표시 전용 — entry 의 원본 title 은 그대로 둔다.
+            # 🔴 escape_reply 는 **clean_track_title 바깥**에 둔다 — 정리가 실패하면 그 함수가
+            # `or title` 로 **원본을 되살리므로**, 안쪽에서 감싸면 그 폴백 경로가 새어나간다.
+            title = clean_track_title(entry.get("title") or "") or entry.get("id") or ""
+            name = escape_reply(title)
+            await self._notify_music(f"{MUSIC_NOW_HEADER}\n{name}" if name else MUSIC_NOW_HEADER)
             return
         if fails > len(self._music_entries) and not self._music_stopping:
-            await self._notify_music("⚠️ 재생 가능한 곡이 없습니다.")
+            await self._notify_music("⚠️ 재생 가능 목록 없음")
 
     def _ffmpeg_stderr(self) -> IO[bytes] | None:
         """ffmpeg 오류를 받을 로그 파일 핸들(어댑터 수명에 **1회만** 연다 — 곡마다 열지 않는다).
@@ -831,7 +864,7 @@ class DiscordAdapter:
         return self._ffmpeg_log
 
     async def _notify_music(self, text: str) -> None:
-        """재생 시작 채널로 보내는 알림(곡 전환 '▶️ Play - <제목>'·재생 불가 통지). 실패는 삼킨다
+        """재생 시작 채널로 보내는 알림(곡 전환 2줄·재생 불가 통지). 실패는 삼킨다
         (§3.3 과 같은 이유 — 알림이 재생을 끊으면 안 된다). 채널 미상(_music_text_ch == 0)이면 스킵.
 
         🔴 self.send() 를 쓰면 **데드락**이다 — send 는 _run 으로 코루틴을 이벤트루프에 밀어넣고
@@ -879,20 +912,20 @@ class DiscordAdapter:
 
     async def _music_skip_coro(self) -> str:
         if self._voice is None or not self._voice.is_connected():
-            return "⏹️ 재생 중인 곡이 없습니다."
+            return "⏹️ 재생 중인 노래가 없어요"
         self._voice.stop()  # → _after → _advance 로 다음 곡
-        return "⏭️ 다음 곡을 재생합니다."
+        return "⏭️ 다음 곡 재생"
 
     async def _music_stop_coro(self) -> str:
         if self._voice is None or not self._voice.is_connected():
-            return "⏹️ 재생 중인 곡이 없습니다."
+            return "⏹️ 재생 중인 노래가 없어요"
         self._music_stopping = True  # _after 가 advance 하지 않게 먼저 세팅
         self._voice.stop()
         await self._voice.disconnect()
         self._voice = None
         self._music_entries = []
         self._music_index = 0
-        return "⏹️ 음악 재생을 마칩니다."
+        return "⏹️ 음악 재생을 마칠게요"
 
     async def _ensure_nickname(self) -> None:
         """봇 서버 닉을 _BOT_NICKNAME 으로 고정(멱등). 강퇴/재초대로 풀린 닉을 on_ready 마다 회복.

@@ -917,11 +917,31 @@ def _playing(monkeypatch, entries, index=0, *, text_ch=500):
 
 
 def test_play_current_announces_title(monkeypatch):
-    # 🔴 요구사항 ①의 유일한 배선 단언 — _play_current 의 알림 한 줄을 지우면 이 테스트가 깨진다.
+    # 🔴 요구사항 ①의 유일한 배선 단언 — _play_current 의 알림을 지우면 이 테스트가 깨진다.
     a, played, sent = _playing(monkeypatch, [{"id": "v1", "title": "밤편지"}])
     asyncio.run(a._play_current())
     assert len(played) == 1  # 재생은 시작됐고
-    assert sent == [(500, "▶️ Play - 밤편지")]  # 제목이 채널로 나갔다
+    assert sent == [(500, "💿 현재 재생 곡\n`밤편지`")]  # 머리글 + 제목 2줄이 채널로 나갔다
+
+
+def test_play_current_announce_is_two_lines_and_cleaned(monkeypatch):
+    """알림 = '💿 현재 재생 곡' + 개행 + clean_track_title 결과(2026-08-18 운영자 요청 형식)."""
+    a, _played, sent = _playing(
+        monkeypatch, [{"id": "v1", "title": "오반 (OVAN) - 행복 Happiness [Music Video]"}]
+    )
+    asyncio.run(a._play_current())
+    assert sent == [(500, f"{discord_adapter.MUSIC_NOW_HEADER}\n`오반 - 행복`")]
+    head, _, body = sent[0][1].partition("\n")
+    assert head == f"{discord_adapter.MUSIC_NOW_EMOJI} 현재 재생 곡" and body == "`오반 - 행복`"
+    # 정리는 **표시 전용** — 엔트리의 원본 제목은 그대로여야 'ㅁ삭제'·'ㅁ목록' 매칭이 산다.
+    assert a._music_entries[0]["title"] == "오반 (OVAN) - 행복 Happiness [Music Video]"
+
+
+def test_play_current_announce_header_only_when_no_title_and_no_id(monkeypatch):
+    # 제목도 id 도 없으면 빈 둘째 줄을 붙이지 않고 머리글만 보낸다.
+    a, _played, sent = _playing(monkeypatch, [{"title": ""}])
+    asyncio.run(a._play_current())
+    assert sent == [(500, discord_adapter.MUSIC_NOW_HEADER)]
 
 
 def test_play_current_rechecks_voice_after_await(monkeypatch):
@@ -962,7 +982,7 @@ def test_play_current_gives_up_after_one_full_round(monkeypatch):
 
     asyncio.run(bounded())
     assert played == []
-    assert sent == [(500, "⚠️ 재생 가능한 곡이 없습니다.")]  # 무음의 이유를 알 수 있게
+    assert sent == [(500, "⚠️ 재생 가능 목록 없음")]  # 무음의 이유를 알 수 있게
 
 
 def test_extract_stream_avoids_broken_dash_clients(monkeypatch):
@@ -992,6 +1012,52 @@ def test_extract_stream_avoids_broken_dash_clients(monkeypatch):
     clients = seen["extractor_args"]["youtube"]["player_client"]
     assert clients == ["android", "tv_simply"]
     assert not ({"android_vr", "web_embedded", "tv_downgraded"} & set(clients))
+
+
+def test_search_candidates_returns_five_with_channel(monkeypatch):
+    """검색은 ytsearch5 **1회**·flat 추출(full 은 후보당 ~1초). 채널명은 코어 필터의 입력이다."""
+    seen: dict = {}
+    refs: list[str] = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            seen.update(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+        def extract_info(self, ref, **_kw):
+            refs.append(ref)
+            return {
+                "entries": [
+                    {"id": "v1", "title": "무대 직캠", "channel": "Mnet"},
+                    {"id": "v2", "title": "[가사] 곡", "uploader": "1theK"},  # uploader 폴백
+                    {"id": None, "title": "id 없음"},  # 건너뛴다
+                    "쓰레기",  # dict 아님 — 건너뛴다
+                ]
+            }
+
+    monkeypatch.setattr(discord_adapter.yt_dlp, "YoutubeDL", FakeYDL)
+    a = _adapter()
+    assert a.search_candidates("곡") == [("v1", "무대 직캠", "Mnet"), ("v2", "[가사] 곡", "1theK")]
+    assert refs == ["ytsearch5:곡"] and seen["extract_flat"] == "in_playlist"
+    # search_video 는 코어 필터(pick_index)를 태운다 — 방송무대 1위를 건너뛴다.
+    assert a.search_video("곡") == ("v2", "[가사] 곡")
+    assert a.search_video("곡", 1) == ("v1", "무대 직캠")  # '#N' 은 필터 무시
+    assert a.search_video("곡", 9) is None  # 범위 밖
+
+
+def test_search_candidates_failure_returns_empty(monkeypatch):
+    class BoomYDL:
+        def __init__(self, _opts):
+            raise RuntimeError("yt-dlp 폭발")
+
+    monkeypatch.setattr(discord_adapter.yt_dlp, "YoutubeDL", BoomYDL)
+    assert _adapter().search_candidates("곡") == []
+    assert _adapter().search_video("곡") is None
 
 
 def test_play_current_passes_stderr_to_ffmpeg(monkeypatch, tmp_path):
@@ -1055,7 +1121,7 @@ def test_advance_plays_next_and_announces(monkeypatch):
         monkeypatch, [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}], index=0
     )
     asyncio.run(a._advance())
-    assert a._music_index == 1 and sent == [(500, "▶️ Play - B")]
+    assert a._music_index == 1 and sent == [(500, "💿 현재 재생 곡\n`B`")]
 
 
 def test_advance_wraps_and_reshuffles(monkeypatch):
@@ -1068,7 +1134,7 @@ def test_advance_wraps_and_reshuffles(monkeypatch):
     asyncio.run(a._advance())
     assert a._music_index == 0
     assert all("queued" not in e for e in a._music_entries)
-    assert len(sent) == 1 and sent[0][1].startswith("▶️ Play - ")
+    assert len(sent) == 1 and sent[0][1].startswith("💿 현재 재생 곡\n")
 
 
 def test_notify_music_sends_via_send_coro():
@@ -1083,24 +1149,24 @@ def test_notify_music_sends_via_send_coro():
 
     a._send_coro = fake_send_coro  # type: ignore[method-assign]
     a._music_text_ch = 0
-    asyncio.run(a._notify_music("▶️ Play - 밤편지"))
+    asyncio.run(a._notify_music("💿 현재 재생 곡\n밤편지"))
     assert sent == []  # 재생 채널 미상 → 스킵
     a._music_text_ch = 500
-    asyncio.run(a._notify_music("▶️ Play - 밤편지"))
-    assert sent == [(500, "▶️ Play - 밤편지", None)]
+    asyncio.run(a._notify_music("💿 현재 재생 곡\n밤편지"))
+    assert sent == [(500, "💿 현재 재생 곡\n밤편지", None)]
 
     async def boom(_cid, _payload, _view):
         raise discord.DiscordException("권한 없음")
 
     a._send_coro = boom  # type: ignore[method-assign]
-    asyncio.run(a._notify_music("▶️ Play - 곡"))  # 예외 전파 없음(재생 계속)
+    asyncio.run(a._notify_music("💿 현재 재생 곡\n곡"))  # 예외 전파 없음(재생 계속)
 
 
 def test_play_current_falls_back_to_id_when_title_missing(monkeypatch):
     # 알림 제목은 title, 없으면 id.
     a, _played, sent = _playing(monkeypatch, [{"id": "v2"}])
     asyncio.run(a._play_current())
-    assert sent == [(500, "▶️ Play - v2")]
+    assert sent == [(500, "💿 현재 재생 곡\n`v2`")]
 
 
 def test_dequeue_coro_shifts_index_when_removing_before_current():
@@ -1125,7 +1191,7 @@ def test_dequeue_coro_skips_to_next_when_removing_current(monkeypatch):
     assert asyncio.run(a._dequeue_coro("cur")) == 1
     assert [e["id"] for e in a._music_entries] == ["a", "b"]
     asyncio.run(a._advance())  # _after 가 하는 일을 실제로 태운다
-    assert sent == [(500, "▶️ Play - B")]
+    assert sent == [(500, "💿 현재 재생 곡\n`B`")]
 
 
 def test_dequeue_current_at_index_zero_then_advance(monkeypatch):
@@ -1139,7 +1205,7 @@ def test_dequeue_current_at_index_zero_then_advance(monkeypatch):
     assert asyncio.run(a._dequeue_coro("cur")) == 1
     assert a._music_index == -1
     asyncio.run(a._advance())
-    assert a._music_index == 0 and sent == [(500, "▶️ Play - B")]
+    assert a._music_index == 0 and sent == [(500, "💿 현재 재생 곡\n`B`")]
 
 
 def test_dequeue_last_entry_wraps_to_reshuffle(monkeypatch):
@@ -1153,7 +1219,8 @@ def test_dequeue_last_entry_wraps_to_reshuffle(monkeypatch):
     assert a._music_index == 1  # 남은 [A,B] 의 마지막 → 다음 +1 이 곧 wrap
     asyncio.run(a._advance())
     assert a._music_index == 0 and len(sent) == 1
-    assert sent[0][1] in ("▶️ Play - A", "▶️ Play - B")  # 재셔플이라 순서는 무작위
+    # 재셔플이라 순서는 무작위
+    assert sent[0][1] in ("💿 현재 재생 곡\n`A`", "💿 현재 재생 곡\n`B`")
 
 
 def test_dequeue_coro_noop_when_queue_would_empty():
@@ -1185,11 +1252,11 @@ def test_music_play_one_coro_moves_queued_song_next(monkeypatch):
         index=1,
     )
     a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "밤편지")) == "⏭️ 밤편지"
+    assert asyncio.run(a._music_play_one_coro(1, 2, "밤편지")) == "⏭️ `밤편지`"
     assert a._music_stopping is False  # stopping 을 건드리면 advance 가 죽는다
     assert len(a._music_entries) == 3  # 이동일 뿐 중복 삽입 아님
     asyncio.run(a._advance())  # 실제 _advance 로 확인
-    assert sent == [(500, "▶️ Play - 밤편지")]
+    assert sent == [(500, "💿 현재 재생 곡\n`밤편지`")]
 
 
 def test_music_play_one_coro_restarts_current_song(monkeypatch):
@@ -1200,10 +1267,10 @@ def test_music_play_one_coro_restarts_current_song(monkeypatch):
         index=1,
     )
     a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "현재곡")) == "⏭️ 현재곡"
+    assert asyncio.run(a._music_play_one_coro(1, 2, "현재곡")) == "⏭️ `현재곡`"
     assert [e["id"] for e in a._music_entries] == ["a", "cur", "b"]  # 구성 불변
     asyncio.run(a._advance())
-    assert sent == [(500, "▶️ Play - 현재곡")]
+    assert sent == [(500, "💿 현재 재생 곡\n`현재곡`")]
 
 
 def test_music_play_one_coro_search_fallback_and_failure():
@@ -1213,32 +1280,30 @@ def test_music_play_one_coro_search_fallback_and_failure():
     a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
     a._music_entries = [{"id": "v0", "title": "곡0"}]
     a._music_index = 0
-    a.search_video = lambda _q: ("newvid", "새로운곡")  # type: ignore[method-assign]
-    assert asyncio.run(a._music_play_one_coro(1, 2, "새로운곡")) == "⏭️ 새로운곡"
+    a.search_video = lambda _q, _i=0: ("newvid", "새로운곡")  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "새로운곡")) == "⏭️ `새로운곡`"
     assert [e["id"] for e in a._music_entries] == ["v0", "newvid"]
-    a.search_video = lambda _q: None  # type: ignore[method-assign]
-    assert "찾지 못했습니다" in asyncio.run(a._music_play_one_coro(1, 2, "없는곡"))
+    a.search_video = lambda _q, _i=0: None  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "없는곡")) == "재생 실패(제목 검색 실패)"
     assert len(a._music_entries) == 2  # 실패는 큐를 건드리지 않는다
 
 
 def test_music_play_one_failure_does_not_echo_raw_markdown():
-    """L-1: 실패 회신이 사용자 입력을 원문 그대로 되돌리면 안 된다.
+    """L-1: 실패 회신이 사용자 입력을 되돌리면 안 된다.
 
     플레이리스트 채널은 비인가 서버 멤버가 우회 허용 대상이라, 마크다운 링크를 치면 **봇 명의로**
-    피싱 링크가 게시된다(멘션은 막았지만 링크는 아니다). 코드스팬 + 길이 절단 + 백틱 제거.
+    피싱 링크가 게시된다(멘션은 막았지만 링크는 아니다). 회신은 입력을 아예 싣지 않는 고정 문구다.
     """
     a = _adapter()
     a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: None)
     a._caller_voice_channel = lambda _uid: object()  # type: ignore[method-assign]
     a._music_entries = [{"id": "v0", "title": "곡0"}]
-    a.search_video = lambda _q: None  # type: ignore[method-assign]
+    a.search_video = lambda _q, _i=0: None  # type: ignore[method-assign]
     reply = asyncio.run(a._music_play_one_coro(1, 2, "[지금 확인](https://피싱주소)"))
-    assert reply == "재생 실패: `[지금 확인](https://피싱주소)` 를 찾지 못했습니다."
-    # 백틱을 섞어 코드스팬을 닫고 빠져나오려는 시도도 무력화된다.
-    out = asyncio.run(a._music_play_one_coro(1, 2, "`](https://x) @everyone"))
-    assert "`" not in out[len("재생 실패: `") : -len("` 를 찾지 못했습니다.")]
-    # 긴 입력은 잘린다(회신 도배 방지).
-    assert asyncio.run(a._music_play_one_coro(1, 2, "가" * 200)).count("가") == 80
+    assert reply == "재생 실패(제목 검색 실패)"
+    # 백틱을 섞어 코드스팬을 닫고 빠져나오려는 시도도, 회신 도배용 긴 입력도 한 글자도 안 실린다.
+    assert asyncio.run(a._music_play_one_coro(1, 2, "`](https://x) @everyone")) == reply
+    assert asyncio.run(a._music_play_one_coro(1, 2, "가" * 200)) == reply
 
 
 def _startable(monkeypatch, flat, search=None):
@@ -1251,7 +1316,7 @@ def _startable(monkeypatch, flat, search=None):
     a._voice = None  # 아직 미연결
     a._music_playlist_url = "https://pl"
     a._extract_flat = lambda: [dict(e) for e in flat]  # type: ignore[method-assign]
-    a.search_video = lambda _q: search  # type: ignore[method-assign]
+    a.search_video = lambda _q, _i=0: search  # type: ignore[method-assign]
 
     async def connect(**_kw):
         a._voice = voice
@@ -1275,7 +1340,7 @@ def test_music_play_coro_query_hits_queue(monkeypatch):
     a, _played, sent = _startable(monkeypatch, flat)
     assert asyncio.run(a._music_play_coro(500, 7, "밤편지")) == "🎵 3곡 재생목록"
     assert _now_playing(a)["id"] == "b"
-    assert sent == [(500, "▶️ Play - 밤편지")]
+    assert sent == [(500, "💿 현재 재생 곡\n`밤편지`")]
 
 
 def test_music_play_coro_query_search_fallback(monkeypatch):
@@ -1284,7 +1349,7 @@ def test_music_play_coro_query_search_fallback(monkeypatch):
     a, _played, sent = _startable(monkeypatch, flat, search=("newvid", "새로운곡"))
     assert asyncio.run(a._music_play_coro(500, 7, "새로운곡")) == "🎵 3곡 재생목록"
     assert _now_playing(a) == {"id": "newvid", "title": "새로운곡", "queued": True}
-    assert sent == [(500, "▶️ Play - 새로운곡")]
+    assert sent == [(500, "💿 현재 재생 곡\n`새로운곡`")]
 
 
 def test_music_play_coro_query_search_failure_starts_shuffled(monkeypatch):
@@ -1293,7 +1358,7 @@ def test_music_play_coro_query_search_failure_starts_shuffled(monkeypatch):
     a, _played, sent = _startable(monkeypatch, flat, search=None)
     assert asyncio.run(a._music_play_coro(500, 7, "없는곡")) == "🎵 2곡 재생목록"
     assert a._music_index == 0 and len(a._music_entries) == 2  # 끼워넣지 않았다
-    assert sent[0][1].startswith("▶️ Play - 곡")
+    assert sent[0][1].startswith("💿 현재 재생 곡\n`곡")
 
 
 def test_music_play_coro_without_query_keeps_legacy_reply(monkeypatch):
@@ -1309,10 +1374,8 @@ def test_music_play_one_coro_requires_caller_in_voice_channel():
     a._voice = SimpleNamespace(is_connected=lambda: True, stop=lambda: pytest.fail("stop 금지"))
     a._music_entries = [{"id": "v0", "title": "곡0"}]
     a._caller_voice_channel = lambda _uid: None  # type: ignore[method-assign]
-    a.search_video = lambda _q: pytest.fail("검색하면 안 된다")  # type: ignore[method-assign]
-    assert (
-        asyncio.run(a._music_play_one_coro(1, 2, "없는곡")) == "🔊 먼저 음성채널에 들어가 주세요."
-    )
+    a.search_video = lambda _q, _i=0: pytest.fail("검색하면 안 된다")  # type: ignore[method-assign]
+    assert asyncio.run(a._music_play_one_coro(1, 2, "없는곡")) == "🔊 먼저 음성채널에 들어가 주세요"
     assert len(a._music_entries) == 1  # 큐 무변형
 
 
@@ -2227,7 +2290,7 @@ def test_render_project_view_empty_header_buttons_only():
 def test_render_project_view_nonempty_header_keeps_textdisplay():
     # 못 찾음 등 의미 있는 안내는 TextDisplay 로 유지(버튼 + 사유).
     view = discord_adapter.render_project_view(
-        "'x' 프로젝트를 찾지 못했습니다.", project_buttons(["a"])
+        "'x' 프로젝트를 찾지 못했습니다", project_buttons(["a"])
     )
     assert any(isinstance(it, discord.ui.TextDisplay) for it in view.children)
 

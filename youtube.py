@@ -190,6 +190,19 @@ def add_video(video_id: str) -> tuple[str, str]:
         return ("fail", _reason(e))
 
 
+def list_titles() -> tuple[str, list[tuple[str, str]]]:
+    """재생목록 전곡 → ("", [(videoId, 제목), …]). 실패는 (사유, []) — 'ㅁ목록' 회신용.
+
+    사설 `_list_items` 를 코어가 직접 부르지 않도록 두는 공개 표면(3튜플의 playlistItem id 는
+    삭제 전용이라 뺀다). 예외 포집은 add_video·remove_video 와 같은 집합 — 비밀값 미포함 사유로만
+    변환한다(이 회신은 비인가 서버 멤버도 보는 채널로 나간다).
+    """
+    try:
+        return ("", [(vid, title) for _item, vid, title in _list_items(_get_access())])
+    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+        return (_reason(e), [])
+
+
 def remove_video(query: str) -> tuple[str, str, str]:
     """제목으로 재생목록에서 영상 1건 제거. 반환 (status, detail, videoId):
 

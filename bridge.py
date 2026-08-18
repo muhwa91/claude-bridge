@@ -132,6 +132,8 @@ MUSIC_ADD_WORDS = frozenset({"ㅁ추가"})
 # 둘 다 ㅁ추가와 같은 접두 매칭. ⚠️ 인가는 갈린다 — _playlist_bypass 는 ㅁ삭제만 우회에서 뺀다.
 MUSIC_DEL_WORDS = frozenset({"ㅁ삭제"})
 MUSIC_PLAY_ONE_WORDS = frozenset({"ㅁ재생"})
+# 'ㅁ목록' — 재생목록 전곡 조회(읽기 전용·인자 없음). music_action 과 같은 공백접기 정확매칭.
+MUSIC_LIST_WORDS = frozenset({"ㅁ목록"})
 
 
 def music_action(text: str) -> str | None:
@@ -189,6 +191,215 @@ def is_music_play_one(text: str) -> bool:
     return _is_prefix_cmd(text, MUSIC_PLAY_ONE_WORDS)
 
 
+def is_music_list(text: str) -> bool:
+    """'ㅁ목록' 여부(공백접기 정확매칭 — 인자 없는 명령). 재생목록 전곡을 번호·제목으로 회신."""
+    return "".join(text.split()).casefold() in MUSIC_LIST_WORDS
+
+
+# ── 'ㅁ추가 <검색어>' 검색 결과 선택(순수 — 네트워크는 어댑터 몫) ─────────────────
+# 검색 1위를 그대로 넣으면 방송무대·팬편집이 섞인다. 근거는 **검색 결과**다 — 2026-08-18 에
+# 재생목록의 방송무대 11곡(열린음악회·스케치북·Mnet 라이브와이어·교차편집·Choreography·@TOUR·
+# 비긴어게인·[최초 공개]·[DF LIVE])을 관측해 규칙을 세웠고, 같은 날 그 11곡을 원곡 버전으로
+# **교체**했다. ⚠️ 그래서 «재생목록 99곡 중 11곡» 으로 재확인할 수 없다 — 지금 재생목록에는
+# 그 11곡이 없다(2026-08-18 실측 = **100곡 중 적중 0**). 이 상수를 손댈 때의 회귀 기준은
+# ① 재생목록 전곡에 적중 0(오검출 없음) ② 검색어 25건의 선택 결과가 검색어와 겹칠 것 두 가지다.
+# 🔴 'cover'·'커버'·'가사'·'lyric' 을 넣지 마라 — 가사영상 54곡·커버 2곡은 개발자가 **의도해서**
+# 넣은 것이라, 거르는 순간 목록의 절반이 밀려난다.
+_STAGE_CHANNEL_RE = re.compile(
+    # 🔴 방송사는 «채널명 전체»가 아니라 낱말로 잡는다 — 2026-08-18 실측에서
+    #    `SBS Entertainment` 가 `SBS ?K` 를 비껴가 방송 무대가 1위로 뽑혔다.
+    #    `KBS부산`·`Mnet TV` 처럼 접미가 자유로워 접두만 고정한다.
+    r"KBS|SBS|MBC|Mnet|Beginagain|비긴어게인|방구석|TV ?CHOSUN|JTBC",
+    re.IGNORECASE,
+)
+_STAGE_TITLE_RE = re.compile(
+    r"교차편집|stage ?mix|@.{0,20}tour|최초 ?공개|열린음악회|스케치북|"
+    r"라이브와이어|choreography|직캠|fancam|"
+    # 🔴 'live' 는 **단독으로 잡지 않는다** — 곡명에 그대로 쓰인다(실측: `Oasis - Live Forever`
+    #    가 5후보 전부 적중해 필터가 무의미해졌다). 라이브 세션·클립 문맥일 때만 잡는다.
+    #    ⚠️ 'special clip' 은 **제거**했다 — 레이블 공식 음원 표기다(실측: `[Official] DK(디셈버)
+    #    - 행복하지 말아요 (Special Clip)` 이 걸러져 무관한 「260717 Havy V7」이 뽑혔다).
+    #    채널 조건과 AND 로 묶는 안은 무의미하다 — 방송사 채널이면 _STAGE_CHANNEL_RE 가 이미 잡는다.
+    r"\(live\)|\[live\]|live ?(?:clip|session|stage|performance|ver)|df ?live|"
+    r"라이브 ?(?:클립|세션|무대|영상)|"
+    # 루프 영상 — 원곡이 아니라 「1시간 연속 재생」류다(2026-08-18 실측: 대체 후보 1위로 뽑혔다).
+    # 🔴 시간·hour 는 **루프 문맥을 요구**한다. 맨 `[0-9]+ ?시간` 은 곡명을 때린다
+    # (실측: `선미 - 24시간이 모자라`·`가인 - 24 시간이 모자라` 가 5후보 전부 적중).
+    r"[0-9]+ ?시간 ?(?:연속|반복|재생|듣기|/ ?[0-9]+ ?hour)|[0-9]+ ?hours? ?(?:loop|non-? ?stop)|"
+    r"연속 ?재생|연속 ?듣기|반복 ?듣기|반복 ?재생|"
+    # 음악방송 프로그램명 — 팬이 올려 채널이 방송사가 아닌 경우가 많아 제목으로 잡는다
+    # (2026-08-18 실측: 「2018 가온 차트 무대 / Gaon Chart Stage」가 대체 후보로 뽑혔다).
+    r"가온 ?차트|gaon ?chart|차트 ?무대|뮤직뱅크|music ?bank|음악중심|인기가요|"
+    # `콘서트` 는 2026-08-18 재검토에서 **남겼다** — 실측 25건 중 적중은 실제 공연 실황
+    # (`임재범 - 너를 위해 / 2016 Tour In Seoul 30주년 기념 콘서트`) 하나뿐이었고 오검출은 0.
+    # 사용자가 «콘서트» 를 직접 치는 경우는 pick_index 의 query 우회가 받는다.
+    r"엠카운트다운|m ?countdown|쇼챔피언|더 ?쇼|가요대전|가요대축제|콘서트",
+    re.IGNORECASE,
+)
+# 'ㅁ추가 <검색어> #2' — 마지막 토큰이 #숫자면 순번 지정. '#' 없는 숫자는 검색어의 일부다
+# ('ㅁ추가 소녀시대 999' 는 곡 제목). ASCII 숫자만 받는다(전각 숫자로 순번을 지정할 길 없음).
+# 🔴 **1~99 만 순번**이다 — `#0` 은 순번이 아닌데 [0-9]{1,2} 로 받으면 index==0(=미지정)이 되어
+# 「필터가 알아서 고름」으로 조용히 바뀌었다. `#100` 이 검색어에 남는 것과 같은 취급으로 통일한다.
+_ADD_INDEX_RE = re.compile(r"^(?P<query>.+?)\s+#(?P<n>[1-9][0-9]?)$")
+
+
+def parse_add_index(arg: str) -> tuple[str, int]:
+    """'ㅁ추가' 인자 → (검색어, 순번). 순번 미지정은 0(=필터가 고른다). 순수 함수."""
+    m = _ADD_INDEX_RE.match(arg.strip())
+    if m is None:
+        return (arg.strip(), 0)
+    return (m.group("query").strip(), int(m.group("n")))
+
+
+def is_stage_clip(title: str, channel: str = "") -> bool:
+    """검색 결과가 방송무대·팬편집·라이브세션인지(순수). 위 두 정규식 근거 주석 참조."""
+    return bool(_STAGE_CHANNEL_RE.search(channel) or _STAGE_TITLE_RE.search(title))
+
+
+def pick_index(
+    candidates: list[tuple[str, str, str]], index: int = 0, query: str = ""
+) -> int | None:
+    """후보 (videoId, 제목, 채널) 목록에서 고를 위치(0-based). 후보 없으면 None.
+
+    `index >= 1`: 사용자가 '#N' 으로 지정한 순번(1-based, parse_add_index 가 1~99만 넘긴다) —
+    **필터를 무시**하고 그대로 쓴다. 범위 밖이면 None(잘못된 번호를 조용히 바꿔치지 않는다).
+    `index == 0`(미지정): 필터에 안 걸리는 첫 후보. **전부 걸리면 1위로 폴백**한다 — 요청은
+    '넣어달라'였으므로 추가 자체를 막지 않는다(원치 않으면 '#N' 으로 다시 고른다).
+    🔴 `query` 자체가 필터 규칙에 걸리면 **필터를 끈다**(1위 그대로). 그 낱말은 사용자가 직접
+    친 것이라 「형식 잡음」과 구분할 근거가 없다 — 실측: `24시간이 모자라`·`Live Forever` 는
+    5후보가 **전부** 적중해 필터가 무의미해지고, 우연히 순서가 바뀌면 무관한 영상이 뽑혔다.
+    """
+    if not candidates:
+        return None
+    if index > 0:
+        return index - 1 if index <= len(candidates) else None
+    if query and is_stage_clip(query):
+        return 0
+    for i, (_vid, title, channel) in enumerate(candidates):
+        if not is_stage_clip(title, channel):
+            return i
+    return 0
+
+
+# ── 곡 제목 표시 정리(순수 — **표시 전용**) ────────────────────────────────────
+# 🔴 재생목록의 실제 제목·'ㅁ삭제' 제목 매칭(youtube.remove_video → fold_title)·'ㅁ목록' 회신은
+#    **원본 제목 그대로** 써야 한다. 거기에 이 정리본을 끼우면 제목이 서로 달라져 매칭이 깨진다.
+#    쓰는 곳은 곡 전환 알림(discord_adapter._play_current) 하나다.
+# 아래 패턴과 적용 순서는 2026-08-18 실제 재생목록 99곡에 전부 대보고 확정했다(감으로 고치지 말 것).
+_HANGUL = re.compile(r"[가-힣]")
+# [Music Video]·【MV】 — 대괄호류는 실측 99곡에서 예외 없이 부가표기였다(곡명에 쓰인 적 없음).
+# 전각 대괄호(U+FF3B/FF3D)도 함께 받는다 — 한글 자판 업로더가 섞어 쓴다.
+_T_BRACKET = re.compile(r"[\[\【\uff3b][^\]\】\uff3d]*[\]\】\uff3d]")
+# 괄호 부가표기: (Official MV)·(feat. …)·(OVAN) 같은 영문 병기. 마지막 대안지는 「ASCII·기호뿐인
+# 괄호」라 한글이 든 괄호(곡명의 일부일 수 있다)는 남긴다.
+_T_NOISE_PAREN = re.compile(
+    r"\((?:[^()]*?)(?:official|mv|video|audio|lyric|가사|feat\.?|prod|inst|"
+    r"[A-Za-z0-9 .,'&!?-]+)\)",
+    re.IGNORECASE,
+)
+# 홍보 문구 구분자 — `ㅣ`·`|`·전각 U+FF5C + **공백으로 둘러싸인 슬래시**.
+# 🔴 붙여 쓴 슬래시는 넣지 마라 — 곡명 `O/W` 가 `O` 로 잘린다(2026-08-18 실측 사고).
+_T_SEG_SPLIT = re.compile(r"[ㅣ|\uff5c]|\s+/\s+")
+_T_DECOR = re.compile(r"[♬♪🔗❣️⭐️]+")  # 업로더 장식 문자 — 정보가 없다
+# 조각 끝에 남은 `가사`·`Lyrics` 류 꼬리표(가사영상이 목록의 절반이라 흔하다).
+# 🔴 `+` 로 **반복** 매칭한다 — 1회만 지우면 `… 가사 해석` 에서 `가사` 가 남는다(실측).
+_T_TAIL_TAG = re.compile(r"(?:[ ,/]*(?:가사|해석|발음|lyrics?|inst))+\s*$", re.IGNORECASE)
+
+
+def _drop_ascii_tail(seg: str) -> str:
+    """한글 조각 꼬리에 붙은 영문 병기를 뗀다(`행복 Happiness` → `행복`). 순수.
+
+    🔴 **곡명 조각(clean_track_title 의 i>=1)에만 쓴다.** 아티스트 조각에 쓰면 이름이 통째로
+    날아간다 — 실측 사고: `어서 날아가렴, Florina - Va Va Vis` 에서 `Florina` 가 소실됐다.
+    한글이 없는 조각(원래 영어 곡)은 손대지 않는다 — 다 떼면 곡명이 빈다.
+    """
+    if not _HANGUL.search(seg):
+        return seg  # 영어 곡 원본 보존
+    words = seg.split()
+    # 꼬리부터 벗긴다. len>1 조건으로 최소 한 낱말은 남겨 조각이 통째로 비는 것을 막는다.
+    while (
+        len(words) > 1
+        and not _HANGUL.search(words[-1])
+        and re.fullmatch(r"[A-Za-z0-9'&.,!?-]+", words[-1])
+    ):
+        words.pop()
+    return " ".join(words)
+
+
+def clean_track_title(title: str) -> str:
+    """유튜브 제목 → 「아티스트 - 곡명」 표시용 정리(순수). 정리 결과가 비면 **원본을 그대로** 반환.
+
+    예: `오반 (OVAN) - 행복 Happiness [Music Video]` → `오반 - 행복`.
+    폴백(원본 반환)이 있어야 알림이 빈 줄로 나가지 않는다.
+    """
+    t = _T_DECOR.sub(" ", title)
+    t = _T_BRACKET.sub(" ", t)
+    for _ in range(3):  # (A)(B)(C) 처럼 여러 번 붙는다 — 중첩이 아니라 반복이라 3회로 충분(실측)
+        t = _T_NOISE_PAREN.sub(" ", t)
+    # 곡선 따옴표(U+2019/U+2018) → 직선(아래서 함께 제거). 이스케이프로 쓴다 — 소스에 그대로
+    # 넣으면 직선 따옴표와 눈으로 구분되지 않아 나중에 잘못 고쳐진다(ruff RUF001 도 같은 이유).
+    t = t.replace("\u2019", "'").replace("\u2018", "'")
+    t = re.sub(r"['\"]", "", t)  # 따옴표 표기가 업로더마다 제각각이라 지워서 통일한다
+    # 'ㅣ'·'|'·' / ' 로 이어붙인 홍보 문구. 🔴 **「A - B」 꼴 조각을 고른다** — 앞 조각만 취하면
+    # 곡명이 통째로 사라진다(실측 사고: `역주행 가능성 58000퍼센트 | 케이시 (Kassy) - 사진첩`,
+    # `노래모음 / 케이시 (Kassy) - 사진첩`). 슬래시도 같은 분기로 처리한다 — 종전의 «꼬리부터
+    # 잘라내기»는 `A / B` 에서 **앞 조각**을 남겨 곡명 쪽을 버렸다.
+    segs = [x.strip() for x in _T_SEG_SPLIT.split(t) if x.strip()]
+    dashed = [x for x in segs if " - " in x]
+    t = max(dashed, key=len) if dashed else (segs[0] if segs else t)
+    # 아티스트/곡명 분해. `_` 구분자도 받는다(업로더가 `아티스트 _ 곡명` 으로 쓰는 경우가 있다).
+    parts = [p.strip() for p in re.split(r"\s+-\s+|\s+_\s+", t) if p.strip()]
+    parts = [_drop_ascii_tail(p) if i else p for i, p in enumerate(parts)]  # i==0(아티스트)은 보존
+    parts = [re.sub(r"\s{2,}", " ", p).strip(" -_|·") for p in parts if p.strip(" -_|·")]
+    parts = [_T_TAIL_TAG.sub("", p).strip() for p in parts]
+    parts = [p for p in parts if p]  # 위 제거로 빈 조각이 생길 수 있다
+    # 3조각 이상이면 앞 2개(아티스트·곡명)만 — 뒤는 부제·설명이다.
+    out = " - ".join(parts[:2]) if len(parts) >= 2 else (parts[0] if parts else title)
+    return re.sub(r"\s{2,}", " ", out).strip() or title
+
+
+# 회신에 실을 때 지워야 하는 제어문자: 개행(가짜 UI 를 만든다)·U+200B~200F(제로폭·RTL/LTR 마크)·
+# U+202A~202E(양방향 override — 글자 순서를 뒤집어 다른 문장으로 보이게 한다).
+# (이스케이프로 쓴다 — 소스에 실문자로 넣으면 **눈에 보이지 않아** 나중에 지워진다)
+_UNSAFE_CTRL = re.compile(r"[\r\n\u200b-\u200f\u202a-\u202e]")
+
+
+def escape_reply(text: str, limit: int = 100) -> str:
+    """★ 외부 문자열을 봇 회신에 실을 때의 **유일한** 안전 표기(보안 감사 대상). 빈 값은 ''.
+
+    감싸는 대상은 두 가지이고 **위협은 같다**:
+      · 사용자 입력(`ㅁ추가 <검색어>`) — 이 채널은 비인가 서버 멤버도 쓴다(_playlist_bypass)
+      · 🔴 **제3자가 올린 유튜브 제목** — 후보 목록·`ㅁ목록`·추가/삭제 결과·곡 전환 알림으로
+        나간다. 멤버 누구나 `ㅁ추가` 로 「제목이 마크다운 링크인 영상」을 넣으면 **봇 명의로**
+        피싱 링크가 게시되고, 곡이 돌 때마다 다시 뜬다. `ㅁ삭제` 는 인가가 필요해 공격자는
+        지우지도 못한다(멘션은 클라이언트에서 전면 차단했지만 링크·서식은 아니다).
+    규칙: 백틱 제거(코드스팬 탈출) → 제어문자 제거 → 길이 절단 → 코드스팬으로 감싸기.
+    ⚠️ **호출부에서 백틱을 덧붙이지 마라** — 이 함수가 감싼다(종전엔 docstring 만 그렇게 적혀
+    있고 실제로는 호출부 2곳이 붙여, 새 호출부가 생길 때마다 잊혔다).
+    """
+    t = _UNSAFE_CTRL.sub("", text.replace("`", ""))[:limit].strip()
+    return f"`{t}`" if t else ""
+
+
+def pack_lines(lines: list[str], limit: int) -> list[str]:
+    """줄 목록 → 한도 이하 메시지들(순수). 줄 중간을 자르지 않고 줄 경계로만 나눈다.
+
+    한 줄이 한도를 넘으면 그 줄만 단독 메시지로 둔다(어댑터의 chunk_text 가 마지막에 자른다).
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    size = 0
+    for line in lines:
+        if buf and size + len(line) + 1 > limit:
+            out.append("\n".join(buf))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+
 # 명령 접두 'ㅁ' 통일(개인용 — 한글 자판 1키). 슬래시('/help'·'/프로젝트')·접두 없는 평문
 # ('프로젝트'·'청소')은 명령이 아니다. 동의어만 별칭으로 두고 정규 ㅁ 토큰으로 접는다.
 COMMAND_ALIASES = {
@@ -208,6 +419,9 @@ COMMANDS = (
 # ㅁ추가)만 처리하고 그 외는 반응·안내 없이 조용히 무시한다(_handle_text 최상단 게이트). 태그는
 # _ensure_voice 가 durable 하게 관리하는 "playlist"(계약의 '플레이리스트'는 이 내부 태그로 실현).
 _MUSIC_ONLY_ROLES = frozenset({"playlist"})
+# 'ㅁ목록' 회신 1건의 최대 길이. 디스코드 한도 2000 보다 낮춰 잡는다 — 어댑터가 마스킹(***)으로
+# 길이를 늘릴 수 있고, 한도에 딱 붙이면 그 증가분이 chunk_text 의 무자비한 절단으로 되돌아온다.
+MUSIC_LIST_MSG_LIMIT = 1800
 
 # ── 게스트질문 채널(개발자 외 서버 멤버용 웹검색 Q&A, 격리) ──────────────────────
 # role 태그. 이 채널의 실행은 도구=WebSearch 1개·cwd=격리 샌드박스로 워크스페이스(파일·bash·git·
@@ -4438,7 +4652,7 @@ def run_claude(
         data = result_box.get("data")
         if isinstance(data, dict):
             return data
-        return {"is_error": True, "result": f"타임아웃({timeout}s) 초과 — 작업을 중단했습니다."}
+        return {"is_error": True, "result": f"타임아웃({timeout}s) 초과 — 작업을 중단했습니다"}
 
     # 리더가 result break 또는 stdout EOF 로 종료 — D2/D3: 손자(MCP) 트리를 정리 후 reap.
     # (result 뒤엔 세션 끝이라 kill 안전; 이미 죽었으면 무해.)
@@ -4474,11 +4688,11 @@ def format_reply(data: dict[str, Any]) -> str:
 
 # GitHub Actions 실행이 "진행/대기"로 볼 status 값(gh run list 의 status 필드).
 _ORACLE_RUNNING_STATUSES = frozenset({"in_progress", "queued", "pending", "requested", "waiting"})
-_ORACLE_NOT_RUNNING = "⚠️ 오라클 재고 잡이가 안 돌고 있어요 (GitHub Actions 확인 필요)."
+_ORACLE_NOT_RUNNING = "⚠️ 오라클 재고 잡이가 안 돌고 있어요 (GitHub Actions 확인 필요)"
 # gh 미설치·타임아웃·오류 폴백(라이브 조회 불가여도 잡이 자체는 GitHub 에서 계속 돎).
 _ORACLE_FALLBACK = (
     "🤖 오라클 재고 잡이는 GitHub Actions에서 24시간 자동으로 돌고 있어요.\n"
-    "데스크탑 꺼도 계속 돌고, 잡히는 순간 여기로 알림이 옵니다."
+    "데스크탑 꺼도 계속 돌고, 잡히는 순간 여기로 알림이 옵니다"
 )
 
 
@@ -4591,13 +4805,13 @@ def git_status_note(root: Path) -> str:
         dirty = False
 
     if ahead > 0:
-        note = f"로컬 커밋 {ahead}개 대기 — 'push' 로 원격 반영하세요."
+        note = f"로컬 커밋 {ahead}개 대기 — 'push' 로 원격 반영하세요"
         if dirty:
             note += " (+ 미커밋 변경 있음)"
         return note
     if dirty:
-        return "변경이 있으나 커밋되지 않았습니다(확인 필요)."
-    return "변경 없음."
+        return "변경이 있으나 커밋되지 않았습니다(확인 필요)"
+    return "변경 없음"
 
 
 def do_push(root: Path) -> str:
@@ -4611,7 +4825,7 @@ def do_push(root: Path) -> str:
     if pull.returncode != 0:
         _git(root, "rebase", "--abort")
         tail = (pull.stderr or pull.stdout).strip()[-500:]
-        return f"{HEADER_FAIL}\n\npull --rebase 실패 — rebase abort, 미푸시.\n{tail}"
+        return f"{HEADER_FAIL}\n\npull --rebase 실패 — rebase abort, 미푸시\n{tail}"
     # autostash pop 충돌 감지: rebase 성공(rc==0)이라도 stash pop 이 원격과 충돌하면 작업트리에
     # <<<< 마커가 남고 stash 가 잔류한다. unmerged 항목이 있으면 rebase 된 HEAD 로 작업트리를
     # 복원(커밋 유실 없음 — WIP 은 autostash 가 만든 stash@{0} 에 보존)한 뒤 push 는 정상 진행.
@@ -4621,13 +4835,13 @@ def do_push(root: Path) -> str:
         _git(root, "reset", "--hard", "HEAD")
         stash_warn = (
             "\n\n⚠️ 미커밋 변경이 원격 변경과 충돌해 stash 에 보관됐습니다 — "
-            "데스크탑에서 `git stash pop` 으로 수동 확인/병합 필요."
+            "데스크탑에서 `git stash pop` 으로 수동 확인/병합 필요"
         )
     push = _git(root, "push", "origin", "main")
     if push.returncode != 0:
         tail = (push.stderr or push.stdout).strip()[-500:]
-        return f"{HEADER_FAIL}\n\npush 실패.\n{tail}"
-    return f"{HEADER_DONE}\n\npull --rebase 후 push 성공 — 원격 main 에 반영됐습니다.{stash_warn}"
+        return f"{HEADER_FAIL}\n\npush 실패\n{tail}"
+    return f"{HEADER_DONE}\n\npull --rebase 후 push 성공 — 원격 main 에 반영됐습니다{stash_warn}"
 
 
 def save_restart_notice(path: Path, channel_id: int, user_id: int) -> None:
@@ -4703,6 +4917,9 @@ HELP_TEXT = (
     "음성채널에 들어가 배경음악을 재생합니다. 정지 ㅁ정지 · 다음곡 ㅁ다음.\n"
     "ㅁ재생 <제목> 은 그 곡을 지금 틀고(목록에 없으면 유튜브에서 찾아 한 번 재생), "
     "ㅁ삭제 <제목> 은 재생목록에서 그 곡을 뺍니다.\n"
+    "ㅁ목록 은 재생목록 전곡을 번호·제목으로 보여줍니다.\n"
+    "ㅁ추가 <검색어> #N 은 검색 결과 N번째를 넣습니다(회신에 붙는 후보 번호). "
+    "번호를 안 주면 방송무대·교차편집·직캠을 걸러 고릅니다.\n"
     "\n"
     "### 오라클 상태 — 오라클\n"
     "무료 서버(오라클 클라우드) 재고 잡이가 도는 중인지 현재 상태를 알려줍니다.\n"
@@ -5012,7 +5229,7 @@ def _run_photo(
     # 실행 대상(cwd) 해석 — _resolve_photo_cwd 단일 소스(소비 게이트와 공유).
     proj_path = _resolve_photo_cwd(event, target_root)
     if proj_path is None:
-        adapter.send(channel_id, "먼저 프로젝트를 선택한 뒤 사진과 지시를 보내주세요.")
+        adapter.send(channel_id, "먼저 프로젝트를 선택한 뒤 사진과 지시를 보내주세요")
         return
 
     # 사진 다운로드(확장자·크기·경로 잠금은 어댑터 fetch_file). 실패는 graceful.
@@ -5026,7 +5243,7 @@ def _run_photo(
         ValueError,
     ) as e:
         log.warning("chat=%s 사진 다운로드 실패: %s", channel_id, type(e).__name__)
-        adapter.send(channel_id, "사진을 내려받지 못했습니다(형식·크기 확인).")
+        adapter.send(channel_id, "사진을 내려받지 못했습니다(형식·크기 확인)")
         return
 
     # 경로를 지시문에 주입 → 일반 실행(세션 연속성·full 화이트리스트). 실행 후 임시파일 삭제.
@@ -5111,14 +5328,14 @@ def _handle_photo(
     if event.channel_role in _MUSIC_ONLY_ROLES:
         return
     if event.photo_ref is None:  # 캡션 유무와 무관 — 사진 자체를 못 읽으면 여기서 끝(가드 단일화).
-        adapter.send(channel_id, "사진을 읽지 못했습니다.")
+        adapter.send(channel_id, "사진을 읽지 못했습니다")
         return
     caption = event.text.strip() if event.text else ""
     if not caption:
         # 사진 먼저 → 지시 나중: 보류(최신으로 교체). 다운로드는 소비 시점에(fetch_file 재사용).
         pending_photos[channel_id] = (event.photo_ref, time.monotonic())
         log.info("chat=%s 사진 보류(지시 대기)", channel_id)
-        adapter.send(channel_id, "📷 사진을 받아뒀어요. 지시를 보내주세요(5분 내).")
+        adapter.send(channel_id, "📷 사진을 받아뒀어요. 지시를 보내주세요(5분 내)")
         return
     # 사진+캡션 즉시 실행 — 이전 보류가 있으면 제거(혼선 방지, 위 docstring 근거).
     pending_photos.pop(channel_id, None)
@@ -5211,8 +5428,8 @@ def _resolve_commit_paths(raw: list[str], cwd: Path, repo_root: Path) -> list[Pa
     return out or None
 
 
-_COMMIT_BAD_FORMAT = "⚠️ 커밋 보고 형식이 올바르지 않아 커밋하지 않았습니다(수동 확인 필요)."
-_COMMIT_BAD_PATH = "⚠️ 커밋 대상 경로가 레포 밖이라 커밋하지 않았습니다(수동 확인 필요)."
+_COMMIT_BAD_FORMAT = "⚠️ 커밋 보고 형식이 올바르지 않아 커밋하지 않았습니다(수동 확인 필요)"
+_COMMIT_BAD_PATH = "⚠️ 커밋 대상 경로가 레포 밖이라 커밋하지 않았습니다(수동 확인 필요)"
 
 
 def commit_reported_changes(result: str, cwd: Path, repo_root: Path) -> str | None:
@@ -5237,7 +5454,7 @@ def commit_reported_changes(result: str, cwd: Path, repo_root: Path) -> str | No
         return _COMMIT_BAD_PATH
     if not _git_commit_paths(repo_root, paths, message):
         log.warning("브리지 커밋 실패 파일수=%d", len(paths))
-        return f"⚠️ 커밋 실패 — 파일 {len(paths)}개, 수동 확인 필요."
+        return f"⚠️ 커밋 실패 — 파일 {len(paths)}개, 수동 확인 필요"
     log.info("브리지 커밋 완료 파일수=%d", len(paths))
     return f"📦 로컬 커밋 완료 (파일 {len(paths)}개) — {message}"
 
@@ -5280,10 +5497,10 @@ def _handle_notify_record(
         #    회신해, 진단이 통째로 유실된 것을 성공으로 보고했다.
         # 거부 회신에 버튼을 다시 붙이는 것도 confirm 과 같다 — 안 붙이면 그 자리가 막다른 길이다.
         if record is None or record[0] != "fail":
-            deny = f"「{label}」 실패 관측 기록이 없습니다 — ✅ 확인시작부터 다시."
+            deny = f"「{label}」 실패 관측 기록이 없습니다 — ✅ 확인시작부터 다시"
             return (deny, notify_buttons(item_id))
         if fresh is None:
-            return ("카드가 만료됐습니다 — 다시 확인해 주세요.", notify_buttons(item_id))
+            return ("카드가 만료됐습니다 — 다시 확인해 주세요", notify_buttons(item_id))
         line = handoff_line(label, fresh[1], today)
         recorded = _boot_write(note_path, insert=line, drop_label=label)
         committed = (
@@ -5302,17 +5519,17 @@ def _handle_notify_record(
     # nb:confirm — 확인완료 2단계(실제 삭제·기록·커밋). 관측 게이트가 먼저다: 여기까지 왔다는
     # 것만으로는 점검을 통과했다는 근거가 못 된다(개편 전 카드에 남은 옛 nb:done 버튼·어제 카드).
     if record is None or record[0] != "pass":
-        deny = f"「{label}」 통과 관측 기록이 없습니다 — ✅ 확인시작부터 다시."
+        deny = f"「{label}」 통과 관측 기록이 없습니다 — ✅ 확인시작부터 다시"
         return (deny, notify_buttons(item_id))
     if fresh is None:
-        return ("카드가 만료됐습니다 — 다시 확인해 주세요.", notify_buttons(item_id))
+        return ("카드가 만료됐습니다 — 다시 확인해 주세요", notify_buttons(item_id))
     with _notify_lock:
         # 사라질 항목이 스누즈 대기 중이면 함께 정리(스테일 재발송 방지 — 구 nb:done 동작 유지).
         if notify_snooze.pop(item_id, None) is not None:
             save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
     before, after = graduate_notify(SCHEDULES_FILE, item_id)
     if before == after:
-        return (f"「{label}」 알림이 이미 없습니다.", None)
+        return (f"「{label}」 알림이 이미 없습니다", None)
     notify_verdict.pop(item_id, None)  # 졸업했으면 관측 기록도 소진(재사용 불가)
     recorded = _boot_write(note_path, insert=graduation_line(label, today), drop_label=label)
     paths = [SCHEDULES_FILE] + ([note_path] if recorded and note_path is not None else [])
@@ -5382,9 +5599,9 @@ def _handle_button(
     elif action == "x":
         log.info("chat=%s callback 취소", channel_id)
         if isinstance(message_id, int):
-            adapter.edit(channel_id, message_id, "취소했습니다.")
+            adapter.edit(channel_id, message_id, "취소했습니다")
         else:
-            adapter.send(channel_id, "취소했습니다.")
+            adapter.send(channel_id, "취소했습니다")
     elif action == "clean:ok":
         # 청소 확인 탭 → 채널 메시지 전체 삭제(무음: 완료 메시지 없음, 개발자 요청). purge 가
         # 확인 메시지까지 지워 채널이 깨끗해지고 끝 — send/edit 안 함(edit 은 사라진 메시지라 실패).
@@ -5430,7 +5647,7 @@ def _handle_button(
                     adapter.edit(
                         channel_id,
                         message_id,
-                        f"✅ 「{label}」 확인 시작 — 프로젝트 채널에서 실행합니다.",
+                        f"✅ 「{label}」 확인 시작 — 프로젝트 채널에서 실행합니다",
                     )
                 else:
                     adapter.edit(channel_id, message_id, f"✅ 「{label}」 확인 실행 중…")
@@ -5460,7 +5677,7 @@ def _handle_button(
             )
         elif item is not None and note and proj_path is None:
             # 프로젝트 폴더 미해석(삭제·오타) — 실행 불가 안내.
-            msg = "프로젝트를 찾지 못했습니다."
+            msg = "프로젝트를 찾지 못했습니다"
             if isinstance(message_id, int):
                 adapter.edit(channel_id, message_id, msg)
             else:
@@ -5495,13 +5712,13 @@ def _handle_button(
                 channel_id,
                 f"{LEAD_NOTIFY} 30분 뒤는 확인가능 시간({rng[0]}~{rng[1]}) 밖이라 "
                 "다시 알리지 않습니다 — 창이 남았으면 지금 ✅ 확인시작을, "
-                "지났으면 내일 카드에서 이어가세요.",
+                "지났으면 내일 카드에서 이어가세요",
             )
             return
         with _notify_lock:
             notify_snooze[arg] = when.isoformat()
             save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
-        later = f"{LEAD_NOTIFY} 30분 뒤 다시 알립니다."
+        later = f"{LEAD_NOTIFY} 30분 뒤 다시 알립니다"
         if isinstance(message_id, int):
             adapter.edit(channel_id, message_id, later)
         else:
@@ -5562,7 +5779,7 @@ def _handle_button(
         ):
             log.info("chat=%s callback c 만료 mid=%s", channel_id, mid_s)
             if isinstance(message_id, int):
-                adapter.edit(channel_id, message_id, "선택이 만료됐습니다.")
+                adapter.edit(channel_id, message_id, "선택이 만료됐습니다")
             return
         assert mid is not None  # 위 가드(entry dict)가 보장 — mypy 좁히기
         session_id, proj = entry.get("session_id"), entry.get("project_path")
@@ -5571,7 +5788,7 @@ def _handle_button(
             # 직접입력 — 다음 텍스트 답장을 이 세션의 resume 입력으로 라우팅(_handle_text 확인).
             entry["await_reply"] = True
             log.info("chat=%s callback c other mid=%s", channel_id, mid_s)
-            adapter.send(channel_id, "답장으로 직접 적어주세요.")
+            adapter.send(channel_id, "답장으로 직접 적어주세요")
             return
         idx = int(sel)  # parse_callback 이 정수 보장
         valid = 0 <= idx < len(choices) and isinstance(session_id, str) and isinstance(proj, str)
@@ -5644,7 +5861,7 @@ def _handle_digest_button(
     if not isinstance(group, dict) or group.get("channel_id") != channel_id:
         log.info("chat=%s callback %s 만료 seq=%s", channel_id, action, arg)
         if isinstance(message_id, int):
-            adapter.edit(channel_id, message_id, "카드가 만료됐습니다(봇 재시작).")
+            adapter.edit(channel_id, message_id, "카드가 만료됐습니다(봇 재시작)")
         return
     assert isinstance(item, dict)  # 위 group 검사가 보장(mypy 좁히기)
     if item["added"]:
@@ -5655,7 +5872,7 @@ def _handle_digest_button(
     # 잠근다 — 이 값이 도구 있는 세션의 지시문으로 나가는 신뢰 경계라 fail-closed 가 옳다.
     if ".." in name or not _FULL_NAME_RE.match(name):
         log.warning("chat=%s od:rev 이름이 레포 형식이 아님 — 적용 거부", channel_id)
-        adapter.send(channel_id, "레포 이름을 확정하지 못해 적용하지 않았습니다.")
+        adapter.send(channel_id, "레포 이름을 확정하지 못해 적용하지 않았습니다")
         return
     item["added"] = True  # 낙관적 표시 — 실패하면 아래에서 되돌려 버튼을 되살린다
     _rerender_digest(adapter, channel_id, message_id, group)
@@ -5701,9 +5918,9 @@ def _find_awaiting(channel_id: int, user_id: int) -> tuple[int, dict[str, Any]] 
 
 
 def _is_playlist_command(text: str) -> bool:
-    """플레이리스트 채널 화이트리스트 판정: ㅁ노래·ㅁ정지·ㅁ다음·ㅁ청소·ㅁ추가·ㅁ삭제·ㅁ재생(순수).
+    """플레이리스트 채널 화이트리스트: ㅁ노래·정지·다음·청소·추가·삭제·재생·목록(순수).
 
-    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one)와 정확히 같은 조건이어야 한다 —
+    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one/list)와 정확히 같은 조건이어야 —
     게이트만 통과하고 아래 분기에 안 걸리면 HELP 폴백이 새어 채널에 안내가 뜬다(§ 무반응 계약).
     ⚠️ 이건 **라우팅**(그 채널에서 처리되는가)이지 인가가 아니다 — ㅁ삭제도 여기선 True 여야 개발자가
     그 채널에서 쓸 수 있다. 비인가 멤버 차단은 _playlist_bypass 가 따로 한다.
@@ -5715,6 +5932,7 @@ def _is_playlist_command(text: str) -> bool:
         or is_music_add(stripped)
         or is_music_del(stripped)
         or is_music_play_one(stripped)
+        or is_music_list(stripped)
     )
 
 
@@ -5724,11 +5942,22 @@ def _playlist_bypass(event: Event) -> bool:
     True 를 반환할 때만 handle_event 가 비인가 user_id 를 통과시킨다(서버 멤버 누구나 음악 제어,
     개발자 결정). 조건을 의도적으로 좁게 유지한다:
       · (channel_role == "playlist")  AND
-      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제는 뺀다**
+      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제·ㅁ목록은 뺀다**
         button → clean:ok/x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
-    ⚠️ ㅁ삭제(재생목록에서 곡 제거)만 우회에서 제외한다 — **파괴적**이라 허용목록 유저(is_allowed)만
-    쓴다. 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
-    무반응이다. ㅁ재생은 ㅁ노래·ㅁ다음과 같은 급(재생 제어)이라 우회를 허용한다.
+
+    🔴 **우회 판정 3조건** — 셋을 모두 지키는 명령만 넣는다(하나라도 어기면 뺀다):
+      1. **상태변경 없음**(또는 되돌릴 수 있음) — 재생목록·레포·세션을 파괴하지 않는다
+      2. **비용 유계** — 공격자가 반복해도 처리량이 그 명령의 상수배를 넘지 않는다
+      3. **회신 유계** — 회신 건수·크기가 공격자 조종 하에 있지 않다
+
+    ⚠️ 빠져 있는 둘:
+      · **ㅁ삭제** — 1 위반(파괴적). 허용목록 유저(is_allowed)만 쓴다.
+      · **ㅁ목록** — 2·3 위반(2026-08-18 운영자 결정). 비인가 멤버가 ㅁ추가로 목록을 불린 뒤
+        ㅁ목록을 반복하면 **회신 크기와 내용이 둘 다 공격자 손 안에** 있고, 단일 스레드 코어가
+        다중 페이지 API + 다중 메시지를 동기로 처리해 브리지 전체가 막힌다. 상한·캐시를 다는
+        대신 우회에서 빼는 것이 최소 수정이다.
+    둘 다 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
+    무반응이다. ㅁ재생은 ㅁ노래·ㅁ다음과 같은 급(재생 제어)이고 회신이 한 줄이라 3조건을 지킨다.
     그 외(다른 채널·비화이트리스트 텍스트·사진·위험명령 ㅁ프로젝트/ㅁ푸시/ㅁ재시작/일반 실행)는
     False → 기존 is_allowed 인가 그대로. 위험명령은 플레이리스트 게이트가 이미 무시하므로 비인가
     user 에게 도달 불가(이중 방어). channel_role 은 어댑터가 channel_map 으로 채운 신뢰값.
@@ -5736,7 +5965,9 @@ def _playlist_bypass(event: Event) -> bool:
     if event.channel_role not in _MUSIC_ONLY_ROLES:
         return False
     if event.kind == "text":
-        return _is_playlist_command(event.text) and not is_music_del(event.text)
+        return _is_playlist_command(event.text) and not (
+            is_music_del(event.text) or is_music_list(event.text)
+        )
     if event.kind == "button":
         return event.action in ("clean:ok", "x")
     return False
@@ -5757,12 +5988,16 @@ def _guest_bypass(event: Event) -> bool:
 
 
 def _format_add_result(result: tuple[str, str]) -> str:
-    """youtube.add_video 결과(status, detail) → 회신 한 줄."""
+    """youtube.add_video 결과(status, detail) → 회신 한 줄.
+
+    added/dup 의 detail 은 **유튜브가 준 제목**(제3자 입력)이라 escape_reply 로 감싼다.
+    fail 의 detail 은 youtube._reason 이 만든 내부 문구라 감싸지 않는다(비밀값·외부 입력 없음).
+    """
     status, detail = result
     if status == "added":
-        return f"✅ 추가됨: {detail}"
+        return f"✅ 추가됨: {escape_reply(detail)}"
     if status == "dup":
-        return f"이미 있어요: {detail}"
+        return f"이미 있어요: {escape_reply(detail)}"
     return f"추가 실패: {detail}"
 
 
@@ -5777,20 +6012,60 @@ def _add_one_line(adapter: Adapter, video_id: str) -> str:
     if result[0] == "added":
         queued = adapter.enqueue_video(video_id, result[1])  # 편입 후 큐 곡수(재생 중 아니면 0)
         if queued > 0:
-            line += f"\n▶️ Play - {queued}곡"
+            # 뜻: "지금 재생 중인 큐에 넣었고 큐가 N곡". 옛 문구 `▶️ Play - N곡` 은 'ㅁ노래' 회신과
+            # 글자 모양이 같아 「재생이 시작됐다」로 읽혔다(2026-08-18 운영자가 실제로 혼동).
+            line += f"\n🔀 재생 큐에 편입 ({queued}곡)"
     return line
 
 
+def _add_candidates_block(query: str, candidates: list[tuple[str, str, str]], picked: int) -> str:
+    """추가 회신에 붙일 '다른 후보' 블록. 고른 것은 빼고 번호는 검색 순번(1-based) 그대로.
+
+    번호를 다시 매기지 않는다 — 그 번호가 그대로 '#N' 재지정 인자다. 후보가 1건뿐이면 ''.
+    🔴 후보 제목은 **제3자가 올린 문자열**이라 escape_reply 를 반드시 통과시킨다.
+    """
+    others = [
+        f" {i}. {escape_reply(title)}"
+        for i, (_v, title, _c) in enumerate(candidates, 1)
+        if i - 1 != picked
+    ]
+    if not others:
+        return ""
+    return "\n".join([f"다른 후보 — ㅁ추가 {escape_reply(query)} #N", *others])
+
+
+def _handle_music_list(adapter: Adapter, channel_id: int) -> None:
+    """'ㅁ목록' — 재생목록 전곡을 번호·제목으로 회신(읽기 전용).
+
+    99곡이면 디스코드 2000자 한도를 넘으므로 **줄 경계로 나눠 여러 메시지**로 보낸다
+    (어댑터의 chunk_text 는 2000자에서 무자비하게 잘라 제목이 두 동강 난다).
+    🔴 제목은 **제3자가 올린 문자열**이라 escape_reply 를 통과시킨다(목록은 그 제목이 한 번에
+    100줄 나가는 최대 노출면이다). `목록 실패: {reason}` 은 인가 유저만 보고 내부 문구다.
+    """
+    reason, items = youtube.list_titles()
+    if reason:
+        adapter.send(channel_id, f"목록 실패: {reason}")
+        return
+    if not items:
+        adapter.send(channel_id, "재생목록이 비어 있습니다")
+        return
+    lines = [f"🎵 재생목록 {len(items)}곡"]
+    lines += [f"{i}. {escape_reply(title)}" for i, (_vid, title) in enumerate(items, 1)]
+    for part in pack_lines(lines, MUSIC_LIST_MSG_LIMIT):
+        adapter.send(channel_id, part)
+
+
 def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
-    """'ㅁ추가' 처리. 링크(들)면 videoId 추출해 각각 추가, 아니면 검색어로 ytsearch1 첫 결과 추가.
+    """'ㅁ추가' 처리. 링크(들)면 videoId 추출해 각각 추가, 아니면 검색어로 후보 5건 중 1건 추가.
 
     링크+캡션 = 링크만 처리(캡션 무시). 다중 링크 = 각각 처리(중복은 add_video 가 개별 스킵).
     재생목록 전용 링크(videoId 없음)는 개별 실패. 네트워크는 위임 — list/insert 는 youtube 모듈
-    (stdlib urllib), 검색은 adapter.search_video(yt-dlp). 여기선 파싱·라우팅·회신만 한다.
+    (stdlib urllib), 검색은 adapter.search_candidates(yt-dlp) **1회**. 여기선 파싱·선택(pick_index)·
+    회신만 한다. 검색어 경로는 '#N' 으로 순번을 직접 고를 수 있고, 회신에 나머지 후보를 붙인다.
     """
     arg = _cmd_arg(text)
     if not arg:
-        adapter.send(channel_id, "추가 실패: 유튜브 링크나 검색어를 주세요.")
+        adapter.send(channel_id, "추가 실패: 유튜브 링크나 검색어를 주세요")
         return
     url_tokens = [t for t in arg.split() if is_youtube_url(t)]
     if url_tokens:  # 링크 우선(캡션 무시) — 각 링크를 개별 처리
@@ -5803,12 +6078,19 @@ def _handle_music_add(adapter: Adapter, channel_id: int, text: str) -> None:
                 lines.append(_add_one_line(adapter, vid))
         adapter.send(channel_id, "\n".join(lines))
         return
-    found = adapter.search_video(arg)  # (videoId, 제목) | None
-    if found is None:
-        adapter.send(channel_id, f"추가 실패: '{arg}' 검색 결과가 없습니다.")
+    query, index = parse_add_index(arg)
+    candidates = adapter.search_candidates(query)  # [(videoId, 제목, 채널)] 최대 5건
+    picked = pick_index(candidates, index, query)
+    if picked is None:
+        if candidates:  # 후보는 있는데 '#N' 이 범위 밖 — 조용히 다른 곡으로 바꿔치지 않는다
+            n = len(candidates)
+            adapter.send(channel_id, f"추가 실패: #{index} 번 후보가 없습니다(1~{n})")
+        else:
+            adapter.send(channel_id, f"추가 실패: {escape_reply(query)} 검색 결과가 없습니다")
         return
-    video_id, _title = found
-    adapter.send(channel_id, _add_one_line(adapter, video_id))
+    line = _add_one_line(adapter, candidates[picked][0])
+    others = _add_candidates_block(query, candidates, picked)
+    adapter.send(channel_id, f"{line}\n{others}" if others else line)
 
 
 def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
@@ -5819,18 +6101,18 @@ def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
     """
     arg = _cmd_arg(text)
     if not arg:
-        adapter.send(channel_id, "삭제 실패: 지울 노래 제목을 주세요.")
+        adapter.send(channel_id, "삭제 실패: 지울 노래 제목을 주세요")
         return
     status, detail, video_id = youtube.remove_video(arg)
     if status == "removed":
-        line = f"🗑️ 삭제됨: {detail}"
+        line = f"🗑️ 삭제됨: {escape_reply(detail)}"
         dropped = adapter.dequeue_video(video_id)  # 재생 중이 아니면 0(no-op)
         if dropped > 0:
             line += f"\n(재생 큐에서 {dropped}곡 제거)"
     elif status == "none":
-        line = f"삭제 실패: '{arg}' 를 재생목록에서 못 찾았습니다."
+        line = f"삭제 실패: {escape_reply(arg)} 를 재생목록에서 못 찾았습니다"
     elif status == "many":
-        line = f"여러 곡이 걸립니다 — 더 정확히 적어주세요:\n{detail}"
+        line = f"여러 곡이 걸립니다 — 더 정확히 적어주세요:\n{escape_reply(detail, 250)}"
     else:
         line = f"삭제 실패: {detail}"
     adapter.send(channel_id, line)
@@ -5854,7 +6136,7 @@ def _handle_text(
         return
     if text == "":
         # 어댑터가 비지원 메시지(스티커 등, text 키 없음)를 text="" 로 정규화 → 안내.
-        adapter.send(channel_id, "텍스트 메시지만 처리합니다.")
+        adapter.send(channel_id, "텍스트 메시지만 처리합니다")
         return
     stripped = text.strip()
 
@@ -5923,6 +6205,14 @@ def _handle_text(
         adapter.send(channel_id, adapter.skip_music(channel_id))
         return
 
+    # 'ㅁ목록' — 재생목록 전곡 조회(읽기 전용). 여러 메시지로 나눠 보낸다.
+    # ㅁ삭제와 같이 인가 우회 대상이 **아니다**(_playlist_bypass 3조건 중 비용·회신 유계 위반) —
+    # 여기 도달하는 비인가 user 는 없다. 이 분기는 허용목록 user 전용.
+    if is_music_list(stripped):
+        log.info("chat=%s cmd=music list", channel_id)
+        _handle_music_list(adapter, channel_id)
+        return
+
     # 'ㅁ추가 <링크|검색어>' — 유튜브 재생목록("코딩")에 추가. 접두 매칭이라 별칭 해석·help 폴백
     # (아래 `cmd.startswith("ㅁ") and cmd not in COMMANDS → HELP`)보다 앞에 둔다.
     if is_music_add(stripped):
@@ -5943,7 +6233,7 @@ def _handle_text(
         log.info("chat=%s cmd=music play-one", channel_id)
         arg = _cmd_arg(stripped)
         if not arg:
-            adapter.send(channel_id, "재생 실패: 노래 제목을 주세요.")
+            adapter.send(channel_id, "재생 실패(노래 제목 필요)")
         else:
             adapter.send(channel_id, adapter.play_music(channel_id, event.user_id, query=arg))
         return
@@ -5985,7 +6275,7 @@ def _handle_text(
         ]
         for m in cleared:
             pending.pop(m, None)
-        note = "취소했습니다." if cleared else "취소할 작업이 없습니다."
+        note = "취소했습니다" if cleared else "취소할 작업이 없습니다"
         adapter.send(channel_id, note)
         return
     if cmd == "ㅁ재시작":
@@ -5999,7 +6289,7 @@ def _handle_text(
         log.info("chat=%s cmd=clean 확인요청", channel_id)
         adapter.send(
             channel_id,
-            "🧹 이 채널의 메시지를 전부 삭제할까요?\n되돌릴 수 없습니다.",
+            "🧹 이 채널의 메시지를 전부 삭제할까요?\n되돌릴 수 없습니다",
             [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "x", "")],
         )
         return
@@ -6008,7 +6298,7 @@ def _handle_text(
         channel_sessions.pop(channel_id, None)
         save_channel_sessions(CHANNEL_SESSIONS_FILE, channel_sessions)
         log.info("chat=%s cmd=new 세션 리셋", channel_id)
-        adapter.send(channel_id, "🆕 새 대화를 시작합니다.")
+        adapter.send(channel_id, "🆕 새 대화를 시작합니다")
         return
 
     # '오라클…' — 재고 잡이는 GitHub Actions(oci_arm_grabber)로 이관됨. gh 로 실행목록을
@@ -6060,7 +6350,7 @@ def _handle_text(
         names = list_projects(target_root)
         first = stripped.split(maxsplit=1)[0] if stripped else ""
         # 대상 목록은 버튼이 곧 목록이라 인라인 나열 생략 — 원인 한 줄만.
-        body = f"'{first}' 프로젝트를 찾지 못했습니다."
+        body = f"'{first}' 프로젝트를 찾지 못했습니다"
         # 보안: 사용자 입력 first 를 %r 로 로깅해 개행 위조(로그 포깅)를 차단.
         log.warning("chat=%s 알수없는 프로젝트=%r", channel_id, first)
         adapter.send(channel_id, body, project_buttons(names))
@@ -6703,8 +6993,25 @@ def _selftest() -> None:
     assert _is_playlist_command("ㅁ노래") and _is_playlist_command("ㅁ청소")
     assert _is_playlist_command("ㅁ추가 노래 제목") and not _is_playlist_command("잡담")
     assert not _is_playlist_command("ㅁ도움말")  # 다른 ㅁ명령은 무시 대상
-    assert _format_add_result(("added", "곡")) == "✅ 추가됨: 곡"
-    assert _format_add_result(("dup", "곡")) == "이미 있어요: 곡"
+    assert _is_playlist_command("ㅁ목록") and is_music_list("ㅁ 목록")  # 읽기 전용 조회
+    # '#N' 순번 지정(순수) — '#' 없는 숫자는 검색어의 일부다.
+    assert parse_add_index("낭만에 대하여 #2") == ("낭만에 대하여", 2)
+    assert parse_add_index("소녀시대 999") == ("소녀시대 999", 0)
+    # 검색 결과 필터 — 방송무대는 거르고 가사영상·커버는 통과(의도해서 넣는 유형).
+    assert is_stage_clip("좋은날 교차편집", "") and is_stage_clip("좋은날", "Mnet")
+    assert not is_stage_clip("[가사] 좋은날 Lyrics", "1theK")
+    assert not is_stage_clip("좋은날 cover by J.Fla")  # 커버·가사영상은 의도해서 넣는 유형
+    assert not is_stage_clip("Oasis - Live Forever")  # 'live' 단독은 곡명이다
+    assert not is_stage_clip('선미 "24시간이 모자라" M/V')  # 'N시간'은 루프 문맥이 있을 때만
+    assert is_stage_clip("좋은날 1시간 연속 재생")  # 루프 영상은 그대로 거른다
+    assert _format_add_result(("added", "곡")) == "✅ 추가됨: `곡`"
+    assert _format_add_result(("dup", "곡")) == "이미 있어요: `곡`"
+    # ★ 외부 문자열 이스케이프 — 제3자 유튜브 제목이 봇 명의 링크가 되는 것을 막는다.
+    assert escape_reply("[지금 확인](https://phish.example)") == (
+        "`[지금 확인](https://phish.example)`"
+    )
+    assert "`" not in escape_reply("a`b")[1:-1] and escape_reply("") == ""
+    assert escape_reply("@everyone\n@here") == "`@everyone@here`"
 
     # 게스트질문 인가 우회(순수 질문만)·격리 불변식.
     def _ge(text: str, kind: str = "text", role: str = _GUEST_ROLE) -> Event:

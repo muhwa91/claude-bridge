@@ -78,8 +78,9 @@ class FakeAdapter:
         dequeue=0,
     ):
         self.secrets = secrets if secrets is not None else []
-        self.searches = []  # search_video 로 넘어온 query 기록(yt-dlp 검색 스파이)
-        self._search = search  # search_video 반환값((videoId, 제목) | None) — 테스트 지정
+        self.searches = []  # search_candidates 로 넘어온 query 기록(yt-dlp 검색 스파이)
+        # search 는 후보 리스트 [(videoId, 제목, 채널)]. None 이면 무결과([]).
+        self._search = search
         self.enqueued = []  # enqueue_video 로 넘어온 (videoId, 제목) 기록(재생 큐 편입 스파이)
         self._enqueue = enqueue  # enqueue_video 반환값(편입 후 큐 곡수 int / no-op 0) — 테스트 지정
         self.dequeued = []  # dequeue_video 로 넘어온 videoId 기록('ㅁ삭제' 큐 제거 스파이)
@@ -157,9 +158,13 @@ class FakeAdapter:
         self.music.append(("skip", channel_id))
         return "⏭️ 다음"
 
-    def search_video(self, query):
+    def search_candidates(self, query):
         self.searches.append(query)
-        return self._search
+        return list(self._search or [])
+
+    def search_video(self, query, index=0):
+        pos = bridge.pick_index(self.search_candidates(query), index)
+        return None if pos is None else self._search[pos][:2]
 
     def enqueue_video(self, video_id, title):
         self.enqueued.append((video_id, title))
@@ -759,7 +764,7 @@ def test_git_status_note_no_ahead_dirty(monkeypatch):
         "_git",
         _fake_git({("rev-list",): (0, "0\n", ""), ("status",): (0, " M x.py\n", "")}),
     )
-    assert bridge.git_status_note(Path()) == "변경이 있으나 커밋되지 않았습니다(확인 필요)."
+    assert bridge.git_status_note(Path()) == "변경이 있으나 커밋되지 않았습니다(확인 필요)"
 
 
 def test_git_status_note_no_ahead_clean(monkeypatch):
@@ -768,7 +773,7 @@ def test_git_status_note_no_ahead_clean(monkeypatch):
         "_git",
         _fake_git({("rev-list",): (0, "0\n", ""), ("status",): (0, "", "")}),
     )
-    assert bridge.git_status_note(Path()) == "변경 없음."
+    assert bridge.git_status_note(Path()) == "변경 없음"
 
 
 def test_git_status_note_revlist_fail_fallback(monkeypatch):
@@ -777,7 +782,7 @@ def test_git_status_note_revlist_fail_fallback(monkeypatch):
         "_git",
         _fake_git({("rev-list",): (128, "", "fatal"), ("status",): (0, " M x.py\n", "")}),
     )
-    assert bridge.git_status_note(Path()) == "변경이 있으나 커밋되지 않았습니다(확인 필요)."
+    assert bridge.git_status_note(Path()) == "변경이 있으나 커밋되지 않았습니다(확인 필요)"
 
 
 def test_git_status_note_status_fail_fallback(monkeypatch):
@@ -786,7 +791,7 @@ def test_git_status_note_status_fail_fallback(monkeypatch):
         "_git",
         _fake_git({("rev-list",): (0, "0\n", ""), ("status",): (1, "", "fatal")}),
     )
-    assert bridge.git_status_note(Path()) == "변경 없음."
+    assert bridge.git_status_note(Path()) == "변경 없음"
 
 
 def test_do_push_pull_fail_aborts(monkeypatch):
@@ -1421,7 +1426,7 @@ def test_music_add_url_extracts_and_adds(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/dQw4w9WgXcQ", channel_role=_PL), target_root="root")
     assert called == ["dQw4w9WgXcQ"]
-    assert a.sent == [(777, "✅ 추가됨: Never Gonna Give You Up", None)]
+    assert a.sent == [(777, "✅ 추가됨: `Never Gonna Give You Up`", None)]
     assert a.searches == []  # 링크는 yt-dlp 검색 안 함
 
 
@@ -1456,13 +1461,13 @@ def test_music_add_playlist_link_rejected(monkeypatch):
 
 
 def test_music_add_search_query(monkeypatch):
-    # URL 이 아니면 yt-dlp ytsearch1 첫 결과 videoId 를 추가.
+    # URL 이 아니면 yt-dlp 검색 후보 중 필터가 고른 1건을 추가(후보 1건이면 후보 블록 없음).
     called = _add_env(monkeypatch, ("added", "아이유 좋은날"))
-    a = FakeAdapter(search=("vidsearch01", "아이유 좋은날"))
+    a = FakeAdapter(search=[("vidsearch01", "아이유 좋은날", "1theK")])
     _fire(a, _txt(777, "ㅁ추가 아이유 좋은날", channel_role=_PL), target_root="root")
     assert a.searches == ["아이유 좋은날"]
     assert called == ["vidsearch01"]
-    assert a.sent == [(777, "✅ 추가됨: 아이유 좋은날", None)]
+    assert a.sent == [(777, "✅ 추가됨: `아이유 좋은날`", None)]
 
 
 def test_music_add_search_no_result(monkeypatch):
@@ -1470,6 +1475,282 @@ def test_music_add_search_no_result(monkeypatch):
     a = FakeAdapter(search=None)  # 무결과
     _fire(a, _txt(777, "ㅁ추가 없는곡xyz"), target_root="root")
     assert any("검색 결과가 없" in t for _c, t, _b in a.sent)
+
+
+def test_music_add_skips_broadcast_stage_and_lists_candidates(monkeypatch):
+    """1위가 방송무대면 건너뛰고, 회신에 나머지 후보를 '#N' 재지정 안내와 함께 붙인다.
+
+    실측 근거: 2026-08-18 재생목록에서 관측한 11곡이 ytsearch1 1위를 그대로 받은
+    방송무대·팬편집이었다
+    (그 11곡은 같은 날 원곡 버전으로 교체돼 **지금 재생목록엔 없다** — bridge.py 상수 주석 참조).
+    """
+    called = _add_env(monkeypatch, ("added", "[가사] 좋은날"))
+    a = FakeAdapter(
+        search=[
+            ("v1", "좋은날 교차편집 stage mix", "someone"),
+            ("v2", "[가사] 좋은날", "1theK"),
+            ("v3", "좋은날 cover by J.Fla", "JFlaMusic"),
+        ]
+    )
+    _fire(a, _txt(777, "ㅁ추가 좋은날", channel_role=_PL), target_root="root")
+    assert called == ["v2"]  # 1위(교차편집)는 건너뛴다
+    text = a.sent[0][1]
+    assert text.startswith("✅ 추가됨: `[가사] 좋은날`")
+    assert "다른 후보 — ㅁ추가 `좋은날` #N" in text
+    assert " 1. `좋은날 교차편집 stage mix`" in text  # 번호는 검색 순번 그대로(= '#N' 인자)
+    assert " 3. `좋은날 cover by J.Fla`" in text
+    assert " 2. " not in text  # 고른 것은 후보 줄에서 뺀다
+
+
+def test_music_add_index_overrides_filter(monkeypatch):
+    # '#N' 은 필터를 무시하고 그 순번을 그대로 넣는다(사용자가 방송무대를 원할 수도 있다).
+    called = _add_env(monkeypatch, ("added", "좋은날 교차편집"))
+    a = FakeAdapter(search=[("v1", "좋은날 교차편집", "Mnet"), ("v2", "[가사] 좋은날", "1theK")])
+    _fire(a, _txt(777, "ㅁ추가 좋은날 #1", channel_role=_PL), target_root="root")
+    assert a.searches == ["좋은날"]  # '#1' 은 검색어에서 뗀다
+    assert called == ["v1"]
+
+
+def test_music_add_index_out_of_range(monkeypatch):
+    # 범위 밖 '#N' 은 조용히 다른 곡으로 바꿔치지 않고 실패로 알린다.
+    called = _add_env(monkeypatch)
+    a = FakeAdapter(search=[("v1", "좋은날", "1theK")])
+    _fire(a, _txt(777, "ㅁ추가 좋은날 #5", channel_role=_PL), target_root="root")
+    assert called == []
+    assert "#5 번 후보가 없습니다(1~1)" in a.sent[0][1]
+
+
+def test_music_add_all_filtered_falls_back_to_first(monkeypatch):
+    # 후보가 전부 걸리면 1위 폴백 — 요청은 '넣어달라'였으므로 추가 자체를 막지 않는다.
+    called = _add_env(monkeypatch, ("added", "무대1"))
+    a = FakeAdapter(search=[("v1", "무대1 직캠", "Mnet"), ("v2", "무대2 fancam", "KBS Kpop")])
+    _fire(a, _txt(777, "ㅁ추가 무대", channel_role=_PL), target_root="root")
+    assert called == ["v1"]
+
+
+def test_music_add_number_without_hash_stays_in_query(monkeypatch):
+    # 'ㅁ추가 소녀시대 999' 의 999 는 곡 제목의 일부지 순번이 아니다.
+    called = _add_env(monkeypatch, ("added", "소녀시대 999"))
+    a = FakeAdapter(search=[("v9", "소녀시대 999", "SM")])
+    _fire(a, _txt(777, "ㅁ추가 소녀시대 999", channel_role=_PL), target_root="root")
+    assert a.searches == ["소녀시대 999"]
+    assert called == ["v9"]
+
+
+def test_music_add_search_runs_once(monkeypatch):
+    # 후보 회신을 붙이려고 검색을 두 번 하지 않는다(곡당 1초씩 드는 경로).
+    _add_env(monkeypatch, ("added", "곡"))
+    a = FakeAdapter(search=[("v1", "곡", "ch"), ("v2", "곡2", "ch")])
+    _fire(a, _txt(777, "ㅁ추가 곡", channel_role=_PL), target_root="root")
+    assert len(a.searches) == 1
+
+
+def test_parse_add_index_pure():
+    assert bridge.parse_add_index("낭만에 대하여 #2") == ("낭만에 대하여", 2)
+    assert bridge.parse_add_index("  낭만에 대하여  #10 ") == ("낭만에 대하여", 10)
+    assert bridge.parse_add_index("소녀시대 999") == ("소녀시대 999", 0)
+    assert bridge.parse_add_index("BTS #하이라이트") == ("BTS #하이라이트", 0)  # 숫자만 순번
+    assert bridge.parse_add_index("아이유#2") == ("아이유#2", 0)  # 앞 공백 없으면 검색어의 일부
+    assert bridge.parse_add_index("#2") == ("#2", 0)  # 검색어가 없으면 순번이 아니다
+    # 🔴 1~99 만 순번. '#0' 을 순번으로 받으면 index==0(미지정)과 구분이 안 돼 조용히
+    # 「필터가 알아서 고름」이 된다 — '#100' 이 검색어에 남는 것과 같은 취급으로 통일한다.
+    assert bridge.parse_add_index("아이유 #0") == ("아이유 #0", 0)
+    assert bridge.parse_add_index("아이유 #00") == ("아이유 #00", 0)
+    assert bridge.parse_add_index("아이유 #100") == ("아이유 #100", 0)
+    assert bridge.parse_add_index("아이유 #99") == ("아이유", 99)
+    assert bridge.parse_add_index("아이유 #1") == ("아이유", 1)
+
+
+def test_stage_clip_filter_keeps_lyrics_and_covers():
+    """관측한 방송무대 유형은 거르고, 의도해서 넣는 가사영상·커버는 통과시킨다.
+
+    🔴 keep 목록 끝 3줄 = 2026-08-18 에 필터가 **진짜 곡을 거르던** 실사례다(4게이트 지적 3).
+    """
+    stage = [
+        ("[최초 공개] 좋은날", ""),
+        ("좋은날 교차편집 (Stage Mix)", ""),
+        ("좋은날 @2024 TOUR", ""),
+        ("좋은날 Choreography", ""),
+        ("좋은날 직캠 fancam", ""),
+        ("[DF LIVE] 좋은날", ""),
+        ("좋은날", "KBSKpop"),
+        ("좋은날", "Mnet TV"),
+        ("좋은날", "비긴어게인"),
+        ("좋은날", "방구석 콘서트"),
+        ("열린음악회 좋은날", ""),
+        ("유희열의 스케치북 - 좋은날", ""),
+        ("Mnet 라이브와이어 좋은날", ""),
+        # 좁힌 패턴이 여전히 잡아야 하는 것들(루프 영상·라이브 세션 문맥)
+        ("좋은날 1시간 연속 재생", ""),
+        ("[1시간/1hour] 좋은날", ""),
+        ("좋은날 10 hours loop", ""),
+        ("좋은날 (Live Clip)", ""),
+        ("좋은날 라이브 세션", ""),
+        ("아이유 - 좋은날 Live ver.", ""),
+    ]
+    for title, channel in stage:
+        assert bridge.is_stage_clip(title, channel), f"걸러야 함: {title!r}/{channel!r}"
+    keep = [
+        ("[가사] 아이유 - 좋은날", "1theK"),
+        ("IU - Good Day (Lyrics)", "Lyrics Vault"),
+        ("좋은날 cover by J.Fla", "JFlaMusic"),
+        ("좋은날 커버", "누군가"),
+        ("아이유 - 좋은날 (Official MV)", "1theK"),
+        ("Olivia - Alive", "OliviaOfficial"),  # 'live' 부분문자열이 \b 로 안 걸린다
+        # 🔴 2026-08-18 좁힌 것들 — 이 3줄이 「진짜 곡을 거르던」 실사례다.
+        ("[Official] DK (디셈버) - 행복하지 말아요 (Special Clip)", "리본 프로젝트"),
+        ("Oasis - Live Forever (Official HD Remastered Video)", "Oasis"),
+        ('선미 "24시간이 모자라" M/V', "JYP Entertainment"),
+    ]
+    for title, channel in keep:
+        assert not bridge.is_stage_clip(title, channel), f"통과해야 함: {title!r}/{channel!r}"
+
+
+def test_pick_index_pure():
+    cands = [("v1", "무대 직캠", "Mnet"), ("v2", "[가사] 곡", "1theK")]
+    assert bridge.pick_index(cands) == 1  # 필터가 1위를 건너뛴다
+    assert bridge.pick_index(cands, 1) == 0  # '#N' 은 필터 무시
+    assert bridge.pick_index(cands, 3) is None  # 범위 밖
+    assert bridge.pick_index([], 0) is None
+    assert bridge.pick_index([("v1", "직캠", "Mnet")]) == 0  # 전부 걸리면 1위 폴백
+
+
+def test_pick_index_query_disables_filter():
+    """검색어 자체가 규칙에 걸리면 필터를 끈다 — 그 낱말은 사용자가 직접 친 것이다."""
+    cands = [("v1", "선미 - 24시간이 모자라 1시간 연속 재생", "누군가"), ("v2", "무관한 영상", "x")]
+    assert bridge.pick_index(cands, 0, "24시간이 모자라 1시간 연속 재생") == 0  # 필터 OFF
+    assert bridge.pick_index(cands, 0, "") == 1  # query 없으면 종전대로 필터 ON
+    assert bridge.pick_index(cands, 0, "다른 곡") == 1  # 안 걸리는 검색어도 필터 ON
+    assert bridge.pick_index(cands, 2, "24시간") == 1  # '#N' 이 우선(필터·query 무관)
+
+
+def test_clean_track_title_basic():
+    """유튜브 제목 → 「아티스트 - 곡명」. 표시 전용(원본 제목은 어디서도 바뀌지 않는다)."""
+    assert bridge.clean_track_title("오반 (OVAN) - 행복 Happiness [Music Video]") == "오반 - 행복"
+    assert bridge.clean_track_title("아이유(IU) _ 좋은 날 Good Day") == "아이유 - 좋은 날"
+    assert bridge.clean_track_title("【MV】 태연 - 사계 Four Seasons") == "태연 - 사계"
+    assert bridge.clean_track_title("♬ 볼빨간사춘기 - 우주를 줄게 (가사)") == (
+        "볼빨간사춘기 - 우주를 줄게"
+    )
+    # 꼬리 슬래시 잡동사니 — 곡명까지 먹지 않는다.
+    assert bridge.clean_track_title("잔나비 - 주저하는 연인들을 위해 / Kpop / Lyrics") == (
+        "잔나비 - 주저하는 연인들을 위해"
+    )
+
+
+def test_clean_track_title_english_untouched():
+    """원래 영어 곡은 병기 제거(_drop_ascii_tail)를 적용하지 않는다 — 다 떼면 곡명이 빈다."""
+    assert bridge.clean_track_title("Can I Love ? (feat. youra, Meego)") == "Can I Love ?"
+    assert bridge.clean_track_title("Coldplay - Yellow") == "Coldplay - Yellow"
+
+
+def test_clean_track_title_fallback_on_empty():
+    """정리 결과가 비면 원본을 그대로 — 알림이 빈 줄로 나가지 않게."""
+    assert bridge.clean_track_title("") == ""
+    assert bridge.clean_track_title("   ") == "   "
+    assert bridge.clean_track_title("[Official MV]") == "[Official MV]"
+
+
+def test_clean_track_title_regressions_2026_08_18():
+    """🔴 실측 99곡에서 실제로 났던 사고 3건 — 되살아나면 여기서 죽는다."""
+    # ① 아티스트 조각에 _drop_ascii_tail 을 적용하면 'Florina' 가 소실됐다.
+    assert (
+        bridge.clean_track_title("어서 날아가렴, Florina - Va Va Vis")
+        == "어서 날아가렴, Florina - Va Va Vis"
+    )
+    # ② 꼬리 슬래시를 공백 없이도 잡으면 곡명 'O/W' 가 'O' 로 잘렸다.
+    assert bridge.clean_track_title("데이식스 - O/W") == "데이식스 - O/W"
+    # ③ 'ㅣ|' 분할에서 앞 조각만 취하면 곡명이 통째로 사라졌다.
+    assert (
+        bridge.clean_track_title("역주행 가능성 58000퍼센트 | 케이시 (Kassy) - 사진첩")
+        == "케이시 - 사진첩"
+    )
+
+
+def test_clean_track_title_regressions_2026_08_18_gate():
+    """4게이트 점검 5번 — 「A / B」 조각 선택·전각 문자·꼬리표 반복."""
+    # ① ' / ' 꼬리 제거가 **앞 조각**을 골라 곡명을 잃었다. 'ㅣ|' 와 같은 「A - B」 우선으로 통일.
+    assert bridge.clean_track_title("노래모음 / 케이시 (Kassy) - 사진첩") == "케이시 - 사진첩"
+    # 종전 동작(꼬리 홍보문구 절단)은 그대로여야 한다 — 「A - B」 조각이 앞에 있는 경우.
+    assert (
+        bridge.clean_track_title("잔나비 - 주저하는 연인들을 위해 / Kpop / Lyrics")
+        == "잔나비 - 주저하는 연인들을 위해"
+    )
+    # ② 전각 대괄호(U+FF3B/FF3D)·전각 세로줄(U+FF5C) 도 반각과 같이 다룬다.
+    assert bridge.clean_track_title("\uff3bMV\uff3d 태연 - 사계") == "태연 - 사계"
+    assert (
+        bridge.clean_track_title(
+            "역주행 가능성 58000퍼센트 " + chr(0xFF5C) + " 케이시 (Kassy) - 사진첩"
+        )
+        == "케이시 - 사진첩"
+    )
+    # ③ 꼬리표 제거가 1회만 돌아 '가사 해석' 에서 '가사' 가 남았다 — 반복 적용.
+    assert bridge.clean_track_title("아이유 - 좋은날 가사 해석") == "아이유 - 좋은날"
+    assert bridge.clean_track_title("아이유 - 좋은날 Lyrics 가사") == "아이유 - 좋은날"
+
+
+def test_escape_reply_blocks_markdown_mention_and_control_chars():
+    """★ 외부 문자열(제3자 유튜브 제목)이 봇 명의 서식으로 렌더되지 않는다."""
+    # ① 마크다운 링크 — 코드스팬 안이라 렌더되지 않는다(피싱 링크가 봇 명의로 게시되던 결함).
+    assert bridge.escape_reply("[지금 확인 →](https://phish.example)") == (
+        "`[지금 확인 →](https://phish.example)`"
+    )
+    # ② 백틱 — 남기면 코드스팬을 닫고 빠져나온다. 안쪽에 백틱이 한 개도 없어야 한다.
+    assert "`" not in bridge.escape_reply("a`b`c [x](y)")[1:-1]
+    # ③ 제어문자 — 개행으로 가짜 UI 를, RTL override 로 뒤집힌 글자를 만든다.
+    assert bridge.escape_reply("@everyone\n@here\u200b\u202e") == "`@everyone@here`"
+    assert bridge.escape_reply("가\r\n나") == "`가나`"
+    # ④ 길이 상한 — 회신 도배 차단. 빈 값은 '' 로 돌려 호출부의 「제목 없음」 분기를 살린다.
+    assert len(bridge.escape_reply("가" * 500)) == 102
+    assert bridge.escape_reply("") == "" and bridge.escape_reply("``") == ""
+
+
+def test_music_replies_escape_hostile_youtube_titles(monkeypatch):
+    """🔴 배선 단언 — 유튜브 제목은 **제3자 입력**이다. 어느 회신에도 날것으로 실리면 안 된다.
+
+    공격: 서버 멤버 누구나(ㅁ추가는 인가 우회) 제목이 마크다운 링크인 영상을 넣으면 봇 명의로
+    링크가 게시되고, ㅁ삭제는 인가가 필요해 공격자는 지우지도 못한다.
+    """
+    evil = "[지금 확인 →](https://phish.example)"
+    # ① 'ㅁ추가' 결과 + 다른 후보 블록
+    _add_env(monkeypatch, ("added", evil))
+    a = FakeAdapter(search=[("v1", evil, "ch"), ("v2", evil + "2", "ch")])
+    _fire(a, _txt(777, "ㅁ추가 곡", channel_role=_PL), target_root="root")
+    text = a.sent[0][1]
+    assert text.startswith("✅ 추가됨: `" + evil + "`")
+    assert " 2. `" + evil + "2`" in text
+    assert "](https" not in text.replace("`" + evil, "").replace(evil + "2`", "")
+    # ② 'ㅁ목록'
+    _list_env(monkeypatch, ("", [("v1", evil)]))
+    a2 = FakeAdapter()
+    _fire(a2, _txt(777, "ㅁ목록", channel_role=_PL), target_root="root")
+    assert a2.sent[0][1] == "🎵 재생목록 1곡\n1. `" + evil + "`"
+    # ③ 'ㅁ삭제' 결과
+    _del_env(monkeypatch, ("removed", evil, "v1"))
+    a3 = FakeAdapter(dequeue=0)
+    _fire(a3, _txt(777, "ㅁ삭제 곡", channel_role=_PL), target_root="root")
+    assert a3.sent == [(777, "🗑️ 삭제됨: `" + evil + "`", None)]
+
+
+def test_pack_lines_pure():
+    """참조가 1곳(ㅁ목록)뿐이라 직접 테스트가 없었다 — 현재 동작을 고정한다(회귀 방지)."""
+    assert bridge.pack_lines([], 100) == []  # 빈 목록
+    assert bridge.pack_lines(["짧다"], 100) == ["짧다"]
+    # 한 줄이 상한을 넘으면 자르지 않고 단독 메시지로 둔다(어댑터 chunk_text 가 마지막에 자른다).
+    assert bridge.pack_lines(["가" * 50], 10) == ["가" * 50]
+    assert bridge.pack_lines(["가" * 50, "나"], 10) == ["가" * 50, "나"]
+    # 정확히 상한 = 한 메시지(줄당 +1 은 개행 몫이라 마지막 줄에도 붙는다 — 상한 이하 보장).
+    assert bridge.pack_lines(["가" * 9], 10) == ["가" * 9]
+    # 합계 상한 ±1 — 경계에서만 갈린다. 합친 길이는 9자인데 한 칸을 더 요구한다(줄마다 개행 몫 +1 을
+    # 마지막 줄에도 세는 보수적 계산 — 그래서 결과는 항상 상한 **이하**다).
+    assert bridge.pack_lines(["가가가가", "나나나나"], 10) == ["가가가가\n나나나나"]
+    assert bridge.pack_lines(["가가가가", "나나나나"], 9) == ["가가가가", "나나나나"]
+    # limit<=0 — 무한루프 없이 줄마다 한 메시지.
+    assert bridge.pack_lines(["가", "나"], 0) == ["가", "나"]
+    assert bridge.pack_lines(["가", "나"], -5) == ["가", "나"]
+    # 모든 결과 메시지는 상한 이하(한 줄이 이미 상한을 넘는 경우 제외).
+    out = bridge.pack_lines([f"{i}. 곡" for i in range(1, 200)], 60)
+    assert all(len(m) <= 60 for m in out) and "\n".join(out).count("곡") == 199
 
 
 def test_music_add_empty_arg(monkeypatch):
@@ -1484,17 +1765,18 @@ def test_music_add_dedup_passthrough(monkeypatch):
     _add_env(monkeypatch, ("dup", "이미있는곡"))
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/ccccccccccc"), target_root="root")
-    assert a.sent == [(777, "이미 있어요: 이미있는곡", None)]
+    assert a.sent == [(777, "이미 있어요: `이미있는곡`", None)]
 
 
 def test_music_add_enqueues_when_playing(monkeypatch):
-    # 재생 중(enqueue_video>0) + 신규추가 → 유튜브 저장 + 큐 편입 + "▶️ Play - N곡"(N=큐 곡수).
+    # 재생 중(enqueue_video>0) + 신규추가 → 유튜브 저장 + 큐 편입 + "🔀 재생 큐에 편입 (N곡)".
+    # 🔴 접두를 'ㅁ노래' 회신(▶️ Play - N곡)과 달리 둔다 — 같은 모양이면 재생 시작으로 읽힌다.
     called = _add_env(monkeypatch, ("added", "새곡"))
     a = FakeAdapter(enqueue=30)
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/eeeeeeeeeee", channel_role=_PL), target_root="root")
     assert called == ["eeeeeeeeeee"]
     assert a.enqueued == [("eeeeeeeeeee", "새곡")]
-    assert a.sent == [(777, "✅ 추가됨: 새곡\n▶️ Play - 30곡", None)]
+    assert a.sent == [(777, "✅ 추가됨: `새곡`\n🔀 재생 큐에 편입 (30곡)", None)]
 
 
 def test_music_add_no_enqueue_suffix_when_not_playing(monkeypatch):
@@ -1503,7 +1785,7 @@ def test_music_add_no_enqueue_suffix_when_not_playing(monkeypatch):
     a = FakeAdapter(enqueue=0)
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/fffffffffff"), target_root="root")
     assert a.enqueued == [("fffffffffff", "새곡")]
-    assert a.sent == [(777, "✅ 추가됨: 새곡", None)]
+    assert a.sent == [(777, "✅ 추가됨: `새곡`", None)]
 
 
 def test_music_add_dup_does_not_enqueue(monkeypatch):
@@ -1512,7 +1794,7 @@ def test_music_add_dup_does_not_enqueue(monkeypatch):
     a = FakeAdapter(enqueue=30)
     _fire(a, _txt(777, "ㅁ추가 https://youtu.be/ggggggggggg"), target_root="root")
     assert a.enqueued == []  # dup → 편입 시도 안 함
-    assert a.sent == [(777, "이미 있어요: 이미있는곡", None)]
+    assert a.sent == [(777, "이미 있어요: `이미있는곡`", None)]
 
 
 def test_music_add_disallowed_user_blocked(monkeypatch):
@@ -1621,7 +1903,7 @@ def test_music_del_removed_and_dequeues(monkeypatch):
     _fire(a, _txt(777, "ㅁ삭제 좋은날", channel_role=_PL), target_root="root")
     assert called == ["좋은날"]
     assert a.dequeued == ["vidzzz"]
-    assert a.sent == [(777, "🗑️ 삭제됨: 아이유 좋은날\n(재생 큐에서 2곡 제거)", None)]
+    assert a.sent == [(777, "🗑️ 삭제됨: `아이유 좋은날`\n(재생 큐에서 2곡 제거)", None)]
 
 
 def test_music_del_removed_without_playback(monkeypatch):
@@ -1630,7 +1912,7 @@ def test_music_del_removed_without_playback(monkeypatch):
     a = FakeAdapter(dequeue=0)
     _fire(a, _txt(777, "ㅁ삭제 곡A"), target_root="root")
     assert a.dequeued == ["vidA"]
-    assert a.sent == [(777, "🗑️ 삭제됨: 곡A", None)]
+    assert a.sent == [(777, "🗑️ 삭제됨: `곡A`", None)]
 
 
 def test_music_del_none_match(monkeypatch):
@@ -1638,7 +1920,7 @@ def test_music_del_none_match(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ삭제 없는곡"), target_root="root")
     assert a.dequeued == []  # 못 찾았으면 큐도 안 건드린다
-    assert a.sent == [(777, "삭제 실패: '없는곡' 를 재생목록에서 못 찾았습니다.", None)]
+    assert a.sent == [(777, "삭제 실패: `없는곡` 를 재생목록에서 못 찾았습니다", None)]
 
 
 def test_music_del_many_matches_does_not_delete(monkeypatch):
@@ -1647,7 +1929,7 @@ def test_music_del_many_matches_does_not_delete(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ삭제 곡"), target_root="root")
     assert a.dequeued == []
-    assert a.sent == [(777, "여러 곡이 걸립니다 — 더 정확히 적어주세요:\n곡1 / 곡2", None)]
+    assert a.sent == [(777, "여러 곡이 걸립니다 — 더 정확히 적어주세요:\n`곡1 / 곡2`", None)]
 
 
 def test_music_del_fail_reason(monkeypatch):
@@ -1662,7 +1944,7 @@ def test_music_del_empty_arg(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ삭제", channel_role=_PL), target_root="root")
     assert called == []  # 네트워크 호출 없이 안내만
-    assert a.sent == [(777, "삭제 실패: 지울 노래 제목을 주세요.", None)]
+    assert a.sent == [(777, "삭제 실패: 지울 노래 제목을 주세요", None)]
 
 
 def test_music_play_one_delegates_with_query():
@@ -1676,7 +1958,86 @@ def test_music_play_one_empty_arg():
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ재생"), target_root="root")
     assert a.music == []  # 위임 전에 막는다
-    assert a.sent == [(777, "재생 실패: 노래 제목을 주세요.", None)]
+    assert a.sent == [(777, "재생 실패(노래 제목 필요)", None)]
+
+
+def _list_env(monkeypatch, result=("", [("v1", "곡1"), ("v2", "곡2")])):
+    """youtube.list_titles 를 목으로 대체(네트워크 차단). 호출 횟수 리스트를 반환한다."""
+    calls = []
+
+    def fake_list():
+        calls.append(1)
+        return result
+
+    monkeypatch.setattr(bridge.youtube, "list_titles", fake_list)
+    return calls
+
+
+def test_music_list_numbers_all_songs(monkeypatch):
+    _list_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ목록", channel_role=_PL), target_root="root")
+    assert a.sent == [(777, "🎵 재생목록 2곡\n1. `곡1`\n2. `곡2`", None)]
+
+
+def test_music_list_splits_into_several_messages(monkeypatch):
+    """99곡은 디스코드 2000자를 넘는다 — 잘림 없이 여러 메시지로 나가야 한다."""
+    songs = [(f"v{i}", f"아주 긴 제목의 노래 {i} " + "가" * 40) for i in range(1, 100)]
+    _list_env(monkeypatch, ("", songs))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ목록", channel_role=_PL), target_root="root")
+    assert len(a.sent) > 1  # 한 메시지에 다 담기지 않는다
+    joined = "\n".join(t for _c, t, _b in a.sent)
+    for i, (_vid, title) in enumerate(songs, 1):
+        assert f"{i}. `{title}`" in joined  # 전곡이 잘림 없이 들어간다
+    assert all(len(t) <= bridge.MUSIC_LIST_MSG_LIMIT for _c, t, _b in a.sent)
+
+
+def test_music_list_empty_and_failure(monkeypatch):
+    _list_env(monkeypatch, ("", []))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ목록", channel_role=_PL), target_root="root")
+    assert a.sent == [(777, "재생목록이 비어 있습니다", None)]
+    _list_env(monkeypatch, ("OAuth 자격증명 없음", []))
+    a2 = FakeAdapter()
+    _fire(a2, _txt(777, "ㅁ목록", channel_role=_PL), target_root="root")
+    assert a2.sent == [(777, "목록 실패: OAuth 자격증명 없음", None)]
+
+
+def test_music_list_is_playlist_command_and_bypasses(monkeypatch):
+    """플레이리스트 채널 라우팅에 없으면 그 채널에서 조용히 무시된다(HELP 폴백도 안 뜬다)."""
+    assert bridge._is_playlist_command("ㅁ목록")  # 라우팅은 열려 있다(개발자가 그 채널서 쓴다)
+    # 🔴 2026-08-18 운영자 결정 — 인가 우회에서 **뺐다**. 회신 크기·내용이 둘 다 공격자
+    # 조종 하에 있어(_playlist_bypass 3조건 중 2·3 위반) 비인가 멤버의 반복 호출이
+    # 단일 스레드 코어를 다중 페이지 API + 다중 메시지로 막는다.
+    assert not bridge._playlist_bypass(_txt(999, "ㅁ목록", channel_role=_PL))
+    calls = _list_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(999, "ㅁ목록", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert calls == [] and a.sent == []  # 비인가 멤버는 무회신(youtube 호출도 없다)
+
+
+def test_music_list_not_help_fallthrough(monkeypatch):
+    _list_env(monkeypatch)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ목록"), target_root="root")
+    assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
+
+
+def test_youtube_list_titles_drops_item_id(monkeypatch):
+    # 공개 표면은 (videoId, 제목) — playlistItem id(삭제 전용)는 노출하지 않는다.
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(youtube, "_list_items", lambda _a: [("item1", "vid1", "제목1")])
+    assert youtube.list_titles() == ("", [("vid1", "제목1")])
+
+
+def test_youtube_list_titles_failure_reason(monkeypatch):
+    def boom():
+        raise OSError("refresh failed")
+
+    monkeypatch.setattr(youtube, "_get_access", boom)
+    reason, items = youtube.list_titles()
+    assert items == [] and reason and "refresh failed" not in reason
 
 
 def test_music_del_and_play_one_not_help_fallthrough(monkeypatch):
@@ -1881,6 +2242,7 @@ def test_playlist_bypass_excludes_destructive_delete():
     """
     assert bridge._is_playlist_command("ㅁ삭제 x")  # 라우팅 ○ (안 넣으면 개발자도 못 쓴다)
     assert not bridge._playlist_bypass(_txt(999, "ㅁ삭제 x", channel_role=_PL))  # 인가 우회 ✗
+    assert not bridge._playlist_bypass(_txt(999, "ㅁ목록", channel_role=_PL))  # 비용·회신 무계
     assert bridge._is_playlist_command("ㅁ재생 x")
     assert bridge._playlist_bypass(_txt(999, "ㅁ재생 x", channel_role=_PL))  # 재생 제어는 우회 ○
 
@@ -2507,7 +2869,7 @@ def test_button_push_calls_do_push_and_edits(cb_env, tmp_path):
 def test_button_cancel_edits_message(cb_env, tmp_path):
     _fire(cb_env, _btn(777, "x"), repo_root=tmp_path, target_root=str(tmp_path))
     assert cb_env.pushes == []
-    assert cb_env.edited[0][2] == "취소했습니다."
+    assert cb_env.edited[0][2] == "취소했습니다"
 
 
 def test_button_push_no_message_id_send_fallback(cb_env, tmp_path):
@@ -3530,7 +3892,7 @@ def test_button_nb_confirm_refuses_expired_observation(record_env, monkeypatch, 
     _freeze_now(monkeypatch, _at(9, 30))
     _seed_verdict("a", "pass", "3경로 일치", when=_at(8, 45))  # 45분 전
     _fire(adapter, _btn(777, "nb:confirm", "a"), repo_root=tmp_path, target_root=str(tmp_path))
-    assert adapter.edited[-1][2] == "카드가 만료됐습니다 — 다시 확인해 주세요."
+    assert adapter.edited[-1][2] == "카드가 만료됐습니다 — 다시 확인해 주세요"
     assert [it["id"] for it in bridge.load_schedules(bridge.SCHEDULES_FILE)] == ["a"]
     assert commits == []
     # 거부는 카드를 갈아끼우므로 **다시 시작할 버튼을 함께 준다**(막다른 길 방지).
@@ -3545,7 +3907,7 @@ def test_button_nb_handoff_refuses_expired_observation(record_env, monkeypatch, 
     _freeze_now(monkeypatch, _at(10, 0, day=12))
     _seed_verdict("a", "fail", "어제 사유", when=_at(8, 45, day=12))  # 75분 전(TTL 30분)
     _fire(adapter, _btn(777, "nb:handoff", "a"), repo_root=tmp_path, target_root=str(tmp_path))
-    assert adapter.edited[-1][2] == "카드가 만료됐습니다 — 다시 확인해 주세요."
+    assert adapter.edited[-1][2] == "카드가 만료됐습니다 — 다시 확인해 주세요"
     assert nb.read_text(encoding="utf-8") == _BOOT_MD  # 미변경
     assert commits == []
     assert adapter.edited[-1][3] == bridge.notify_buttons("a")  # 막다른 길 방지
@@ -4758,7 +5120,7 @@ def test_handle_text_skips_git_note_when_choice_rendered(monkeypatch, tmp_path):
         lambda *_a, **_k: {"is_error": False, "result": "ok", "choice_rendered": True},
     )
     note_calls = []
-    monkeypatch.setattr(bridge, "git_status_note", lambda _r: note_calls.append(1) or "변경 없음.")
+    monkeypatch.setattr(bridge, "git_status_note", lambda _r: note_calls.append(1) or "변경 없음")
     monkeypatch.setattr(bridge, "git_ahead", lambda _r: 0)
     fa = FakeAdapter(secrets=[])
     _fire(fa, _txt(777, "etf_info 뭐 골라줘"), repo_root=tmp_path, target_root=str(tmp_path))
@@ -4815,7 +5177,7 @@ def sel_env(monkeypatch):
         return {"is_error": False, "result": "ok"}
 
     monkeypatch.setattr(bridge, "run_claude_with_progress", fake_run)
-    monkeypatch.setattr(bridge, "git_status_note", lambda _r: "변경 없음.")
+    monkeypatch.setattr(bridge, "git_status_note", lambda _r: "변경 없음")
     monkeypatch.setattr(bridge, "git_ahead", lambda _r: 0)
     yield fa
     bridge.chat_selection.clear()

@@ -166,9 +166,22 @@ class Adapter(Protocol):
         """현재 곡을 건너뛰고 다음 곡 재생(디스코드 전용). 회신 문자열 반환. 타 어댑터 미지원."""
         ...
 
-    def search_video(self, query: str) -> tuple[str, str] | None:
-        """'ㅁ추가 <검색어>' 용 유튜브 검색(yt-dlp ytsearch1) — 첫 결과 (videoId, 제목). 무결과·
-        실패는 None. yt-dlp 는 어댑터에만 격리되므로 코어는 이 capability 로 위임한다(음악과 동일).
+    def search_candidates(self, query: str) -> list[tuple[str, str, str]]:
+        """유튜브 검색 후보 최대 5건 (videoId, 제목, 채널). 무결과·실패는 []. 네트워크 1회.
+
+        채널명을 함께 준다 — 코어의 선택 필터(bridge.is_stage_clip)가 «채널 + 제목» 두 규칙으로
+        방송무대·팬편집을 거르기 때문이다(그래서 (videoId, 제목) 2튜플로는 부족하다).
+        선택(필터·순번)은 코어의 순수 함수 몫이고 어댑터는 검색만 한다.
+        """
+        ...
+
+    def search_video(self, query: str, index: int = 0) -> tuple[str, str] | None:
+        """'ㅁ재생' 폴백용 단건 검색 — (videoId, 제목). 무결과·실패·범위 밖은 None.
+
+        `index > 0` 이면 필터를 무시하고 그 순번(1-based)을 그대로 준다. 0 이면 코어 필터가
+        고른 결과. search_candidates + bridge.pick_index 의 조합이라 검색은 여전히 1회다.
+        구현은 query 도 pick_index 에 넘겨야 한다 — 검색어 자체가 필터 규칙에 걸리는 경우
+        (`Live Forever`·`24시간이 모자라`)에 필터를 끄기 위함이다.
         """
         ...
 

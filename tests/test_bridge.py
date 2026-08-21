@@ -9628,6 +9628,23 @@ def test_yt_backlog_records_only_adopted(tmp_path, monkeypatch):
     assert "- 기존 항목" in body  # 기존 내용 보존
 
 
+def test_yt_backlog_anchors_on_heading_not_prose_quote(tmp_path, monkeypatch):
+    """머리말이 `## 열린/미결 항목` 을 백틱으로 인용해도 **진짜 제목**에 붙는다.
+
+    2026-08-21 실사고 — substring 검색이 머리말 인용을 먼저 잡아 그 문장을 한가운데서
+    쪼갰다. 이 문서는 헌법이 개편 정본으로 지정해 **다음 세션이 판단 근거로 읽는다.**
+    """
+    f = tmp_path / "b.md"
+    prose = "> 아래쪽 `## 열린/미결 항목` 절은 아직 안 끝난 것을 모아두는 자리다.\n"
+    f.write_text("# x\n\n" + prose + "\n## 열린/미결 항목\n\n- 기존 항목\n", encoding="utf-8")
+    monkeypatch.setattr(bridge, "BACKLOG_FILE", f)
+    picks = bridge.parse_yt_picks(_YT_PICKS_TXT)
+    bridge.append_yt_backlog("2026-08-16", picks, bridge.parse_yt_judgement(_YT_JUDGE_TXT))
+    body = f.read_text(encoding="utf-8")
+    assert prose in body, "머리말 문장이 쪼개졌다"
+    assert body.index("### 2026-08-16") > body.index("\n## 열린/미결 항목")
+
+
 # ── 축 정규화·필터(`_yt_by_axis`) 회귀 ────────────────────────────────────────
 # 판정 축이 선발 축과 어긋나는 순간 **한 회차가 서로 다른 말을 한다** — 네 소비처(문서 MD·
 # 카드·Dev_log·백로그)가 같은 맵 하나만 보는지 확인한다.

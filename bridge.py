@@ -4275,8 +4275,13 @@ def append_yt_backlog(day: str, picks: list[dict[str, Any]], judged: list[dict[s
         lines.append(f"- **[{axis}] {what}** — {how} (출처: 「{title}」)")
     try:
         cur = BACKLOG_FILE.read_text(encoding="utf-8")
-        anchor = "## 열린/미결 항목"
-        i = cur.index(anchor) + len(anchor)
+        # 🔴 라인 앵커 필수 — 머리말이 `## 열린/미결 항목` 을 **백틱으로 인용**하고 있어
+        # 단순 substring 은 그 인용을 먼저 잡고 **머리말 문장 한가운데를 쪼갠다**(2026-08-21 실사고).
+        # 같은 파일 `_BACKLOG_OPEN_RE` 는 처음부터 `re.M` 라인 앵커였다 — 이쪽만 빠져 있었다.
+        m = re.search(r"^## 열린/미결 항목.*$", cur, re.M)
+        if m is None:
+            raise ValueError("열린/미결 항목 절 없음")
+        i = m.end()
         BACKLOG_FILE.write_text(cur[:i] + "\n" + "\n".join(lines) + cur[i:], encoding="utf-8")
     except (OSError, ValueError) as e:
         log.warning("백로그 기재 실패(%s) — 채택분은 PDF 에만 남는다", type(e).__name__)

@@ -10219,11 +10219,28 @@ def test_yt_digest_survives_undecodable_stamp(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "t.md")
     monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "p.txt")
+    monkeypatch.setattr(bridge.shutil, "which", lambda _n: "claude")  # 없는 머신의 조기 return 차단
     bridge.YT_TODAY_F.write_text("# 유튜브 후보 — 2026-08-16\n■ 자동 선발 0건\n", encoding="utf-8")
     bridge.YT_POSTED_F.write_bytes(b"\xff\xfe# \xec\x98\x9b \xed\x9b\x84\xeb\xb3\xb4 2026-01-01\n")
     a = FakeAdapter()
     assert bridge.run_yt_digest(a, 7, "2026-08-16") is True
     assert bridge.YT_POSTED_F.read_text(encoding="utf-8").strip() == "# 유튜브 후보 — 2026-08-16"
+
+
+def test_yt_digest_survives_undecodable_picks_file(monkeypatch, tmp_path):
+    """선발 파일(`YT_TODAY_F`)이 비UTF-8 이어도 False 로 떨어진다 — 형제 누수.
+
+    스탬프 쪽(위 테스트)과 달리 **여기서 새면 run_yt_digest 밖으로 전파**돼 반환조차 못 한다.
+    `--daily` 는 INTERVAL_DAYS 간격에만 이 파일을 다시 쓰므로 최대 그 기간 내내 고장난다.
+    ⚠️ `shutil.which` 패치 필수 — claude 없는 머신은 파손을 읽기 전에 True 로 나가 검증이 죽는다.
+    """
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "t.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "p.txt")
+    monkeypatch.setattr(bridge.shutil, "which", lambda _n: "claude")
+    bridge.YT_TODAY_F.write_bytes(b"\xff\xfe# \xec\x98\x9b \xed\x9b\x84\xeb\xb3\xb4 2026-01-01\n")
+    a = FakeAdapter()
+    assert bridge.run_yt_digest(a, 7, "2026-08-16") is False  # 다음 틱 재시도
+    assert not a.sent
 
 
 def test_yt_digest_runs_end_to_end_with_valid_tool_tier(monkeypatch, tmp_path):

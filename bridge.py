@@ -3736,10 +3736,13 @@ def run_yt_digest(adapter: Adapter, channel_id: int, today: str) -> bool:
         text = YT_TODAY_F.read_text(encoding="utf-8")
     except FileNotFoundError:
         return True  # 아직 한 번도 안 돌았다(첫 세션)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         # ⚠️ FileNotFoundError 만 «첫 세션»이다. 종전엔 OSError 를 통째로 True 로 돌려
         # 권한·락 오류까지 «낼 것이 없다»로 삼켰다 — 파일이 계속 못 읽히는 상태여도
         # **영구히 성공으로 보고**돼 로그 한 줄 없이 파이프라인이 죽어 있는다.
+        # ValueError(=UnicodeDecodeError ⊄ OSError)를 함께 잡는 이유는 아래 YT_POSTED_F 주석.
+        # 여기만의 차이 — 아래는 새도 그냥 지나가지만 **여기서 새면 러너 밖으로 전파된다**
+        # (False 반환조차 못 한다). `--daily` 는 INTERVAL_DAYS 간격에만 이 파일을 다시 쓴다.
         log.warning("유튜브 선발 파일을 못 읽었다(%s) — 다음 틱 재시도", type(e).__name__)
         return False
     stamp = text.split("\n", 1)[0].strip()
@@ -6387,7 +6390,8 @@ def run_spotify_monthly(adapter: Adapter, channel_id: int, today: str) -> bool:
         # 파일에 비UTF-8 바이트가 한 번 들어가면 여기서 예외가 새어 _run_digest 가 삼키고(3회 재시도
         # 뒤 그날 포기) **덮어쓰는 경로에 영영 도달하지 못해** 다음 달도 그 다음 달도 고장난다.
         # 디코드 실패 = 파손된 스탬프 = 다시 담아야 정상이므로 「못 읽었다」와 같게 취급한다.
-        # (같은 형태가 run_yt_digest 의 YT_POSTED_F 읽기에도 있었다 — 2026-08-26 함께 고쳤다.)
+        # (같은 형태가 run_yt_digest 의 두 읽기(YT_TODAY_F·YT_POSTED_F)에도 있었다 —
+        #  2026-08-26 함께 고쳤다.)
         log.warning(
             "스포티파이 월 스탬프를 못 읽었다(%s) — 이번 달에 또 담을 수 있다", type(e).__name__
         )

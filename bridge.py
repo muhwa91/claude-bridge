@@ -18,6 +18,7 @@ discord_adapter.py)이 흡수하고, 이 코어는 정규화 `Event`/`Button` �
 from __future__ import annotations
 
 import contextlib
+import html
 import http.client
 import itertools
 import json
@@ -134,6 +135,10 @@ MUSIC_DEL_WORDS = frozenset({"ㅁ삭제"})
 MUSIC_PLAY_ONE_WORDS = frozenset({"ㅁ재생"})
 # 'ㅁ목록' — 재생목록 전곡 조회(읽기 전용·인자 없음). music_action 과 같은 공백접기 정확매칭.
 MUSIC_LIST_WORDS = frozenset({"ㅁ목록"})
+# 'ㅁ스포티파이' — kworb 미러의 스포티파이 주간차트 3개(글로벌·일본·한국) 상위 30곡씩을 한 번에
+# 재생목록에 담는다. ㅁ목록과 같은 단독 정확매칭(인자 없음). ⚠️ 90곡을 밀어넣는 명령이라
+# _playlist_bypass 우회에서 **뺀다**(ㅁ삭제·ㅁ목록과 같은 취급 — 허용목록 user 전용).
+MUSIC_SPOTIFY_WORDS = frozenset({"ㅁ스포티파이"})
 
 
 def music_action(text: str) -> str | None:
@@ -194,6 +199,11 @@ def is_music_play_one(text: str) -> bool:
 def is_music_list(text: str) -> bool:
     """'ㅁ목록' 여부(공백접기 정확매칭 — 인자 없는 명령). 재생목록 전곡을 번호·제목으로 회신."""
     return "".join(text.split()).casefold() in MUSIC_LIST_WORDS
+
+
+def is_music_spotify(text: str) -> bool:
+    """'ㅁ스포티파이' 여부(공백접기 정확매칭 — 인자 없는 명령). 'ㅁ스포티파이곡'은 미발동."""
+    return "".join(text.split()).casefold() in MUSIC_SPOTIFY_WORDS
 
 
 # ── 'ㅁ추가 <검색어>' 검색 결과 선택(순수 — 네트워크는 어댑터 몫) ─────────────────
@@ -1715,10 +1725,14 @@ US_DIGEST_NOTIFY_ID = "us-digest"  # 미국주식 다이제스트(#미국주식)
 # ② 테스트가 `monkeypatch.setattr(bridge, "run_opensource_digest", …)` 로 갈아끼우는데
 # 객체를 잡아두면 그 교체가 안 먹는다(늦은 바인딩이 필요).
 YT_NOTIFY_ID = "yt-digest"  # 유튜브 후보(#유튜브dev) — 배선 공용, 러너만 다르다
+# 월 1회 스포티파이 주간차트 담기(#playlist). 다이제스트는 아니지만 «세션마다 후보 → 러너가
+# 판정» 이라는 배선이 똑같아 같은 맵을 탄다(스케줄러를 새로 들이지 않는다).
+SPOTIFY_NOTIFY_ID = "spotify-monthly"
 DIGEST_RUNNERS: dict[str, str] = {
     DIGEST_NOTIFY_ID: "run_opensource_digest",
     US_DIGEST_NOTIFY_ID: "run_us_digest",
     YT_NOTIFY_ID: "run_yt_digest",
+    SPOTIFY_NOTIFY_ID: "run_spotify_monthly",
 }
 DIGEST_MIN_STARS = 300  # **대형 축** 1차 거르기 하한(⭐) — 신흥 축은 아래 속도 필터가 대신한다
 # ── 속도(velocity) 필터 — 신흥 축의 ⭐하한을 대체한다(2026-08-11) ────────────
@@ -1859,7 +1873,11 @@ DIGEST_SYSTEM_PROMPT = (
 )
 # 외부 조회 host allowlist. 전체 URL 인자를 받지 않고 **고정 host + 경로/쿼리**만 받아 조립한다
 # (SSRF 차단 — fetch_rest_probe 와 동형). GET 고정·타임아웃·실패는 조용히 스킵.
-_DIGEST_HOSTS = frozenset({"api.github.com", "raw.githubusercontent.com", "hn.algolia.com"})
+# ⚠️ 이름은 '다이제스트'지만 **이 프로젝트의 유일한 allowlist GET** 이라 다이제스트 밖에서도 쓴다
+# (kworb.net = 'ㅁ스포티파이' 의 차트 미러 — 새 fetch 헬퍼를 만드는 대신 이 경로를 공유한다).
+_DIGEST_HOSTS = frozenset(
+    {"api.github.com", "raw.githubusercontent.com", "hn.algolia.com", "kworb.net"}
+)
 _DIGEST_TIMEOUT = 8  # 초
 _DIGEST_MAXBYTES = 300_000  # 응답 읽기 상한(거대 README·검색결과 방어)
 _DIGEST_README_MAXLEN = 2000  # README 발췌 상한(프롬프트 비대 방지 — _REST_PROBE_MAXLEN 사상)
@@ -4981,6 +4999,8 @@ HELP_TEXT = (
     "ㅁ재생 <제목> 은 그 곡을 지금 틀고(목록에 없으면 유튜브에서 찾아 한 번 재생), "
     "ㅁ삭제 <제목> 은 재생목록에서 그 곡을 뺍니다.\n"
     "ㅁ목록 은 재생목록 전곡을 번호·제목으로 보여줍니다.\n"
+    "ㅁ스포티파이 는 스포티파이 월간차트(글로벌·일본·한국) 상위 30곡씩을 한 번에 담습니다"
+    "(약 7분 소요 — 끝나면 추가·중복·실패 곡수를 알려줍니다).\n"
     "ㅁ추가 <검색어> #N 은 검색 결과 N번째를 넣습니다(번호는 검색 순번). "
     "번호를 안 주면 방송무대·교차편집·직캠을 걸러 고릅니다.\n"
     "\n"
@@ -5981,9 +6001,9 @@ def _find_awaiting(channel_id: int, user_id: int) -> tuple[int, dict[str, Any]] 
 
 
 def _is_playlist_command(text: str) -> bool:
-    """플레이리스트 채널 화이트리스트: ㅁ노래·정지·다음·청소·추가·삭제·재생·목록(순수).
+    """플레이리스트 채널 화이트리스트: ㅁ노래·정지·다음·청소·추가·삭제·재생·목록·스포티파이(순수).
 
-    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one/list)와 정확히 같은 조건이어야 —
+    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one/list/spotify)와 같은 조건이어야 —
     게이트만 통과하고 아래 분기에 안 걸리면 HELP 폴백이 새어 채널에 안내가 뜬다(§ 무반응 계약).
     ⚠️ 이건 **라우팅**(그 채널에서 처리되는가)이지 인가가 아니다 — ㅁ삭제도 여기선 True 여야 개발자가
     그 채널에서 쓸 수 있다. 비인가 멤버 차단은 _playlist_bypass 가 따로 한다.
@@ -5996,6 +6016,7 @@ def _is_playlist_command(text: str) -> bool:
         or is_music_del(stripped)
         or is_music_play_one(stripped)
         or is_music_list(stripped)
+        or is_music_spotify(stripped)
     )
 
 
@@ -6005,7 +6026,7 @@ def _playlist_bypass(event: Event) -> bool:
     True 를 반환할 때만 handle_event 가 비인가 user_id 를 통과시킨다(서버 멤버 누구나 음악 제어,
     개발자 결정). 조건을 의도적으로 좁게 유지한다:
       · (channel_role == "playlist")  AND
-      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제·ㅁ목록은 뺀다**
+      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제·ㅁ목록·ㅁ스포티파이는 뺀다**
         button → clean:ok/x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
 
     🔴 **우회 판정 3조건** — 셋을 모두 지키는 명령만 넣는다(하나라도 어기면 뺀다):
@@ -6013,13 +6034,16 @@ def _playlist_bypass(event: Event) -> bool:
       2. **비용 유계** — 공격자가 반복해도 처리량이 그 명령의 상수배를 넘지 않는다
       3. **회신 유계** — 회신 건수·크기가 공격자 조종 하에 있지 않다
 
-    ⚠️ 빠져 있는 둘:
+    ⚠️ 빠져 있는 셋:
       · **ㅁ삭제** — 1 위반(파괴적). 허용목록 유저(is_allowed)만 쓴다.
+      · **ㅁ스포티파이** — 1·2 위반. 한 번에 **90곡**을 재생목록에 밀어넣고(되돌리려면 ㅁ삭제를
+        90번 쳐야 한다), 명령 1건이 유튜브 검색 90회 + Data API 왕복 90회를 태워 단일 스레드
+        코어를 수 분간 점유한다. 아무나 반복할 수 있으면 안 된다(2026-08-25 신설).
       · **ㅁ목록** — 2·3 위반(2026-08-18 운영자 결정). 비인가 멤버가 ㅁ추가로 목록을 불린 뒤
         ㅁ목록을 반복하면 **회신 크기와 내용이 둘 다 공격자 손 안에** 있고, 단일 스레드 코어가
         다중 페이지 API + 다중 메시지를 동기로 처리해 브리지 전체가 막힌다. 상한·캐시를 다는
         대신 우회에서 빼는 것이 최소 수정이다.
-    둘 다 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
+    셋 다 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
     무반응이다. ㅁ재생은 ㅁ노래·ㅁ다음과 같은 급(재생 제어)이고 회신이 한 줄이라 3조건을 지킨다.
     그 외(다른 채널·비화이트리스트 텍스트·사진·위험명령 ㅁ프로젝트/ㅁ푸시/ㅁ재시작/일반 실행)는
     False → 기존 is_allowed 인가 그대로. 위험명령은 플레이리스트 게이트가 이미 무시하므로 비인가
@@ -6029,7 +6053,7 @@ def _playlist_bypass(event: Event) -> bool:
         return False
     if event.kind == "text":
         return _is_playlist_command(event.text) and not (
-            is_music_del(event.text) or is_music_list(event.text)
+            is_music_del(event.text) or is_music_list(event.text) or is_music_spotify(event.text)
         )
     if event.kind == "button":
         return event.action in ("clean:ok", "x")
@@ -6065,17 +6089,26 @@ def _format_add_result(result: tuple[str, str], channel: str = "") -> str:
     return f"추가 실패({detail})"
 
 
-def _add_one_line(adapter: Adapter, video_id: str, channel: str = "") -> str:
-    """영상 1건 추가 + (신규추가 & 재생 중이면) 재생 큐 실시간 편입. 회신 한 줄.
+def _add_one(adapter: Adapter, video_id: str) -> tuple[str, str]:
+    """영상 1건 추가 + (신규추가 & 재생 중이면) 재생 큐 실시간 편입. youtube.add_video 결과 그대로.
 
     중복(dup)은 이미 재생목록에 있어 큐에도 있으므로 편입 안 함. 재생 중 아니면 enqueue_video 가
     no-op(0) → 어차피 다음 ㅁ노래에 자연 포함된다.
-    🔴 편입 결과는 **회신에 싣지 않는다**(2026-08-18 운영자 지시 — 회신은 한 줄). 동작은 그대로다.
+    회신 문구가 필요한 호출부는 _add_one_line 을, 상태 집계만 필요한 호출부(ㅁ스포티파이)는
+    이 함수를 직접 쓴다 — 추가 경로는 하나뿐이어야 한다.
     """
     result = youtube.add_video(video_id)
     if result[0] == "added":
         adapter.enqueue_video(video_id, result[1])
-    return _format_add_result(result, channel)
+    return result
+
+
+def _add_one_line(adapter: Adapter, video_id: str, channel: str = "") -> str:
+    """영상 1건 추가(_add_one) + 회신 한 줄.
+
+    🔴 편입 결과는 **회신에 싣지 않는다**(2026-08-18 운영자 지시 — 회신은 한 줄). 동작은 그대로다.
+    """
+    return _format_add_result(_add_one(adapter, video_id), channel)
 
 
 def _handle_music_list(adapter: Adapter, channel_id: int) -> None:
@@ -6172,6 +6205,192 @@ def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
     adapter.send(channel_id, line)
 
 
+# ── 'ㅁ스포티파이' — kworb 미러의 스포티파이 주간차트 → 재생목록 일괄 추가 ────────────
+# 스포티파이 공식 API 는 쓰지 않는다(차트 엔드포인트가 막혀 있고 OAuth 가 필요하다). kworb 가
+# 미러링한 HTML 을 allowlist GET(fetch_digest_text) 으로 받아 「가수 곡명」 검색어만 뽑는다.
+KWORB_HOST = "kworb.net"
+SPOTIFY_CHARTS = (
+    ("글로벌", "/spotify/country/global_weekly.html"),
+    ("일본", "/spotify/country/jp_weekly.html"),
+    ("한국", "/spotify/country/kr_weekly.html"),
+)
+SPOTIFY_TOP_N = 30  # 차트당 상위 N곡(3개 차트 → 최대 90곡)
+_KWORB_QUERY_MAX = 120  # 검색어 상한(외부 문자열 — 길이를 공격자에게 맡기지 않는다)
+# 곡 셀: `<td class="text mp"><div><a …/artist/…>가수</a> - <a …/track/…>곡명</a>…</div></td>`.
+# 가수 링크를 따로 잡지 않는 이유 — **가수가 링크가 아닌 행이 있다**(`Unknown Artist - <a track>`,
+# 2026-08-25 jp 차트 200행 중 1행). 트랙 링크 앞을 통째로 잡아 태그만 걷어내면 두 모양을 다 먹는다.
+# 가수 캡처가 `(.*?)` 가 아닌 이유 **둘**:
+# ① 길이 상한 `{0,300}` — 무한 `.*?` 는 `<td class="text mp"><div>` 접두를 만날 때마다 줄 끝까지
+#    재확장해 실패 시 O(N²)다(300KB=_DIGEST_MAXBYTES 상한에서 10.4초 실측 · 차트 3개면 코어가
+#    ~31초 멈춘다). 300 = 실측 여유값: 실물 행의 이 캡처는 가수 링크를 여럿 이어도 100자를 안
+#    넘는다(픽스처 32행 최대 76자). 넘는 행은 그 행만 빠진다.
+# ② 셀 경계 `(?!</div>)` — 「개행이 막아준다」는 **kworb 가 셀마다 줄바꿈을 넣는 지금 서식에만**
+#    기대는 근거였다. 한 줄에 두 셀이 붙으면(minify) 트랙 링크가 없는 앞 셀이 뒷 셀을 삼켜
+#    `공지</div></td><td…><div>B - <a track>U` 가 `"공지B U"` 로 뽑힌다 — 예외도 로그도 없이
+#    엉뚱한 곡 30개가 재생목록에 들어간다. `</div>` 를 못 넘게 해 캡처를 셀 안에 가둔다.
+_KWORB_ROW_RE = re.compile(
+    r'<td class="text mp"><div>((?:(?!</div>).){0,300}?)<a href="[^"]*/track/[^"]*">([^<]*)</a>'
+)
+_KWORB_TAG_RE = re.compile(r"<[^>]*>")
+
+
+def parse_kworb_tracks(page: str, limit: int) -> list[str]:
+    """kworb 차트 HTML → 상위 limit 곡의 '가수 곡명' 유튜브 검색어(순수). 실패·빈 페이지는 [].
+
+    🔴 여기서 나오는 문자열은 **외부에서 온 데이터이지 지시가 아니다**. 그래서 이 함수가
+    한 줄 필드로 정규화(strip_control_line — 제어문자 제거 + 공백 접기)하고 길이를 자른다.
+    회신에 실릴 일이 생기면 호출부가 escape_reply 를 **반드시** 통과시켜야 한다
+    (ㅁ스포티파이 회신은 곡 제목을 아예 싣지 않는다 — 집계 숫자만 나간다).
+    """
+    out: list[str] = []
+    for raw_artist, raw_title in _KWORB_ROW_RE.findall(page):
+        artist = _KWORB_TAG_RE.sub("", raw_artist).strip().rstrip("-").strip()
+        query = strip_control_line(html.unescape(f"{artist} {raw_title}"))[:_KWORB_QUERY_MAX]
+        if query:
+            out.append(query)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _handle_music_spotify(adapter: Adapter, channel_id: int, month: str) -> bool:
+    """'ㅁ스포티파이' — 주간차트 3개의 상위 30곡을 재생목록에 담고 집계만 회신한다.
+
+    곡 하나를 넣는 경로는 ㅁ추가와 **같다**(adapter.search_video → _add_one → youtube.add_video).
+    중복 판정도 add_video 가 insert 전에 하므로 여기서 새로 만들지 않는다.
+    90회 검색이 순차로 돌아 수 분 걸린다 → 먼저 "시작" 을 보내고 끝나면 요약을 보낸다.
+    - **수동 경로**(ㅁ스포티파이)는 이벤트 워커가 직렬 처리하므로 그동안 다른 명령이 대기한다
+      (실행 명령과 같은 성질).
+    - **자동 경로**(run_spotify_monthly)는 _start_digest 가 띄운 **데몬 스레드**에서 돌아 워커를
+      막지 않는다 — 그동안 ㅁ추가·ㅁ삭제가 동시에 들어온다. 그래서 youtube 모듈이 `_LOCK` 으로
+      호출 1건씩 직렬화한다(2026-08-25 — 그 전까지 youtube.py 는 "단일 워커" 전제였다).
+    한 곡의 실패(검색 무결과·네트워크·API 오류)에 여기서 try/except 를 걸지 않는 이유 —
+    **호출부가 계약상 예외를 던지지 않는다**: search_video·youtube.add_video·fetch_digest_text 가
+    각자 삼켜 None·("fail",…)·"" 로 돌려주므로, 여기서는 그 반환을 실패 카운트로 세기만 한다.
+
+    month = 스탬프에 찍을 `YYYY-MM` — **호출부가 확정해 넘긴다**(수동 = 명령을 받은 시각의 달,
+    자동 = 러너가 판정에 쓴 달). 🔴 기본값을 두지 않는 것이 계약이다 — 왜는 _mark_spotify_month.
+
+    반환 = **담기를 시도했는지**(False = 시작 안내조차 못 보내 아무 일도 안 함).
+    월 1회 자동 실행(run_spotify_monthly)이 이 값으로 "그 달 몫을 썼는지"를 판단한다.
+    """
+    # ⚠️ send 를 try/except 로 감싸지 마라 — 어댑터는 계약상 예외 없이 실패를 None 으로 돌린다
+    # (§3.3). 시작 안내가 실패했다 = 이 채널에 말을 못 붙인다 = 결과를 전할 곳이 없다는 뜻이라,
+    # 90회 왕복을 시작하지 않고 그대로 접는다(자동 실행은 스탬프 없이 다음 틱에 다시 잡는다).
+    # 2줄인 이유 — 한 줄이면 «도는 중인지 멈춘 건지» 알 수 없다(2026-08-25 운영자 지적·문안 지정).
+    # 예상 시간은 그날 실측 6분 59초(90곡). **재생목록이 커질수록 add_video 의 목록 재조회가
+    # 길어져 늘어난다** — 크게 어긋나면 이 숫자를 조정한다.
+    opening = "🎧 스포티파이 월간차트 추가\n차트를 가져오고 있습니다(7분 예상)"
+    if adapter.send(channel_id, opening) is None:
+        log.warning("chat=%s spotify 시작 안내 실패 — 담지 않고 중단", channel_id)
+        return False
+    added = dup = fail = 0
+    seen: set[str] = set()  # 차트끼리 겹치는 곡 — 두 번째부터는 왕복 없이 '이미 있음'
+    missing: list[str] = []
+    for name, path in SPOTIFY_CHARTS:
+        queries = parse_kworb_tracks(fetch_digest_text(KWORB_HOST, path), SPOTIFY_TOP_N)
+        if not queries:  # 조회 실패·구조 변경 — 그 차트만 건너뛰고 나머지는 계속한다
+            missing.append(name)
+            continue
+        for query in queries:
+            hit = adapter.search_video(query)
+            if hit is None:
+                fail += 1
+                continue
+            if hit[0] in seen:
+                dup += 1
+                continue
+            seen.add(hit[0])
+            status = _add_one(adapter, hit[0])[0]
+            if status == "added":
+                added += 1
+            elif status == "dup":
+                dup += 1
+            else:
+                fail += 1
+    log.info(
+        "chat=%s spotify 추가=%d 중복=%d 실패=%d 차트실패=%d",
+        channel_id,
+        added,
+        dup,
+        fail,
+        len(missing),
+    )
+    # 🔴 **수동 'ㅁ스포티파이' 도 스탬프를 갱신한다**(그래서 러너가 아니라 여기서 찍는다).
+    # 스탬프의 목적이 "한 달에 한 번만 90회 왕복" 인데, 관리자가 손으로 담은 직후 다음 세션의
+    # 자동 실행이 같은 주간차트를 한 번 더 훑으면 그 목적이 그대로 깨진다(추가는 거의 0곡,
+    # 왕복만 90회). 반대 방향은 막지 않는다 — 수동은 스탬프를 **읽지 않아** 언제든 다시 돈다.
+    # ⚠️ **전 차트 실패(missing 3개)면 찍지 않는다** — 재시도가 비싸다는 종전 근거가 사실과
+    # 달랐다: 차트를 하나도 못 읽으면 queries 가 비어 90회 왕복을 **아예 안 하고** HTTP 3회로
+    # 끝난다(거의 공짜다). 일시적 네트워크 오류 한 번에 그 달 90곡을 통째로 날릴 이유가 없다.
+    # 부분 실패(1~2개)는 지금처럼 찍는다 — 이미 담은 게 있어 재실행하면 성공한 차트를 또 훑는다.
+    # (반환은 True 그대로 — 그 세션엔 재시도하지 않고 다음 세션에 한 번 다시 잡는다.)
+    if len(missing) < len(SPOTIFY_CHARTS):
+        _mark_spotify_month(month)
+    # 운영자 지정본(2026-08-25) — 제목 없이 `✅처리완료`(공백 없음) + 항목당 한 줄.
+    # 시작 안내에 제목이 이미 있어 문맥이 이어진다.
+    line = f"✅처리완료\n추가 {added}곡\n중복 {dup}곡\n실패 {fail}곡"
+    # 차트 실패는 **로그로만** 남긴다(2026-08-25 운영자 지시 — 회신은 지정본 4줄 고정).
+    # 스탬프 판정은 위 `missing` 이 그대로 쓴다(전 차트 실패면 안 찍는다).
+    adapter.send(channel_id, line)
+    return True
+
+
+# ── 월 1회 자동 실행 — 스탬프가 주기를 정한다 ──────────────────────────────────
+# 이 PC 는 상시 가동이 아니다(관리자가 켜 둔 동안만 돈다). "매월 1일 00:00" 으로 잡으면
+# 그날 PC 가 꺼져 있던 달은 **통째로 건너뛴다** → notify.json 에서는 `on:"session"` 으로 세션마다
+# 통과시키고, 실제 주기는 이 스탬프 파일이 정한다(yt-digest 와 같은 사상).
+SPOTIFY_MONTH_F = LOG_DIR / "spotify_month.txt"  # 마지막으로 담은 달 `YYYY-MM` 한 줄
+
+
+def _mark_spotify_month(month: str) -> None:
+    """`YYYY-MM` 스탬프 기록 — 실패해도 담은 것은 성공이라 삼킨다(_yt_mark_posted 와 같은 계약).
+
+    🔴 **찍는 달을 인자로 받는 이유 — 비교한 값을 그대로 찍어야 한다**(run_yt_digest 가
+    `_yt_mark_posted(stamp)` 로 넘기는 관용구와 같다). 여기서 `datetime.now()` 를 다시 읽으면
+    판정 시각(러너 시작)과 기록 시각(90회 왕복 뒤)이 갈라진다 — 8/31 23:5x 에 시작해 00:0x 에
+    끝나면 `2026-09` 가 찍히고, 9월 첫 세션이 "이미 담았다"로 조용히 끝나 **9월치가 통째로
+    사라진다**(2026-08-25 재현 확인).
+
+    최악의 결과 = 다음 세션에 한 번 더 담는다(중복은 add_video 가 '이미 있음' 으로 거른다).
+    """
+    try:
+        SPOTIFY_MONTH_F.parent.mkdir(parents=True, exist_ok=True)
+        SPOTIFY_MONTH_F.write_text(month + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning("스포티파이 월 스탬프 기록 실패(%s)", type(e).__name__)
+
+
+def run_spotify_monthly(adapter: Adapter, channel_id: int, today: str) -> bool:
+    """월 1회 스포티파이 주간차트 담기. 반환 = 이 항목을 처리 완료로 볼지.
+
+    달이 바뀐 뒤 PC 를 **처음 켠 날** 한 번 돈다(1일에 꺼져 있어도 놓치지 않는다).
+    곡 수집·추가는 전부 수동 'ㅁ스포티파이' 와 **같은 핸들러**가 한다 — 여기는 껍데기다.
+
+    이미 이번 달에 담았으면 **True**(조용히 끝). "할 일이 없다"는 실패가 아니다 — False 로
+    돌리면 _revert_digest_fired 가 fired 를 풀어 25초마다 같은 판정을 DIGEST_MAX_ATTEMPTS 회
+    반복하고 WARNING 을 남긴다(run_yt_digest 의 "낼 것이 없는 경우도 True" 와 같은 계약).
+    """
+    try:
+        if SPOTIFY_MONTH_F.read_text(encoding="utf-8").strip() == today[:7]:
+            return True
+    except FileNotFoundError:
+        pass  # 아직 한 번도 안 담았다 — 정상 경로라 조용히 지나간다
+    except (OSError, ValueError) as e:
+        # 스탬프를 못 읽으면 주기 제한이 통째로 꺼져 **매 세션 90회 왕복**이 돈다. 흔적이 0 이면
+        # 아무도 모르므로 경고는 남긴다(읽기 실패로 담기를 포기하지는 않는다 — 그게 이 기능이다).
+        # 🔴 ValueError 도 잡는 이유 — `UnicodeDecodeError` 는 **OSError 가 아니라 ValueError** 다.
+        # 파일에 비UTF-8 바이트가 한 번 들어가면 여기서 예외가 새어 _run_digest 가 삼키고(3회 재시도
+        # 뒤 그날 포기) **덮어쓰는 경로에 영영 도달하지 못해** 다음 달도 그 다음 달도 고장난다.
+        # 디코드 실패 = 파손된 스탬프 = 다시 담아야 정상이므로 「못 읽었다」와 같게 취급한다.
+        # (같은 형태가 run_yt_digest 의 YT_POSTED_F 읽기에도 있다 — 이번 범위 밖이라 안 건드렸다.)
+        log.warning(
+            "스포티파이 월 스탬프를 못 읽었다(%s) — 이번 달에 또 담을 수 있다", type(e).__name__
+        )
+    # 판정에 쓴 달(today[:7])을 그대로 넘긴다 — 왜는 _mark_spotify_month 주석.
+    return _handle_music_spotify(adapter, channel_id, today[:7])
+
+
 def _handle_text(
     adapter: Adapter,
     event: Event,
@@ -6184,7 +6403,8 @@ def _handle_text(
     """텍스트 메시지 처리(구 handle_update 텍스트 분기). 명령·push·프로젝트 실행·직접입력 라우팅."""
     channel_id = event.channel_id
     text = event.text
-    # 플레이리스트 채널 게이트(최상단): 화이트리스트(ㅁ노래·정지·다음·청소·추가·삭제·재생)만 통과.
+    # 플레이리스트 채널 게이트(최상단): 화이트리스트(ㅁ노래·정지·다음·청소·추가·삭제·재생·
+    # 목록·스포티파이)만 통과.
     # 그 외(잡담·사진 캡션·다른 ㅁ명령·순수 링크·빈 메시지)는 반응·안내 없이 조용히 무시한다.
     if event.channel_role in _MUSIC_ONLY_ROLES and not _is_playlist_command(text):
         return
@@ -6271,6 +6491,15 @@ def _handle_text(
     if is_music_list(stripped):
         log.info("chat=%s cmd=music list", channel_id)
         _handle_music_list(adapter, channel_id)
+        return
+
+    # 'ㅁ스포티파이' — 주간차트 3개 상위 30곡씩을 재생목록에 일괄 추가(약 7분 소요).
+    # ㅁ목록·ㅁ삭제와 같이 인가 우회 대상이 **아니다**(_playlist_bypass 3조건 중 1·2 위반) —
+    # 여기 도달하는 비인가 user 는 없다. 이 분기는 허용목록 user 전용.
+    if is_music_spotify(stripped):
+        log.info("chat=%s cmd=music spotify", channel_id)
+        # 찍을 달은 **여기서**(명령을 받은 시각) 확정한다 — 왜는 _mark_spotify_month 주석.
+        _handle_music_spotify(adapter, channel_id, datetime.now(_KST).strftime("%Y-%m"))
         return
 
     # 'ㅁ추가 <링크|검색어>' — 유튜브 재생목록("코딩")에 추가. 접두 매칭이라 별칭 해석·help 폴백
@@ -6885,6 +7114,14 @@ def _selftest() -> None:
     assert _DIGEST_NONE_MARK in build_digest_prompt([], {})  # 0건 계약 문구(영역 없음)
     assert DIGEST_AREAS[0] in build_digest_prompt([], {})  # 영역 라벨은 claude 가 고른다
     assert _digest_get("evil.com", "/x") is None  # allowlist 밖 host = 네트워크 미접촉
+    # kworb host 가 두 벌(KWORB_HOST · _DIGEST_HOSTS)이다 — 한쪽만 고치면 allowlist 가 조용히
+    # 막는데, 회신은 «추가 0곡» 4줄뿐이고 흔적은 로그의 `차트실패=3` 하나다(2026-08-25 운영자
+    # 지시로 회신에서 차트 실패 줄을 뺐다). 그래서 더더욱 여기서 묶는다 — 상수를 합치지 않고.
+    assert KWORB_HOST in _DIGEST_HOSTS
+    # 러너 배선 — 실행은 `globals()[DIGEST_RUNNERS[item_id]]`(늦은 바인딩)이라 이름에 오타가 나면
+    # _run_digest 의 except 가 삼켜 재시도 루프만 남는다. dict 값을 문자열로 비교하는 테스트는
+    # 그 오타를 못 잡으므로, 여기서 **실제로 부를 수 있는지**를 본다(os·us·yt·spotify 전부).
+    assert all(callable(globals().get(n)) for n in DIGEST_RUNNERS.values())
     assert _digest_get("api.github.com", "https://evil.com/x") is None  # 전체 URL 거부
     assert split_digest_cards(f"{LEAD_DIGEST} A\n내용 : x\n{LEAD_DIGEST} B\n내용 : y") == [
         f"{LEAD_DIGEST} A\n내용 : x",
@@ -7055,6 +7292,15 @@ def _selftest() -> None:
     assert _is_playlist_command("ㅁ추가 노래 제목") and not _is_playlist_command("잡담")
     assert not _is_playlist_command("ㅁ도움말")  # 다른 ㅁ명령은 무시 대상
     assert _is_playlist_command("ㅁ목록") and is_music_list("ㅁ 목록")  # 읽기 전용 조회
+    # 'ㅁ스포티파이' — 단독 정확매칭 + kworb 파싱(가수 링크 있는 행·없는 행 둘 다).
+    assert _is_playlist_command("ㅁ스포티파이") and is_music_spotify("ㅁ 스포티파이")
+    assert not is_music_spotify("ㅁ스포티파이곡") and not is_music_spotify("ㅁ스포티파이 추가")
+    assert parse_kworb_tracks(
+        '<td class="text mp"><div><a href="../artist/a.html">CORTIS</a> - '
+        '<a href="../track/t.html">REDRED</a></div></td>'
+        '<td class="text mp"><div>Unknown Artist - <a href="../track/u.html">Fire</a></div></td>',
+        9,
+    ) == ["CORTIS REDRED", "Unknown Artist Fire"]
     # '#N' 순번 지정(순수) — '#' 없는 숫자는 검색어의 일부다.
     assert parse_add_index("낭만에 대하여 #2") == ("낭만에 대하여", 2)
     assert parse_add_index("소녀시대 999") == ("소녀시대 999", 0)

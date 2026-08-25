@@ -166,12 +166,16 @@ class FakeAdapter:
         return self._music_result("⏭️ 다음")
 
     def search_candidates(self, query):
+        # search 는 고정 후보 리스트 또는 **query → 후보 리스트 함수**(검색어마다 결과가 달라야
+        # 하는 ㅁ스포티파이 테스트용). 둘 다 없으면 무결과.
         self.searches.append(query)
-        return list(self._search or [])
+        found = self._search(query) if callable(self._search) else self._search
+        return list(found or [])
 
     def search_video(self, query, index=0):
-        pos = bridge.pick_index(self.search_candidates(query), index)
-        return None if pos is None else self._search[pos][:2]
+        found = self.search_candidates(query)
+        pos = bridge.pick_index(found, index)
+        return None if pos is None else found[pos][:2]
 
     def enqueue_video(self, video_id, title):
         self.enqueued.append((video_id, title))
@@ -1937,6 +1941,37 @@ def test_youtube_add_video_dedup_skips_insert(monkeypatch):
     assert inserted == ["vid2"]
 
 
+def test_youtube_add_video_is_serialized_across_threads(monkeypatch):
+    """동시 호출에도 같은 곡이 두 번 insert 되지 않는다(_LOCK — list→insert 는 원자적이 아니다).
+
+    2026-08-25 'ㅁ스포티파이' 월 1회 자동 실행이 _start_digest 의 **데몬 스레드**에서 이 모듈을
+    부르면서 「단일 워커가 직렬 처리」 전제가 깨졌다 — 그동안 이벤트 워커의 ㅁ추가가 동시에 온다.
+    락이 없으면 두 스레드가 같은 '없음' 을 보고 각자 insert 한다.
+    """
+    items: list[tuple[str, str, str]] = []
+
+    def slow_list(_access):
+        snapshot = list(items)  # 스냅샷을 **먼저** 뜨고 늦게 돌려준다 = 실제 HTTP 왕복의 경합 창
+        time.sleep(0.05)
+        return snapshot
+
+    monkeypatch.setattr(youtube, "_get_access", lambda: "tok")
+    monkeypatch.setattr(youtube, "_list_items", slow_list)
+    monkeypatch.setattr(
+        youtube, "_insert", lambda _a, v: items.append((f"i{len(items)}", v, "제목")) or "제목"
+    )
+    results = []
+    threads = [
+        threading.Thread(target=lambda: results.append(youtube.add_video("vidX"))) for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(5)
+    assert len(items) == 1  # insert 는 한 번뿐
+    assert sorted(s for s, _d in results) == ["added", "dup"]
+
+
 def test_youtube_add_video_network_failure(monkeypatch):
     # 인증·네트워크 오류는 삼켜 ('fail', 사유)로 — 비밀값 미포함.
     def boom():
@@ -2150,6 +2185,429 @@ def test_music_list_not_help_fallthrough(monkeypatch):
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ목록"), target_root="root")
     assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
+
+
+# ── 'ㅁ스포티파이'(kworb 주간차트 → 재생목록 일괄 추가) ────────────────────────────
+# 픽스처 = 실물 kworb 한국 주간차트 앞부분(곡 32행 — 상위 30 절단을 검사할 수 있게 30보다 크다).
+# 마지막 행은 **가수가 링크가 아닌** 실제 행(일본 차트의 `Unknown Artist`)을 붙였다.
+_KWORB_FIXTURE = Path(__file__).parent / "fixtures" / "kworb_weekly.html"
+
+
+def _kworb_page():
+    return _KWORB_FIXTURE.read_text(encoding="utf-8")
+
+
+def test_parse_kworb_tracks_takes_top_n():
+    tracks = bridge.parse_kworb_tracks(_kworb_page(), 30)
+    assert len(tracks) == 30  # 32행짜리 페이지에서 상위 30곡만
+    assert tracks[0] == "CORTIS REDRED"
+    assert tracks[1] == "RESCENE LOVE ATTACK"
+    # 곡명 안의 ' - ' 는 살아 있어야 한다(가수 구분자와 헷갈려 자르면 검색어가 망가진다).
+    assert tracks[3] == "Post Malone Sunflower - Spider-Man: Into the Spider-Verse"
+    # 태그·제어문자·개행이 검색어에 남지 않는다(외부 문자열 정규화).
+    assert all("<" not in t and "\n" not in t and t == t.strip() for t in tracks)
+
+
+def test_parse_kworb_tracks_plain_artist_and_entities():
+    # ① 가수가 링크가 아닌 행도 뽑는다 ② HTML 엔티티 복원 ③ 폭0 문자 제거 ④ 무의미 입력은 []
+    tracks = bridge.parse_kworb_tracks(_kworb_page(), 40)
+    assert len(tracks) == 32 and tracks[31] == "Unknown Artist 打上花火"
+    cell = (
+        '<td class="text mp"><div><a href="../artist/x.html">She &amp; Him</a> - '
+        '<a href="../track/y.html">I​Thought</a></div></td>'
+    )
+    assert bridge.parse_kworb_tracks(cell, 5) == ["She & Him IThought"]
+    assert bridge.parse_kworb_tracks("", 30) == []
+    assert bridge.parse_kworb_tracks("<html><body>차트 없음</body></html>", 30) == []
+
+
+def test_parse_kworb_tracks_stays_inside_the_cell():
+    """한 줄에 두 셀이 붙어도(minify) 앞 셀이 뒷 셀을 삼키지 않는다 — 캡처가 `</div>` 를 못 넘는다.
+
+    삼키면 예외도 로그도 없이 **엉뚱한 문자열이 검색어가 돼** 엉뚱한 곡이 재생목록에 들어간다.
+    """
+    mix = (
+        '<td class="text mp"><div>공지</div></td>'
+        '<td class="text mp"><div>B - <a href="../track/u.html">U</a></div></td>'
+    )
+    assert bridge.parse_kworb_tracks(mix, 5) == ["B U"]
+
+
+def test_parse_kworb_tracks_truncates_long_query():
+    """검색어 길이 상한(_KWORB_QUERY_MAX) — 외부 문자열의 길이를 공격자에게 맡기지 않는다."""
+    page = _kworb_page_of(["곡" * 300], artist="가" * 30)
+    assert len(bridge.parse_kworb_tracks(page, 5)[0]) == bridge._KWORB_QUERY_MAX
+
+
+def test_parse_kworb_tracks_drops_row_with_overlong_artist():
+    """가수 접두가 정규식 상한(300자)을 넘는 행은 **그 행만** 빠진다 — 나머지 행은 정상 파싱.
+
+    상한은 백트래킹 폭주 방어라 그 행을 못 읽는 것이 정상 동작이다. 파서가 통째로 멎거나
+    다음 행을 삼키면(경계 없이 재확장) 안 된다는 쪽을 고정한다.
+    """
+    page = _kworb_page_of(["정상A", "긴가수행", "정상B"], artist="가")
+    row2 = '<a href="../track/t2.html">'  # 가운데 행의 트랙 링크 — 그 **앞**만 부풀린다
+    page = page.replace(">가</a> - " + row2, ">" + "가" * 320 + "</a> - " + row2)
+    assert bridge.parse_kworb_tracks(page, 10) == ["가 정상A", "가 정상B"]
+
+
+def test_spotify_command_matching_is_standalone():
+    """'ㅁ목록' 과 같은 단독 정확매칭 — 붙여쓰기·인자 붙임은 미발동."""
+    assert bridge.is_music_spotify("ㅁ스포티파이")
+    assert bridge.is_music_spotify("  ㅁ 스포티파이 ")  # 공백접기
+    assert not bridge.is_music_spotify("ㅁ스포티파이곡")
+    assert not bridge.is_music_spotify("ㅁ스포티파이 추가")
+    assert not bridge.is_music_spotify("스포티파이")
+
+
+def test_spotify_is_playlist_command_but_not_bypassed():
+    """라우팅은 열되(개발자가 그 채널서 쓴다) **인가 우회에서는 뺀다** — 90곡을 밀어넣는 명령."""
+    assert bridge._is_playlist_command("ㅁ스포티파이")
+    assert not bridge._playlist_bypass(_txt(999, "ㅁ스포티파이", channel_role=_PL))
+
+
+def _spotify_env(monkeypatch, page=None, add=None):
+    """kworb 조회·youtube 추가를 목으로 대체(네트워크 0). (조회기록, 추가기록) 반환."""
+    fetched = []
+
+    def fake_fetch(host, path):
+        fetched.append((host, path))
+        return _kworb_page() if page is None else page(path)
+
+    added = []
+
+    def fake_add(video_id):
+        added.append(video_id)
+        return add(video_id) if add else ("added", f"제목 {video_id}")
+
+    monkeypatch.setattr(bridge, "fetch_digest_text", fake_fetch)
+    monkeypatch.setattr(bridge.youtube, "add_video", fake_add)
+    return fetched, added
+
+
+def _fake_search(ids=None):
+    """검색어마다 다른 videoId 를 주는 가짜 유튜브 검색(같은 검색어 → 같은 id)."""
+    ids = {} if ids is None else ids
+
+    def search(query):
+        return [(ids.setdefault(query, f"v{len(ids)}"), f"{query} MV", "채널")]
+
+    return search
+
+
+def test_spotify_adds_top30_from_three_charts(monkeypatch):
+    fetched, added = _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    # 차트 3개를 각각 한 번씩 조회한다(경로는 상수 그대로 — 전체 URL 인자를 받지 않는다).
+    assert fetched == [(bridge.KWORB_HOST, p) for _n, p in bridge.SPOTIFY_CHARTS]
+    assert len(a.searches) == 90  # 차트당 30곡, 차트 3개
+    # 세 차트가 같은 페이지라 곡이 겹친다 → 첫 차트만 실제 추가, 나머지는 '이미 있음'
+    assert len(added) == 30
+    assert a.sent[-1][1] == "✅처리완료\n추가 30곡\n중복 60곡\n실패 0곡"
+
+
+def test_spotify_replies_start_before_summary(monkeypatch):
+    """7분 걸리는 명령 — 먼저 '시작' 을 보내고 끝나면 요약을 보낸다(디스코드 무응답 방지).
+
+    시작 안내는 **2줄**이다 — 한 줄이면 도는 중인지 멈춘 건지 알 수 없다(운영자 지적).
+    예상 시간 줄이 사라지면 그 사고가 그대로 돌아오므로 문구를 통째로 고정한다.
+    """
+    _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert len(a.sent) == 2
+    assert a.sent[0][1] == "🎧 스포티파이 월간차트 추가\n차트를 가져오고 있습니다(7분 예상)"
+    assert a.sent[0][1] != a.sent[-1][1]
+
+
+def test_spotify_counts_dup_and_fail(monkeypatch):
+    """중복(add_video 가 dup)·추가 실패·검색 무결과가 각 칸으로 집계된다."""
+    monkeypatch.setattr(bridge, "SPOTIFY_CHARTS", (("한국", "/spotify/country/kr_weekly.html"),))
+
+    def add(video_id):
+        if video_id in ("v0", "v1"):
+            return ("dup", "이미 있는 곡")
+        if video_id == "v2":
+            return ("fail", "YouTube API 오류(HTTP 403)")
+        return ("added", "새 곡")
+
+    _spotify_env(monkeypatch, add=add)
+    ids = {}
+    search = _fake_search(ids)
+    # 4번째 곡은 유튜브 검색 자체가 무결과 → 실패로만 세고 계속 진행한다.
+    quiet = bridge.parse_kworb_tracks(_kworb_page(), 30)[3]
+    a = FakeAdapter(search=lambda q: [] if q == quiet else search(q))
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert a.sent[-1][1] == "✅처리완료\n추가 26곡\n중복 2곡\n실패 2곡"
+
+
+def test_spotify_chart_fetch_failure_keeps_going(monkeypatch, caplog):
+    """한 차트 조회가 실패해도(빈 응답) 나머지 차트는 계속 담는다.
+
+    회신은 **지정본 4줄 고정**이라 차트 실패를 싣지 않는다(2026-08-25 운영자 지시) —
+    그래서 로그가 «어느 차트가 몇 개 실패했나» 의 유일한 흔적이다. 그 흔적까지 함께 고정한다.
+    """
+    fetched, added = _spotify_env(
+        monkeypatch, page=lambda path: "" if "global" in path else _kworb_page()
+    )
+    a = FakeAdapter(search=_fake_search())
+    with caplog.at_level(logging.INFO, logger="bridge"):
+        _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert len(fetched) == 3 and len(a.searches) == 60 and len(added) == 30
+    assert a.sent[-1][1] == "✅처리완료\n추가 30곡\n중복 30곡\n실패 0곡"
+    assert any("차트실패=1" in r.getMessage() for r in caplog.records)
+
+
+def test_spotify_all_charts_down(monkeypatch):
+    _spotify_env(monkeypatch, page=lambda _p: "")
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert a.searches == []
+    assert a.sent[-1][1] == "✅처리완료\n추가 0곡\n중복 0곡\n실패 0곡"
+
+
+def _kworb_page_of(titles, artist="가수"):
+    """곡 n개짜리 최소 kworb 페이지(실물 셀 구조만 복제) — 30곡 미만·악성 제목 축을 만든다."""
+    return "\n".join(
+        f'<tr><td class="np">{i}</td><td class="text mp"><div>'
+        f'<a href="../artist/a{i}.html">{artist}</a> - '
+        f'<a href="../track/t{i}.html">{t}</a></div></td></tr>'
+        for i, t in enumerate(titles, 1)
+    )
+
+
+def test_spotify_short_chart_and_broken_html(monkeypatch):
+    """30곡 미만 차트는 **있는 만큼만** 담고, 구조가 깨진 차트만 '못 읽음' 으로 떨어진다."""
+    short = _kworb_page_of(["짧은차트A", "짧은차트B", "짧은차트C"])
+    broken = "<html><body><table><tr><td>공지</td></tr></table></body></html>"
+    pages = {"global": short, "jp": broken}
+    fetched, added = _spotify_env(
+        monkeypatch,
+        page=lambda path: next((v for k, v in pages.items() if k in path), _kworb_page()),
+    )
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert len(fetched) == 3  # 파손 차트에서 멈추지 않는다
+    assert len(a.searches) == 33 and len(added) == 33  # 3곡(부분) + 30곡(정상)
+    assert a.sent[-1][1] == "✅처리완료\n추가 33곡\n중복 0곡\n실패 0곡"
+
+
+def test_spotify_second_run_inserts_nothing(monkeypatch):
+    """2회차가 add_video 의 'dup' 을 **집계·큐편입에 어떻게 반영하는지**를 고정한다.
+
+    ⚠️ "멱등을 증명한다"가 아니다 — 실제 dedup(list→insert 사이의 중복 판정)은 youtube 쪽
+    계약이고 test_youtube_add_video_* 가 고정한다. 여기 `len(inserted)==30` 은 그 계약을 흉내낸
+    **가짜 add_video 가드**에 기댄 값이라, 이 테스트가 지키는 것은 핸들러가 dup 을 새 추가로
+    세지 않고(중복 30곡) 재생 큐에도 넣지 않는다(enqueued 0)는 쪽이다.
+    """
+    monkeypatch.setattr(bridge, "SPOTIFY_CHARTS", (("한국", "/spotify/country/kr_weekly.html"),))
+    inserted = []  # 실제 playlistItems.insert 가 일어난 videoId(중복은 add_video 가 앞에서 막는다)
+
+    def add(video_id):
+        if video_id in inserted:
+            return ("dup", f"제목 {video_id}")
+        inserted.append(video_id)
+        return ("added", f"제목 {video_id}")
+
+    _spotify_env(monkeypatch, add=add)
+    ids = {}  # 두 회차가 같은 검색어 → 같은 videoId 를 받게 공유한다
+    first = FakeAdapter(search=_fake_search(ids))
+    _fire(first, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert first.sent[-1][1] == "✅처리완료\n추가 30곡\n중복 0곡\n실패 0곡"
+    assert len(inserted) == 30
+
+    second = FakeAdapter(search=_fake_search(ids))
+    _fire(second, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert second.sent[-1][1] == "✅처리완료\n추가 0곡\n중복 30곡\n실패 0곡"
+    assert len(inserted) == 30  # 2회차는 한 곡도 밀어넣지 않았다
+    assert second.enqueued == []  # 큐 편입도 없다(added 가 0곡)
+
+
+def test_spotify_reply_carries_no_track_text(monkeypatch):
+    """외부 문자열 계약 — 곡 제목이 마크다운 링크·제어문자여도 **회신엔 숫자만** 나간다."""
+    monkeypatch.setattr(bridge, "SPOTIFY_CHARTS", (("한국", "/spotify/country/kr_weekly.html"),))
+    evil = ["[클릭](http://evil)", "@everyone\x07벨", "```py\npwn()```"]
+    _spotify_env(monkeypatch, page=lambda _p: _kworb_page_of(evil, artist="`악성`가수"))
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    # 검색어에는 제어문자·개행이 없다(strip_control_line) — 링크 텍스트 자체는 검색어로 살아 있다.
+    assert a.searches == [
+        "`악성`가수 [클릭](http://evil)",
+        "`악성`가수 @everyone벨",
+        "`악성`가수 ```py pwn()```",
+    ]
+    body = "\n".join(t for _c, t, _b in a.sent)
+    assert "evil" not in body and "@everyone" not in body and "```" not in body
+    assert a.sent[-1][1] == "✅처리완료\n추가 3곡\n중복 0곡\n실패 0곡"
+
+
+def test_spotify_unauthorized_member_gets_nothing(monkeypatch):
+    """비인가 서버 멤버는 무회신 — kworb 조회도 유튜브 검색도 일어나지 않는다."""
+    fetched, added = _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(999, "ㅁ스포티파이", channel_role=_PL), allowed=_ALLOWED, target_root="root")
+    assert (fetched, added, a.searches, a.sent) == ([], [], [], [])
+
+
+def test_spotify_not_help_fallthrough(monkeypatch):
+    # 삽입 위치 회귀: 별칭 해석·HELP 폴백보다 앞에 있어야 한다.
+    _spotify_env(monkeypatch, page=lambda _p: "")
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ스포티파이"), target_root="root")
+    assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
+
+
+# ── 월 1회 자동 실행(run_spotify_monthly) — 스탬프가 주기를 정한다 ────────────────
+# SPOTIFY_MONTH_F 는 conftest 가 tmp 로 격리한다(라이브 logs/spotify_month.txt 오염 방지).
+def _spotify_runner_spy(monkeypatch):
+    """핸들러를 목으로 — 러너가 무엇을 들고 부르는지/안 부르는지만 본다(90회 왕복 0).
+
+    기록은 (channel_id, month) — 러너가 **판정에 쓴 달을 그대로** 넘기는지가 계약이다.
+    """
+    calls = []
+    monkeypatch.setattr(
+        bridge,
+        "_handle_music_spotify",
+        lambda _a, cid, month: bool(calls.append((cid, month))) or True,
+    )
+    return calls
+
+
+def test_spotify_registered_as_session_runner():
+    assert bridge.DIGEST_RUNNERS[bridge.SPOTIFY_NOTIFY_ID] == "run_spotify_monthly"
+
+
+def test_spotify_monthly_skips_when_already_done_this_month(monkeypatch):
+    """같은 달 재실행 = **아무것도 안 한다.**
+
+    반환이 True 인 것도 계약이다 — False 면 _revert_digest_fired 가 fired 를 풀어
+    25초마다 같은 판정을 DIGEST_MAX_ATTEMPTS 회 반복한다(run_yt_digest 와 같다).
+    """
+    calls = _spotify_runner_spy(monkeypatch)
+    bridge.SPOTIFY_MONTH_F.write_text("2026-08\n", encoding="utf-8")
+    a = FakeAdapter()
+    assert bridge.run_spotify_monthly(a, 7, "2026-08-25") is True
+    assert calls == [] and a.sent == []  # 회신 한 줄도 없다(조용히 끝)
+
+
+def test_spotify_monthly_runs_when_month_changed(monkeypatch):
+    """달이 바뀌면 실행 — 1일이 아니라 **그 달 처음 켠 날**이다(PC 가 상시 가동이 아니다)."""
+    calls = _spotify_runner_spy(monkeypatch)
+    bridge.SPOTIFY_MONTH_F.write_text("2026-08\n", encoding="utf-8")
+    assert bridge.run_spotify_monthly(FakeAdapter(), 7, "2026-09-14") is True
+    # 판정에 쓴 달을 그대로 넘긴다 — 핸들러가 datetime.now() 를 다시 읽으면 월 경계에서 갈린다.
+    assert calls == [(7, "2026-09")]
+
+
+def test_spotify_monthly_runs_when_no_stamp(monkeypatch):
+    """스탬프 파일이 없다(최초) = 아직 한 번도 안 담았다 → 실행."""
+    calls = _spotify_runner_spy(monkeypatch)
+    assert not bridge.SPOTIFY_MONTH_F.exists()
+    assert bridge.run_spotify_monthly(FakeAdapter(), 7, "2026-08-25") is True
+    assert calls == [(7, "2026-08")]
+
+
+def test_spotify_manual_run_marks_month_stamp(monkeypatch):
+    """수동 'ㅁ스포티파이' 도 그 달 몫을 쓴다 — 직후 자동 실행은 아무것도 하지 않는다.
+
+    손으로 담은 다음 세션에 자동이 같은 주간차트를 한 번 더 훑으면 스탬프의 목적
+    ("한 달에 한 번만 90회 왕복")이 그대로 깨진다. 반대 방향은 막지 않는다(아래 단언).
+    """
+    _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    this_month = datetime.now(bridge._KST).strftime("%Y-%m")
+    assert bridge.SPOTIFY_MONTH_F.read_text(encoding="utf-8").strip() == this_month
+    # 수동은 스탬프를 **읽지 않는다** — 자동이 이미 돈 달에도 언제든 다시 담을 수 있다.
+    b = FakeAdapter(search=_fake_search())
+    _fire(b, _txt(777, "ㅁ스포티파이", channel_role=_PL), target_root="root")
+    assert len(b.searches) == 90
+    # 반대로 자동은 그 달 몫이 이미 쓰였음을 보고 조용히 끝낸다(핸들러 미호출).
+    calls = _spotify_runner_spy(monkeypatch)
+    assert bridge.run_spotify_monthly(FakeAdapter(), 7, f"{this_month}-28") is True
+    assert calls == []
+
+
+def test_spotify_monthly_leaves_no_stamp_when_all_charts_down(monkeypatch):
+    """차트가 **전부** 죽으면 스탬프를 찍지 않는다 — 일시 장애 한 번에 그 달을 통째로 날리지 않게.
+
+    재시도가 비싸지 않다는 것이 근거다: 차트를 하나도 못 읽으면 queries 가 비어 90회 왕복을
+    아예 안 하고 HTTP 3회로 끝난다. 반환은 True 라 그 세션엔 재시도하지 않는다(다음 세션에 1회).
+    """
+    _spotify_env(monkeypatch, page=lambda _p: "")
+    a = FakeAdapter(search=_fake_search())
+    assert bridge.run_spotify_monthly(a, 7, "2026-08-25") is True
+    assert a.searches == []  # 90회 왕복은 시작도 안 했다 → 다시 잡아도 싸다
+    assert not bridge.SPOTIFY_MONTH_F.exists()
+
+
+def test_spotify_monthly_stamps_on_partial_chart_failure(monkeypatch):
+    """부분 실패(차트 1개만 죽음)는 종전대로 찍는다 — 이미 담은 게 있어 재실행이 헛돈다.
+
+    회신에서 «못 읽은 차트» 줄이 빠진 뒤로는 이 단언들이 부분/전체 실패를 가르는 유일한
+    방어선이다(전 차트 실패는 아래 leaves_no_stamp 테스트).
+    """
+    _fetched, added = _spotify_env(
+        monkeypatch, page=lambda path: "" if "global" in path else _kworb_page()
+    )
+    a = FakeAdapter(search=_fake_search())
+    assert bridge.run_spotify_monthly(a, 7, "2026-08-25") is True
+    assert len(added) == 30  # 죽은 차트만 건너뛰고 성공한 차트는 그대로 담는다
+    assert bridge.SPOTIFY_MONTH_F.read_text(encoding="utf-8").strip() == "2026-08"
+
+
+def test_spotify_monthly_stamps_the_judged_month_not_the_wall_clock(monkeypatch):
+    """월 경계 — 스탬프는 **판정에 쓴 달**이지 기록 시점의 벽시계가 아니다.
+
+    8/31 에 시작해 9/1 에 끝난 실행이 `2026-09` 를 찍으면, 9월 첫 세션이 '이미 담았다'로
+    조용히 끝나 9월치가 통째로 사라진다.
+    🔴 **실제 달과 다른 달을 넘긴다** — 같은 달을 쓰면 두 클럭(인자 vs datetime.now)이 같은 값을
+    내 「인자를 무시하고 now 를 찍는」 변조가 그대로 통과한다(2026-08-25 mutation 으로 실측).
+    """
+    _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    assert bridge.run_spotify_monthly(a, 7, "2026-07-31") is True
+    assert bridge.SPOTIFY_MONTH_F.read_text(encoding="utf-8").strip() == "2026-07"
+
+
+def test_spotify_monthly_survives_broken_stamp_file(monkeypatch, tmp_path):
+    """스탬프 읽기·쓰기가 둘 다 실패해도 **예외 없이** 담고 회신한다.
+
+    여기서 예외가 새면 _start_digest 의 데몬 스레드가 죽어 25초마다 재시도만 반복한다.
+    경로를 디렉터리로 두면 read_text·write_text 가 모두 OSError(IsADirectoryError/PermissionError).
+    """
+    stamp_dir = tmp_path / "spotify_month.txt"
+    stamp_dir.mkdir()
+    monkeypatch.setattr(bridge, "SPOTIFY_MONTH_F", stamp_dir)
+    _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    assert bridge.run_spotify_monthly(a, 7, "2026-08-25") is True
+    assert len(a.searches) == 90  # 읽기 실패로 담기를 포기하지 않는다 — 그게 이 기능이다
+    assert a.sent[-1][1].startswith("✅처리완료\n추가")
+
+
+def test_spotify_monthly_survives_undecodable_stamp(monkeypatch):
+    """비UTF-8 스탬프(UnicodeDecodeError ⊄ OSError)도 「못 읽었다」로 떨어져 자가치유한다.
+
+    안 잡으면 덮어쓰는 경로에 영영 도달하지 못해 다음 달도 그 다음 달도 고장난다.
+    파손 페이로드의 텍스트 꼬리는 기대값과 **다른 달**(2026-01)을 쓴다 — 같은 달이면
+    「치유된 값」과 「그대로 남은 쓰레기」가 값으로 구분되지 않는다.
+    """
+    bridge.SPOTIFY_MONTH_F.write_bytes(b"\xff\xfe2026-01\n")
+    _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search())
+    assert bridge.run_spotify_monthly(a, 7, "2026-08-25") is True
+    assert bridge.SPOTIFY_MONTH_F.read_text(encoding="utf-8").strip() == "2026-08"  # 정상화
+
+
+def test_spotify_monthly_dead_send_leaves_no_stamp(monkeypatch):
+    """시작 안내조차 못 보냈다 = 아무 일도 안 함 → 담지 않고 스탬프도 없이 False(다음 틱 재시도)."""
+    fetched, added = _spotify_env(monkeypatch)
+    a = FakeAdapter(search=_fake_search(), send_ids=[None])
+    assert bridge.run_spotify_monthly(a, 7, "2026-08-25") is False
+    assert (fetched, added, a.searches) == ([], [], [])
+    assert not bridge.SPOTIFY_MONTH_F.exists()
 
 
 def test_youtube_list_titles_drops_item_id(monkeypatch):
@@ -7981,6 +8439,19 @@ def test_real_schedules_baseline_fields_unchanged():
     # 없다**는 현재 사실을 못 박는다(시각 항목 = on 이 없는 항목). 새 시각 알림이 베이스라인
     # 등재 없이 조용히 들어오면 여기서 빨간불이고, 그때 위 딕셔너리에 값을 적으면 된다.
     assert {it["id"] for it in _REAL_ITEMS} - _REAL_SESSION_IDS == set(_REAL_BASELINE)
+
+
+@_needs_real_schedules
+def test_real_schedule_has_spotify_monthly_on_session():
+    """배포본 배선 — 이 항목이 빠지면 러너가 있어도 **한 달에 한 번이 영영 안 온다.**
+
+    `days` 를 넣지 않는 것도 계약이다: 요일을 걸면 그날 PC 가 꺼져 있던 달을 통째로 건너뛴다
+    (주기는 logs/spotify_month.txt 스탬프가 정한다).
+    """
+    item = next((it for it in _REAL_ITEMS if it.get("id") == bridge.SPOTIFY_NOTIFY_ID), None)
+    assert item is not None, "배포본 notify.json 에 spotify-monthly 항목이 없다"
+    assert item.get("on") == "session" and item.get("channel") == "playlist"
+    assert "days" not in item and "at" not in item
 
 
 @_needs_real_schedules

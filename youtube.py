@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -32,8 +33,17 @@ _TOKEN_URI = "https://oauth2.googleapis.com/token"  # client 파일에 없을 �
 _UA = "claude_bridge_youtube/1.0"
 _TIMEOUT = 15
 
-# access token 메모리 캐시(만료 전 재사용). ponytail: 단일 워커가 직렬 처리라 잠금 불필요 —
-# 멀티스레드에서 갱신이 필요해지면 lock 을 추가한다.
+# 공개 API(add_video·list_titles·remove_video) 직렬화 락. **호출 1건 단위**로만 잠근다 —
+# 스포티파이 90회 전체를 한 락 안에 넣으면 ㅁ추가·ㅁ삭제가 수 분 굶는다.
+# 경위: 종전 주석은 `ponytail: 단일 워커가 직렬 처리라 잠금 불필요 — 멀티스레드에서 갱신이
+# 필요해지면 lock 을 추가한다` 였다. **2026-08-25 'ㅁ스포티파이' 월 1회 자동 실행이 이 모듈을
+# _start_digest 의 데몬 스레드에서 부르면서 그 전제가 깨졌다**(이벤트 워커의 ㅁ추가·ㅁ삭제와 동시
+# 진행). add_video 가 「list → 없으면 insert」라 원자적이지 않아 같은 videoId 가 두 번 insert 될
+# 수 있고, 아래 access token 캐시 갱신도 경합한다. RLock 인 이유 = 내부 중첩 호출 안전
+# (remove_video 가 _get_access 를 두 번 부르는 식의 경로가 늘어도 자기 락에 자기가 안 막힌다).
+_LOCK = threading.RLock()
+
+# access token 메모리 캐시(만료 전 재사용 — 갱신은 _LOCK 안에서만 일어난다).
 _access_token = ""
 _access_exp = 0.0
 
@@ -173,21 +183,24 @@ def add_video(video_id: str) -> tuple[str, str]:
     - ("dup", 제목): 이미 있어 스킵(insert 안 함)
     - ("fail", 사유): 인증·네트워크·API 오류(비밀값 미포함)
 
-    중복은 insert 전에 playlistItems.list 로 확인한다. 예외는 삼켜 회신용 사유로만 변환한다.
+    중복은 insert 전에 playlistItems.list 로 확인한다(list→insert 사이가 갈리면 같은 곡이 두 번
+    들어가므로 _LOCK 이 그 구간을 덮는다). 예외는 삼켜 회신용 사유로만 변환한다.
     """
-    try:
-        access = _get_access()
-        existing = {vid: title for _item, vid, title in _list_items(access)}
-    # URLError/HTTPError ⊂ OSError, json ⊂ ValueError, 응답 잘림(IncompleteRead 등) = HTTPException
-    # (OSError 아님 — fetch_rest_probe 선례처럼 명시 포집해야 회신 유실 없이 사유로 변환).
-    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
-        return ("fail", _reason(e))
-    if video_id in existing:
-        return ("dup", existing[video_id])
-    try:
-        return ("added", _insert(access, video_id))
-    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
-        return ("fail", _reason(e))
+    with _LOCK:
+        try:
+            access = _get_access()
+            existing = {vid: title for _item, vid, title in _list_items(access)}
+        # URLError/HTTPError ⊂ OSError, json ⊂ ValueError, 응답 잘림(IncompleteRead 등) =
+        # HTTPException(OSError 아님 — fetch_rest_probe 선례처럼 명시 포집해야 회신 유실 없이
+        # 사유로 변환).
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+            return ("fail", _reason(e))
+        if video_id in existing:
+            return ("dup", existing[video_id])
+        try:
+            return ("added", _insert(access, video_id))
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+            return ("fail", _reason(e))
 
 
 def list_titles() -> tuple[str, list[tuple[str, str]]]:
@@ -197,10 +210,11 @@ def list_titles() -> tuple[str, list[tuple[str, str]]]:
     삭제 전용이라 뺀다). 예외 포집은 add_video·remove_video 와 같은 집합 — 비밀값 미포함 사유로만
     변환한다(이 회신은 비인가 서버 멤버도 보는 채널로 나간다).
     """
-    try:
-        return ("", [(vid, title) for _item, vid, title in _list_items(_get_access())])
-    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
-        return (_reason(e), [])
+    with _LOCK:
+        try:
+            return ("", [(vid, title) for _item, vid, title in _list_items(_get_access())])
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+            return (_reason(e), [])
 
 
 def remove_video(query: str) -> tuple[str, str, str]:
@@ -226,19 +240,20 @@ def remove_video(query: str) -> tuple[str, str, str]:
         not key
     ):  # 빈 키는 모든 제목에 포함돼 곡이 1개뿐인 목록의 그 곡을 지운다(파괴적 함수 자체 가드)
         return ("none", query, "")
-    try:
-        items = _list_items(_get_access())
-    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
-        return ("fail", _reason(e), "")
-    exact = [it for it in items if fold_title(it[2]) == key]
-    hits = exact or [it for it in items if key in fold_title(it[2])]
-    if not hits:
-        return ("none", query, "")
-    if len(hits) > 1:
-        return ("many", " / ".join(title[:40] for _item, _vid, title in hits[:5]), "")
-    item_id, video_id, title = hits[0]
-    try:
-        _delete(_get_access(), item_id)
-    except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
-        return ("fail", _reason(e), "")
-    return ("removed", title, video_id)
+    with _LOCK:  # list→판정→delete 가 갈리면 남이 지운 item id 를 지우려 든다(파괴적 경로)
+        try:
+            items = _list_items(_get_access())
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+            return ("fail", _reason(e), "")
+        exact = [it for it in items if fold_title(it[2]) == key]
+        hits = exact or [it for it in items if key in fold_title(it[2])]
+        if not hits:
+            return ("none", query, "")
+        if len(hits) > 1:
+            return ("many", " / ".join(title[:40] for _item, _vid, title in hits[:5]), "")
+        item_id, video_id, title = hits[0]
+        try:
+            _delete(_get_access(), item_id)
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+            return ("fail", _reason(e), "")
+        return ("removed", title, video_id)

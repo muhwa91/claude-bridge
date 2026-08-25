@@ -3752,9 +3752,13 @@ def run_yt_digest(adapter: Adapter, channel_id: int, today: str) -> bool:
             return True
     except FileNotFoundError:
         pass  # 아직 한 번도 안 냈다 — 정상 경로라 조용히 지나간다
-    except OSError as e:
+    except (OSError, ValueError) as e:
         # 스탬프를 못 읽으면 중복 방지가 통째로 꺼져 **매 세션 전 파이프라인이 다시 돈다**
         # (자막·판정 토큰을 그만큼 태운다). 흔적이 0 이면 아무도 모르므로 경고는 남긴다.
+        # 🔴 ValueError 도 잡는 이유 — `UnicodeDecodeError` 는 **OSError 가 아니라 ValueError** 다.
+        # 파일에 비UTF-8 바이트가 한 번 들어가면 여기서 예외가 새어 _run_digest 가 삼키고(3회 재시도
+        # 뒤 그날 포기) **덮어쓰는 경로에 영영 도달하지 못해** 다음 주도 그 다음 주도 고장난다.
+        # 디코드 실패 = 파손된 스탬프 = 다시 내보내야 정상이므로 「못 읽었다」와 같게 취급한다.
         log.warning(
             "유튜브 발송 스탬프를 못 읽었다(%s) — 같은 회차를 다시 낼 수 있다", type(e).__name__
         )
@@ -6383,7 +6387,7 @@ def run_spotify_monthly(adapter: Adapter, channel_id: int, today: str) -> bool:
         # 파일에 비UTF-8 바이트가 한 번 들어가면 여기서 예외가 새어 _run_digest 가 삼키고(3회 재시도
         # 뒤 그날 포기) **덮어쓰는 경로에 영영 도달하지 못해** 다음 달도 그 다음 달도 고장난다.
         # 디코드 실패 = 파손된 스탬프 = 다시 담아야 정상이므로 「못 읽었다」와 같게 취급한다.
-        # (같은 형태가 run_yt_digest 의 YT_POSTED_F 읽기에도 있다 — 이번 범위 밖이라 안 건드렸다.)
+        # (같은 형태가 run_yt_digest 의 YT_POSTED_F 읽기에도 있었다 — 2026-08-26 함께 고쳤다.)
         log.warning(
             "스포티파이 월 스탬프를 못 읽었다(%s) — 이번 달에 또 담을 수 있다", type(e).__name__
         )

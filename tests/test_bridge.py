@@ -10209,6 +10209,23 @@ def test_yt_digest_skips_same_stamp(monkeypatch, tmp_path):
     assert not a.sent
 
 
+def test_yt_digest_survives_undecodable_stamp(monkeypatch, tmp_path):
+    """비UTF-8 스탬프(UnicodeDecodeError ⊄ OSError)도 「못 읽었다」로 떨어져 자가치유한다.
+
+    안 잡으면 러너가 매 호출 예외 → _run_digest 가 삼키고 3회 재시도 뒤 그날 포기 →
+    덮어쓰는 경로에 영영 도달하지 못해 다음 주도 그 다음 주도 고장난다.
+    파손 페이로드의 텍스트 꼬리는 기대값과 **다른 스탬프**를 쓴다 — 같은 값이면
+    「치유된 값」과 「그대로 남은 쓰레기」가 값으로 구분되지 않는다.
+    """
+    monkeypatch.setattr(bridge, "YT_TODAY_F", tmp_path / "t.md")
+    monkeypatch.setattr(bridge, "YT_POSTED_F", tmp_path / "p.txt")
+    bridge.YT_TODAY_F.write_text("# 유튜브 후보 — 2026-08-16\n■ 자동 선발 0건\n", encoding="utf-8")
+    bridge.YT_POSTED_F.write_bytes(b"\xff\xfe# \xec\x98\x9b \xed\x9b\x84\xeb\xb3\xb4 2026-01-01\n")
+    a = FakeAdapter()
+    assert bridge.run_yt_digest(a, 7, "2026-08-16") is True
+    assert bridge.YT_POSTED_F.read_text(encoding="utf-8").strip() == "# 유튜브 후보 — 2026-08-16"
+
+
 def test_yt_digest_runs_end_to_end_with_valid_tool_tier(monkeypatch, tmp_path):
     """행복 경로 1건 — **run_claude 인자를 실제 계약으로 검증**한다.
 

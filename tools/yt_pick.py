@@ -275,6 +275,9 @@ def yt(args: list[str], budget: Budget, kind: str, cost: int = 1) -> str:
         errors="replace",
         timeout=600,
         check=False,
+        # detached(콘솔 없는) 부모에서 돌면 yt-dlp.exe 가 «새 콘솔 창»을 띄운다 — 훅의
+        # windowsHide 는 python 까지만 먹는다. 사용자가 그 창을 닫으면 0xC000013A 로 죽는다.
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if p.returncode != 0:  # 403·차단은 예외가 아니라 종료코드로 온다 — 안 남기면 흔적이 사라진다
         lines = [ln.strip() for ln in (p.stderr or "").splitlines() if ln.strip()]

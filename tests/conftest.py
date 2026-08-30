@@ -26,6 +26,19 @@ LIVE_PATHS = {
     "YT_DEV_LOG": bridge.YT_DEV_LOG,
 }
 
+# 위 경로들은 **모노레포 안에서만** 실물이 있다. 공개 미러(`muhwa91/claude-bridge`)는 이 프로젝트
+# 폴더만 떼어낸 독립 클론이라 `REPO_ROOT/_System/` 이 아예 없고, 실경로를 보는 테스트 3건이
+# 거기서는 «구조적으로 통과 불가»한 빨간불로 남는다(2026-08-30 실측 — 공개 레포를 보는 사람에게는
+# 깨진 프로젝트로 보인다). 그래서 «없다»를 값으로 만들어 두고 그 3건만 skip 한다.
+# 🔴 **모노레포 안에서는 절대 skip 되면 안 된다** — 그 3건이 경로 드리프트의 유일한 방어선이라
+# (2026-08-14 실사고) 조용히 꺼지면 종전과 똑같은 무음 실패로 돌아간다.
+# 회귀: `test_conftest_monorepo_guard.py`.
+IN_MONOREPO = (bridge.REPO_ROOT / "_System" / "Core").is_dir()
+
+requires_monorepo = pytest.mark.skipif(
+    not IN_MONOREPO, reason="모노레포 밖(공개 미러 클론) — LIVE_PATHS 실물이 없다"
+)
+
 # 다이제스트가 **실제로 쓰는** 상태 파일. 모듈 상수를 직접 읽는 함수(mark_seen·append_rejected·
 # append_backlog·collect_awesome)를 부르는 테스트가 monkeypatch 를 빠뜨리면 라이브가 오염된다.
 _STATE_ATTRS = (

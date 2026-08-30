@@ -57,6 +57,7 @@ from bridge import (
     run_claude,
     save_notify_state,
 )
+from conftest import requires_monorepo  # pytest 가 conftest 를 먼저 로드한다
 
 _ALLOWED = frozenset({777})
 _ALLOWED2 = frozenset({777, 888})
@@ -9903,6 +9904,7 @@ def test_yt_registered_as_session_runner():
     assert bridge.DIGEST_RUNNERS[bridge.YT_NOTIFY_ID] == "run_yt_digest"
 
 
+@requires_monorepo
 def test_repo_paths_actually_exist():
     """상수가 가리키는 **실경로가 실재하는지** 단언한다.
 
@@ -9922,6 +9924,7 @@ def test_repo_paths_actually_exist():
         assert p.exists(), f"{name} 이 가리키는 {p} 가 없다 — 파일이 옮겨졌나?"
 
 
+@requires_monorepo
 def test_backlog_read_returns_content():
     """경로가 맞아도 **실제로 읽히는지**까지 본다(존재만으로는 무음 실패를 못 잡는다)."""
     from conftest import LIVE_PATHS
@@ -10423,6 +10426,7 @@ def test_yt_upload_returns_empty_when_rclone_fails(monkeypatch, tmp_path):
     assert bridge.yt_upload(tmp_path / "x.pdf", "2026-08-14", "MCP") == ""
 
 
+@requires_monorepo
 def test_yt_dev_log_path_agrees_with_picker():
     """`bridge.YT_DEV_LOG` 와 `tools/yt_pick.py` 의 `DEV_LOG` 가 **같은 파일**이어야 한다.
 

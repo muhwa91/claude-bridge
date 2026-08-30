@@ -4301,7 +4301,8 @@ def append_yt_backlog(day: str, picks: list[dict[str, Any]], judged: list[dict[s
     try:
         cur = BACKLOG_FILE.read_text(encoding="utf-8")
         # 🔴 라인 앵커 필수 — 머리말이 `## 열린/미결 항목` 을 **백틱으로 인용**하고 있어
-        # 단순 substring 은 그 인용을 먼저 잡고 **머리말 문장 한가운데를 쪼갠다**(2026-08-21 실사고).
+        # 단순 substring 은 그 인용을 먼저 잡고 **머리말 문장 한가운데를 쪼갠다**
+        # (2026-08-21 실사고).
         # 같은 파일 `_BACKLOG_OPEN_RE` 는 처음부터 `re.M` 라인 앵커였다 — 이쪽만 빠져 있었다.
         m = re.search(r"^## 열린/미결 항목.*$", cur, re.M)
         if m is None:

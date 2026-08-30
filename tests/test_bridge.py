@@ -7358,7 +7358,16 @@ def test_claude_cli_accepts_every_flag_we_pass():
         pytest.skip("claude CLI 없음")
     try:
         help_text = subprocess.run(
-            [exe, "--help"], capture_output=True, text=True, timeout=120, check=False
+            # encoding 명시 — 헬프의 UTF-8 바이트를 Windows 기본 cp949 로 읽다 리더 스레드에서
+            # UnicodeDecodeError 가 나면, 그 예외는 호출부로 전파되지 않고 `.stdout` 만 None 이
+            # 되어 아래 `except (OSError, TimeoutExpired)` skip 가드를 무력화한다(2026-08-30 실측).
+            [exe, "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            check=False,
         ).stdout
     except (OSError, subprocess.TimeoutExpired) as exc:  # pragma: no cover - 환경 의존
         pytest.skip(f"claude --help 실행 실패: {exc}")

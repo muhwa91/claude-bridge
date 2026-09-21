@@ -7716,6 +7716,31 @@ def test_run_digest_stops_reverting_after_max_attempts(digest_env, monkeypatch):
     assert ("os-digest", "2026-07-15") in bridge.notify_fired  # 마지막 시도는 되돌리지 않음
 
 
+def test_run_digest_shouts_when_giving_up(digest_env, monkeypatch, caplog):
+    """🔴 그날치를 버릴 때는 **채널에 말한다** — 이 침묵이 유튜브 문서화 24일을 먹었다.
+
+    로그 등급도 ERROR 다(WARNING 은 평소에도 흘러 눈에 안 띈다). 도배 방지: 상한을 넘는
+    순간 딱 한 번 — 그 뒤 몇 번을 더 불러도 통지는 늘지 않는다.
+    """
+    monkeypatch.setattr(bridge, "run_opensource_digest", lambda *_a: False)
+    with caplog.at_level(logging.ERROR, logger="bridge"):
+        for _ in range(bridge.DIGEST_MAX_ATTEMPTS + 2):
+            bridge.notify_fired.add(("os-digest", "2026-07-15"))
+            bridge._run_digest(digest_env, 555, "os-digest", "2026-07-15")
+    assert [c for c, _t, _b in digest_env.sent] == [555]  # 그 다이제스트의 채널로 1회
+    assert "os-digest" in digest_env.sent[0][1] and "bridge.log" in digest_env.sent[0][1]
+    assert any("재시도 중단" in r.getMessage() for r in caplog.records)
+
+
+def test_run_digest_no_alert_before_the_limit(digest_env, monkeypatch):
+    """일시 장애(1·2회차)는 다음 틱이 삼킨다 — 그때까지는 조용해도 된다."""
+    monkeypatch.setattr(bridge, "run_opensource_digest", lambda *_a: False)
+    for _ in range(bridge.DIGEST_MAX_ATTEMPTS - 1):
+        bridge.notify_fired.add(("os-digest", "2026-07-15"))
+        bridge._run_digest(digest_env, 555, "os-digest", "2026-07-15")
+    assert digest_env.sent == []
+
+
 # ── 파이프라인(네트워크·claude 전부 monkeypatch) ────────────────────────────
 @pytest.fixture
 def pipeline(monkeypatch, tmp_path):
@@ -10394,6 +10419,24 @@ def test_yt_digest_pdf_failure_reverts(monkeypatch, tmp_path):
     assert bridge.run_yt_digest(a, 7, "2026-08-16") is False
     assert not a.sent
     assert not bridge.YT_POSTED_F.exists(), "PDF 가 없는데 스탬프를 남겼다"
+
+
+def test_build_yt_pdf_logs_whole_evidence(monkeypatch, tmp_path, caplog):
+    """build_note 가 실은 증거가 **로그에서 잘리지 않는다**(2026-09-21).
+
+    종전 `[-200:]` 은 argv·dest·부모목록·크롬버전을 통째로 잘랐고, `(stderr or stdout)` 은
+    stderr 가 비면 stdout 까지 못 보게 했다 — 24회 연속 실패에서 남은 것은 `rc=0` 뿐이었다.
+    """
+    evidence = "argv=['chrome', '--headless=new']\n" + "x" * 1200 + "\n증거=C:/T/yt_pdf_fail/1"
+    monkeypatch.setattr(
+        bridge.subprocess,
+        "run",
+        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 1, "표준출력도 본다", evidence),
+    )
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        assert bridge.build_yt_pdf(tmp_path / "x.md", tmp_path / "x.pdf") is False
+    assert "argv=" in caplog.text and "yt_pdf_fail" in caplog.text  # 머리도 꼬리도 살아 있다
+    assert "표준출력도 본다" in caplog.text  # 한쪽이 비어도 다른 쪽을 본다
 
 
 def test_yt_upload_builds_dated_remote_path(monkeypatch, tmp_path):

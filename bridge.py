@@ -3612,7 +3612,7 @@ def _review_gist(body: str) -> str:
     return next(iter(body.splitlines()), "")
 
 
-def _revert_digest_fired(item_id: str, today: str, reason: str) -> None:
+def _revert_digest_fired(item_id: str, today: str, reason: str) -> bool:
     """다이제스트 fired 선기록 되돌림 — 하루 DIGEST_MAX_ATTEMPTS 회까지만.
 
     되돌림 지점이 둘이다: 워커(_run_digest, 파이프라인 실패)와 틱(dispatch_notifications,
@@ -3622,6 +3622,10 @@ def _revert_digest_fired(item_id: str, today: str, reason: str) -> None:
     자기치유는 상한 안이라 그대로 산다).
     **예산은 다이제스트 id 별로 따로 센다** — 세션 항목 둘이 같은 틱에 함께 도는데 예산을
     공유하면 한쪽 장애가 다른 쪽 그날치를 통째로 삼킨다(로그에도 어느 쪽인지 남긴다).
+
+    🔴 **포기했으면 True 를 돌린다**(2026-09-21). 호출부가 그때 사람에게 알린다 — 유튜브
+    문서화가 24일(24/24회) 동안 이 자리에서 조용히 포기했고, 흔적은 WARNING 한 줄뿐이라
+    아무도 몰랐다. 「그날치를 통째로 버렸다」는 로그 등급이 경고가 아니라 **오류**다.
     """
     with _notify_lock:
         key = (item_id, today)
@@ -3630,13 +3634,18 @@ def _revert_digest_fired(item_id: str, today: str, reason: str) -> None:
             del _digest_attempts[stale]  # 어제 것만 정리(clear 면 형제 카운터까지 날아간다)
         _digest_attempts[key] = tries
         if tries >= DIGEST_MAX_ATTEMPTS:
-            log.warning("다이제스트 %s %s %d회 — 오늘은 재시도 중단", item_id, reason, tries)
-            return
+            log.error(
+                "다이제스트 %s %s %d회 — 오늘은 재시도 중단(그날치 유실)", item_id, reason, tries
+            )
+            # 통지는 **상한을 넘는 그 순간 한 번만** — 스누즈 등으로 이 자리에 다시 와도
+            # 같은 말을 되풀이하지 않는다(로그는 매번 남는다).
+            return tries == DIGEST_MAX_ATTEMPTS
         notify_fired.discard(key)
         save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
         log.info(
             "다이제스트 %s %s %d/%d — 다음 틱 재시도", item_id, reason, tries, DIGEST_MAX_ATTEMPTS
         )
+        return False
 
 
 def _start_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -> None:
@@ -3667,8 +3676,17 @@ def _run_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -> 
         # 다이제스트는 스레드 안이라 이 로그가 유일한 증거다 — 상위로 전파되지 않는다.
         log.exception("다이제스트 예외 (%s)", item_id)
         posted = False
-    if not posted:
-        _revert_digest_fired(item_id, today, "실패")
+    if not posted and _revert_digest_fired(item_id, today, "실패"):
+        # 🔴 그날치를 버렸다 → **사람에게 말한다**(2026-09-21). 로그만 남기던 종전엔 유튜브
+        # 문서화가 24일간 하루도 안 나왔는데 채널은 조용했다 — 「안 온 것」은 눈에 안 띈다.
+        # 도배 걱정은 없다: 상한에 닿으면 fired 를 유지하므로 이 자리는 **하루 1회**만 온다.
+        # 채널은 그 다이제스트가 본래 게시될 곳(새 통지 경로를 만들지 않는다).
+        adapter.send(
+            channel_id,
+            f"⛔ `{item_id}` 오늘 {DIGEST_MAX_ATTEMPTS}회 실패 — 오늘치는 포기했습니다.\n"
+            "원인은 `claude-bridge/logs/bridge.log` 에 있습니다.",
+            None,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -4119,7 +4137,16 @@ def build_yt_pdf(md: Path, pdf: Path) -> bool:
         log.warning("PDF 생성 실패(%s)", type(e).__name__)
         return False
     if r.returncode != 0 or not pdf.exists():
-        log.warning("build_note rc=%s — %s", r.returncode, (r.stderr or r.stdout)[-200:])
+        # ⚠️ **꼬리를 짧게 자르지 마라**(2026-09-21). build_note 는 실패 시 argv·dest·부모 목록·
+        # stdout/stderr·크롬 버전·증거 경로를 여러 줄로 뱉는데, 종전 `[-200:]` 이면 그게 전부
+        # 잘려나가 **증거를 실어도 로그엔 안 남는다**. 여기가 유일한 기록 지점이다.
+        # stdout 도 함께 남긴다 — `or` 로 고르면 한쪽이 비었을 때 다른 쪽까지 못 본다.
+        log.warning(
+            "build_note rc=%s — stderr=%s / stdout=%s",
+            r.returncode,
+            r.stderr[-2000:],
+            r.stdout[-500:],
+        )
         return False
     return True
 

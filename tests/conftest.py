@@ -18,19 +18,13 @@ LIVE_PATHS = {
     "BACKLOG_FILE": bridge.BACKLOG_FILE,
     "PROJECT_LABELS": bridge.REPO_ROOT / "_System" / "Core" / "project_labels.json",
     "SEEN_FILE": bridge.SEEN_FILE,
-    "YT_TODAY_F": bridge.YT_TODAY_F,
-    # 유튜브 산출 색인 — `BACKLOG_FILE` 과 **같은 부류의 위험**이다. 이 경로가 어긋나도
-    # `append_yt_dev_log` 의 `mkdir(parents=True)` 가 엉뚱한 곳에 유령 파일을 만들며 조용히
-    # 성공하고, 그 사이 `tools/yt_pick.py` 는 진짜 색인을 읽어 **중복 제거가 영구히 꺼진다**
-    # (이미 다룬 영상을 계속 다시 뽑아 자막·판정 토큰을 태운다).
-    "YT_DEV_LOG": bridge.YT_DEV_LOG,
 }
 
 # 위 경로들은 **모노레포 안에서만** 실물이 있다. 공개 미러(`muhwa91/claude-bridge`)는 이 프로젝트
-# 폴더만 떼어낸 독립 클론이라 `REPO_ROOT/_System/` 이 아예 없고, 실경로를 보는 테스트 3건이
+# 폴더만 떼어낸 독립 클론이라 `REPO_ROOT/_System/` 이 아예 없고, 실경로를 보는 테스트들이
 # 거기서는 «구조적으로 통과 불가»한 빨간불로 남는다(2026-08-30 실측 — 공개 레포를 보는 사람에게는
 # 깨진 프로젝트로 보인다). 그래서 «없다»를 값으로 만들어 두고 그 3건만 skip 한다.
-# 🔴 **모노레포 안에서는 절대 skip 되면 안 된다** — 그 3건이 경로 드리프트의 유일한 방어선이라
+# 🔴 **모노레포 안에서는 절대 skip 되면 안 된다** — 그 테스트들이 경로 드리프트의 유일한 방어선이라
 # (2026-08-14 실사고) 조용히 꺼지면 종전과 똑같은 무음 실패로 돌아간다.
 # 회귀: `test_conftest_monorepo_guard.py`.
 IN_MONOREPO = (bridge.REPO_ROOT / "_System" / "Core").is_dir()
@@ -46,19 +40,9 @@ _STATE_ATTRS = (
     "REJECTED_FILE",
     "BACKLOG_FILE",
     "AWESOME_SNAPSHOT_FILE",
-    # 유튜브 후보(2026-08-13) — 둘 다 라이브 파일이라 격리하지 않으면 테스트가 실물을 건드린다.
-    # YT_POSTED_F 를 안 막으면 "이미 낸 스탬프"가 테스트 값으로 덮여 **실제 카드가 안 뜬다**.
-    # YT_TODAY_F 는 읽기 전용이지만, 격리해야 테스트가 라이브 선별 결과에 좌우되지 않는다.
-    "YT_POSTED_F",
-    "YT_TODAY_F",
-    # YT_DEV_LOG 도 `append_yt_dev_log` 가 **모듈 상수를 직접 읽어** 추가(append)하는 라이브
-    # 파일이라 같은 성질이다 — monkeypatch 를 빠뜨린 테스트가 실색인에 가짜 행을 남기면
-    # yt_pick 의 중복 제거가 그 영상을 영구히 후보에서 뺀다.
-    # ⚠️ 실경로가 필요한 테스트는 `LIVE_PATHS["YT_DEV_LOG"]` 를 쓴다(여기서 tmp 로 덮인다).
-    "YT_DEV_LOG",
     # 스포티파이 월 스탬프(2026-08-25) — **수동 'ㅁ스포티파이' 테스트도 이 파일을 쓴다**
     # (_handle_music_spotify 가 직접 찍는다). 격리를 빠뜨리면 테스트가 라이브 스탬프를 이번 달로
-    # 덮어 **그 달의 자동 실행이 통째로 사라진다**(YT_POSTED_F 와 같은 성질).
+    # 덮어 **그 달의 자동 실행이 통째로 사라진다**.
     "SPOTIFY_MONTH_F",
 )
 
@@ -70,7 +54,7 @@ _STATE_ATTRS = (
 
 @pytest.fixture(autouse=True)
 def _isolate_state_files(monkeypatch, tmp_path_factory):
-    """상태 파일 4종을 **모든 테스트에서** tmp 로 돌린다(라이브 오염 방지 가드).
+    """상태 파일 전부를 **모든 테스트에서** tmp 로 돌린다(라이브 오염 방지 가드).
 
     2026-07-27 실제 사고: `_post_digest_cards` 를 직접 부르는 테스트가 SEEN_FILE 을 monkeypatch
     하지 않아 라이브 `logs/opensource_seen.json` 에 테스트 고정 날짜(`owner/repo-plus`:

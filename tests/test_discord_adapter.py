@@ -1956,8 +1956,8 @@ def test_scheduler_special_role_channels():
     # 표시 순서를 바꾸려면 디스코드에서 직접 옮긴다.
     # (종전 주석은 *"바꾸면 채널이 재배치된다"* 였으나 **거짓이었다** — 2026-08-15 점검에서
     #  두 게이트가 독립 실측: 항목 제거 전후 4채널 position 불변. 거짓 주석은 없느니만 못하다.)
-    # notify.json 의 `channel` 은 **tag** 를 쓴다:
-    # yt-digest → "유튜브-Dev"(표시명 `유튜브dev` 아님).
+    # notify.json 의 `channel` 은 **표시명이 아니라 tag** 를 쓴다:
+    # us-digest → "미국주식"(표시명 `#반도체주식` 아님).
     # 읽기전용·notify.json 라우팅도 tag 기준이라 함께 무변경이어야 한다.
     assert "미국주식" in discord_adapter._READONLY_TAGS
 

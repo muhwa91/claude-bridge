@@ -645,7 +645,7 @@ def test_event_to_progress_text_stripped():
 
 
 def test_event_to_progress_masks_secret_before_truncation():
-    secret = "C:\\Users\\Home"
+    secret = "C:\\Users\\Example"
     cmd = "a" * 55 + secret + "tail"
     ev = _assistant({"type": "tool_use", "name": "Bash", "input": {"command": cmd}})
     line = event_to_progress(ev, [secret])

@@ -1760,6 +1760,24 @@ DIGEST_CARD_MAXLEN = 1000
 DIGEST_NEW_DAYS = 90  # 신흥 축 조회 창(일) — `created:>` 에 들어간다
 DIGEST_COOLDOWN_DAYS = 30  # 발송·기각 후 다시 후보로 올리지 않는 기간(일). 📌 등재분은 영구 제외
 _SEEN_FOREVER = ""  # seen 값이 빈 문자열 = 날짜 없는 **영구 제외**(📌 등재분 · v1 리스트 형식)
+# 이미 **채택해 하네스에 이식한** 레포 — 영구 제외. `SEEN_FILE` 은 gitignore(로그 폴더)라 재클론·
+# 로그 삭제로 사라진다: 거기에 적으면 제외가 풀려 후보로 되돌아온다. `HARNESS_POLICY` 와 같은
+# 이유로 **판정 근거를 코드에 둔다.**
+# ▸ 왜 영구인가: 기각(쿨다운)은 "조건이 해소되면 다시 와야 하는" 보류인데, 이식은 **이미 반영을
+#   마친 상태**라 해소될 조건이 없다. 📌 버튼이 `_SEEN_FOREVER` 를 쓰는 것과 같은 사상(5393).
+# ▸ 스킬 폴더가 남아 있으면 `installed_names` 가 걸렀는데, 2026-10-01 에 요지만 직원 정의로
+#   옮기고 폴더를 지워 그 거르기가 풀렸다(계약 5절의 `_skill_names` 장치가 **바로 이 두 레포**를
+#   예시로 든다). 이름은 후보 `name` = GitHub `full_name` 표기 그대로.
+# ⚠️ `--digest-dry-run --ignore-seen` 은 active_seen 을 통째로 건너뛰므로 이것도 안 걸린다
+#   (드라이런은 게시·기록을 안 하니 그대로 둔다).
+_SEEN_ADOPTED = frozenset(
+    {
+        # 2026-10-01 이식 → `.claude/agents/doc/writer.md` 「AI 티 제거」(스킬 폴더는 삭제)
+        "blader/humanizer",
+        # 2026-10-01 이식 → `.claude/agents/doc/researcher.md` 「최근 30일 커뮤니티 축」
+        "mvanhorn/last30days-skill",
+    }
+)
 _BACKLOG_FIELD_MAXLEN = 200  # 백로그 한 줄에 싣는 외부 유래 필드(이름·적용·URL) 각각의 상한
 # ── 하네스 주입 상한(로컬·신뢰 소스라 인젝션 가드는 불필요하되 토큰·비용 상한은 건다) ──
 HARNESS_MAX_NAMES = 60  # 목록(MCP·플러그인·스킬·에이전트) 1개당 이름 수 상한
@@ -3150,14 +3168,21 @@ def save_seen(path: Path, seen: dict[str, str]) -> None:
 
 
 def active_seen(
-    seen: dict[str, str], today: date, cooldown: int = DIGEST_COOLDOWN_DAYS
+    seen: dict[str, str],
+    today: date,
+    cooldown: int = DIGEST_COOLDOWN_DAYS,
+    adopted: frozenset[str] = _SEEN_ADOPTED,
 ) -> set[str]:
     """아직 유효한 제외 목록(= 오늘 후보에서 뺄 이름). 영구·손상 값은 계속 제외. 순수.
 
     기각을 **영구가 아니라 쿨다운**으로 둔 이유: `claude-mem` 처럼 "uninstall 미확인"으로 보류된
     후보는 문서가 생기면 판정이 바뀌어야 한다. 영구 제외하면 조건이 해소돼도 영영 안 온다.
+    **기각은 쿨다운 / 이식 완료는 영구** — 둘은 충돌하지 않는다. `adopted`(`_SEEN_ADOPTED`)는
+    이미 반영을 마쳐 해소될 조건이 없는 것만 담는다(`SEEN_FILE` 이 gitignore 라 코드 상수).
     """
-    return {name for name, value in seen.items() if _seen_blocks(value, today, cooldown)}
+    return set(adopted) | {
+        name for name, value in seen.items() if _seen_blocks(value, today, cooldown)
+    }
 
 
 def _seen_blocks(value: str, today: date, cooldown: int) -> bool:
@@ -6674,8 +6699,16 @@ def _selftest() -> None:
     assert [c["name"] for c in _picked] == ["o/fast", "o/tiny"]
     assert parse_screen_names("아무것도 못 골랐습니다", [_fast]) == []  # 폴백 신호(호출측이 상위 N)
     # seen 쿨다운: 발송·기각은 30일, 📌(빈 값)은 영구, 손상 값도 계속 제외.
-    assert active_seen({"a": "2026-07-20", "b": "2026-06-01"}, _today) == {"a"}
-    assert active_seen({"a": _SEEN_FOREVER, "b": "쓰레기"}, _today) == {"a", "b"}
+    # (`adopted=frozenset()` = 코드 상수를 뺀 종전 동작 — 상수가 비어도 이 결과가 유지돼야 한다.)
+    _none: frozenset[str] = frozenset()
+    assert active_seen({"a": "2026-07-20", "b": "2026-06-01"}, _today, adopted=_none) == {"a"}
+    assert active_seen({"a": _SEEN_FOREVER, "b": "쓰레기"}, _today, adopted=_none) == {"a", "b"}
+    # 이식 완료분(_SEEN_ADOPTED)은 seen 파일이 비어도(= 재클론 직후) 항상 제외된다.
+    assert active_seen({}, _today) == set(_SEEN_ADOPTED)
+    assert {"blader/humanizer", "mvanhorn/last30days-skill"} <= active_seen({"a": "쓰레기"}, _today)
+    # 그 두 이름은 후보 `name`(GitHub full_name) 표기 그대로라 1차 거르기에서 실제로 걸린다.
+    _adopted_cand = {"name": "blader/humanizer", "key": "humanizer", "stars": 9999, "points": 0}
+    assert filter_digest([_adopted_cand], active_seen({}, _today), set(), today=_today) == []
     # 선택지 파싱.
     assert parse_choice_prompt("옵션.\n❓선택: [유지|keep]|[교체|swap]") == (
         "옵션.",

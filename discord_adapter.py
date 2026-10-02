@@ -178,7 +178,6 @@ _PROJECT_ORDER = [
     "H_security_sheet",
     "trading_info",
     "etf_info",
-    "mobi_barter",
     "chiikawa_office",
     "claude_bridge",
 ]

@@ -8447,11 +8447,14 @@ _needs_real_schedules = pytest.mark.skipif(
 # `ti-premarket-baseline`(평일 07:50/70)은 2026-08-12 졸업 — 라이브 관측 통과(장전 기준가가
 # 3경로에서 일치)로 목적을 다했고 notify.json 에서 빠졌다(커밋 cf27626). 1→0.
 # 값은 배포본 실물과 대조해 적는다.
-# ⚠️ **지금은 비어 있다** — 배포본에 시각 알림이 한 건도 없고 세션 항목만 남았다. 그래서 이
-# 딕셔너리를 도는 대조는 공회전이고, 그 자리를 아래 "시각 항목이 하나도 없다" 단언이 대신 지킨다
-# (빈 창 트립와이어와 같은 취지의 파일 단위판). 시각 알림이 다시 들어오면 그 항목을 여기 적으면
-# 되고, 그 순간 대조 루프와 아래 respect_fired 가 자동으로 되살아난다.
-_REAL_BASELINE: dict[str, tuple[list[str], str, int]] = {}
+# 비어 있으면 대조는 공회전이고 그 자리를 아래 «시각 항목 = 베이스라인» 단언이 대신 지킨다
+# (빈 창 트립와이어와 같은 취지의 파일 단위판). 시각 알림이 들어오면 그 항목을 여기 적는다.
+# `agent-usage-compare`(일 10:17/720) — 2026-10-04 커밋 7180b60 이 넣은 직원 모델 비교 1회 알림.
+# 10-18 실행 뒤 notify.json 에서 졸업시키면 이 줄도 함께 지운다(안 지우면 «베이스라인이 그대로
+# 있다» 단언이 빨개진다).
+_REAL_BASELINE: dict[str, tuple[list[str], str, int]] = {
+    "agent-usage-compare": (["sun"], "10:17", 720),
+}
 # 핑 값이 무엇이든 시각 알림 판정은 불변이어야 한다(없음·오늘·과거·미래·깨진 문자열).
 _PINGS = (None, "2026-07-15", "2026-07-14", "2026-07-16", "oops", "")
 # 세션 항목(다이제스트 2건 + pending-checks) — 시각 판정 테스트에서 걸러낸다. DIGEST_RUNNERS 로
@@ -8570,7 +8573,10 @@ def test_real_schedules_time_alerts_respect_fired():
     ]
     alert = [it for it in _REAL_ITEMS if it["id"] == target]
     assert alert, f"{target} 이 배포본에 없다 — 유도한 기준 항목이 죽었다(공허한 통과 방지)"
-    assert due_notifications(_REAL_ITEMS, moment, set(), ping) == alert + session_items
+    # 발송 순서 = notify.json 의 항목 순서다. 종전엔 시각 알림이 늘 앞에 있어 `alert + session` 으로
+    # 적었는데, agent-usage-compare(2026-10-04)는 맨 끝에 붙었다 → 파일 순서로 기대값을 만든다.
+    expected = [it for it in _REAL_ITEMS if it in alert or it in session_items]
+    assert due_notifications(_REAL_ITEMS, moment, set(), ping) == expected
     assert due_notifications(_REAL_ITEMS, moment, {(target, ping)}, ping) == session_items
 
 

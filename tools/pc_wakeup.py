@@ -94,10 +94,11 @@ def hm(hhmm):
 
 
 def due(items, today, now_hm=None):
-    """오늘 발화할 **시각 알림**만 고른다.
+    """오늘 발화할 **프로젝트 검증 리마인더**만 고른다.
 
-    `at` 이 없는 항목(`on: "session"` 다이제스트·리마인더)은 PC 앞에 있어야 할 시각이
-    없으므로 애초에 대상이 아니다. `days` 가 없으면 매일로 본다 — 브리지
+    대상은 `project` 키와 `at` 이 모두 있는 항목뿐이다. `project` 가 없는 항목(다이제스트·
+    월간 알림 등)은 PC 앞에서 사람이 확인하는 게 아니라 봇이 알아서 올리는 것이라 대상이 아니다.
+    `days` 가 없으면 매일로 본다 — 브리지
     `due_notifications` 와 같은 규약이라 한쪽만 다르게 해석하면 안 된다.
 
     now_hm: 실행 시각(KST HHMM). 주면 **이미 끝난 건을 뺀다.** cron 은 크게 늦을 수
@@ -107,7 +108,7 @@ def due(items, today, now_hm=None):
     종료(at+grace)를 창의 끝으로 본다. None 이면 시각을 안 따진다(순수 필터).
     """
     dow = DOW[today.weekday()]
-    out = [i for i in items if i.get("at") and dow in (i.get("days") or DOW)]
+    out = [i for i in items if i.get("project") and i.get("at") and dow in (i.get("days") or DOW)]
     if now_hm is None:
         return out
     return [
@@ -154,10 +155,10 @@ def selftest():
         "check_to": "09:00",
         "prep": "백엔드 실행 필요 → 바탕화면 [주식] 아이콘",
     }
-    session_item = {"id": "us-digest", "on": "session", "days": ["wed"]}
+    session_item = {"id": "us-digest", "at": "21:30", "days": ["wed"]}  # project 없음
     everyday = {"id": "x", "project": "p", "at": "06:00"}  # days 없음 = 매일
 
-    # ① 시각 없는 항목은 대상이 아니다 — 이걸 놓치면 다이제스트까지 폰으로 나간다.
+    # ① project 없는 항목은 대상이 아니다 — 이걸 놓치면 다이제스트·월간 알림까지 폰으로 나간다.
     assert due([session_item], wed) == []
     # ② 요일 필터. 토요일엔 평일 항목이 빠진다.
     assert [i["id"] for i in due([ti, session_item], wed)] == ["ti-premarket-baseline"]
@@ -173,8 +174,8 @@ def selftest():
     assert due([ti], wed, 900) == [], "창 끝 = 더 알릴 이유 없음"
     assert due([ti], wed, 1103) == [], "실측 최악 지연(11:03)에도 헛알림이 안 나간다"
     # check_to 가 없으면 PC활성화 종료(at+grace)가 창의 끝이다.
-    assert due([{"id": "n", "at": "07:00", "grace_min": 30}], wed, 725) != []
-    assert due([{"id": "n", "at": "07:00", "grace_min": 30}], wed, 730) == []
+    assert due([{"id": "n", "project": "p", "at": "07:00", "grace_min": 30}], wed, 725) != []
+    assert due([{"id": "n", "project": "p", "at": "07:00", "grace_min": 30}], wed, 730) == []
 
     body = render(ti, wed)
     assert body == (
@@ -195,6 +196,7 @@ def selftest():
     items = load(NOTIFY)
     assert isinstance(items, list) and all("id" in i for i in items), items
     for i in due(items, wed):
+        assert i.get("project"), i  # 실물에서도 project 없는 항목은 안 잡힌다
         render(i, wed)  # 배포본 항목이 렌더 중 죽지 않는지
 
     # ⑦ tg() — cp949 사고가 났던 함수라 실제 Request 를 검사한다(네트워크 안 나감).

@@ -7,7 +7,7 @@ spike/discord_bridge_spike.py 로 실증한 패턴을 정식화한다: discord.p
 `run_coroutine_threadsafe(coro, loop).result(timeout)` 로 코루틴 완료까지 블록해 동기 값을 반환한다.
 
 의존성 격리: discord.py import 는 **이 파일에만** 있다. 코어(bridge.main)는 이 모듈을 지연
-import 하므로 discord.py 미설치 환경에서도 순수 함수 경로(selftest·단위 테스트)가 죽지 않는다
+import 하므로 discord.py 미설치 환경에서도 순수 함수 경로(단위 테스트)가 죽지 않는다
 (계약: 본체 stdlib 전용).
 
 보안 경계(§2.4):
@@ -27,9 +27,11 @@ import queue
 import random
 import re
 import threading
+import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Coroutine, Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
@@ -65,6 +67,8 @@ from bridge import (
     STATUS_LEADERS,
     display_title,
     escape_reply,
+    notice_stamp,
+    off_notice_text,
     pick_index,
 )
 
@@ -83,26 +87,38 @@ _DISCORD_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 # 코어 상수를 import 하지 않는다: bridge 를 import 하면 순환이 된다(bridge → discord_adapter).
 FFMPEG_LOG_FILE = Path(__file__).resolve().parent / "logs" / "ffmpeg.log"
 
+# ── #봇상태 시스템 소식(기동·재연결) — 문구는 순수 함수라 테스트가 직접 부른다 ──────────
+_RECONNECT_NOTICE_MIN_SEC = 600  # 이 시간 이상 끊겼다 돌아왔을 때만 알린다(짧은 끊김은 조용히)
+
+
+def boot_notice_text(now: datetime) -> str:
+    """🟢 기동 알림 문구. 프로세스당 1회(on_ready 최초). 문구 = 개발자 확정(편집기)."""
+    return f"{notice_stamp(now)} 🟢 bridge On"
+
+
+def reconnect_notice_texts(since: float, now: float) -> list[str]:
+    """10분+ 끊겼다 돌아오면 `[끊긴 시각] 🔴 bridge Off` → `[돌아온 시각] 🟢 bridge On`(10-09 확정).
+
+    끊긴 동안엔 보낼 수 없으므로 둘 다 돌아온 뒤에 보낸다. 10분 미만이면 [](짧은 끊김은 잦다).
+    """
+    if now - since < _RECONNECT_NOTICE_MIN_SEC:
+        return []
+    return [
+        off_notice_text(datetime.fromtimestamp(since)),
+        boot_notice_text(datetime.fromtimestamp(now)),
+    ]
+
+
 # ── 상태색 매핑(§4.1 — 어댑터가 text 헤더로 판정, 계약 무변경) ──────────────────
 # ⚠️ 동기화 주의(§4 주의점 1): 색 판정은 코어(bridge)의 회신/진행 헤더에 묶여 있다.
 #   · 완료/실패/확인 3종은 위 HEADER_* import 로 문자열을 자동 추종(헤더 텍스트가 바뀌어도 무영향).
-#   · 진행/예약알림 선두 이모지도 코어 STATUS_LEADERS import(단일 소스) — 코어 변경 자동 추종.
+#   · 진행 선두 이모지도 코어 STATUS_LEADERS import(단일 소스) — 코어 변경 자동 추종.
 _COLOR_DONE = 0x3ECF85  # 초록 — 처리완료
 _COLOR_FAIL = 0xF0565B  # 빨강 — 처리실패
 _COLOR_INFO = 0x5865F2  # 블러플 — 추가 확인사항 / push 승인 대기
-_COLOR_WAIT = 0xEEBB4D  # 노랑 — 진행 중 / 예약 알림
+_COLOR_WAIT = 0xEEBB4D  # 노랑 — 진행 중
 _EMBED_TITLE_LIMIT = 256  # discord Embed title 한도
 _EMBED_DESC_LIMIT = 4096  # discord Embed description 한도(§4.1 — 초과분은 후속 plain 청크)
-# 카드 렌더(§card 규약) 전용 한도 — 초과분은 자른다(디스코드가 400 으로 거부하므로).
-_EMBED_AUTHOR_LIMIT = 256
-_EMBED_FIELD_NAME_LIMIT = 256
-_EMBED_FIELD_VALUE_LIMIT = 1024
-_EMBED_FOOTER_LIMIT = 2048
-_EMBED_FIELDS_MAX = 25
-# 임베드 **전 슬롯 합계** 한도(디스코드). 넘으면 400 으로 메시지 자체가 안 나간다 — 슬롯별
-# 한도를 다 지켜도 걸릴 수 있어 누적으로도 센다(build_card_embed).
-_EMBED_TOTAL_LIMIT = 6000
-_OMIT_NOTE_MAXLEN = 40  # footer 에 붙일 `⚠️N개 필드 생략(길이 초과)` 몫 — 총합에서 미리 뺀다
 
 # ── ①(채널 자동생성 §4.4) — 서버 구조 ───────────────────────────────────────
 # 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag). 프로젝트 카테고리는 setup 시
@@ -115,14 +131,12 @@ _BOT_NICKNAME = "치이카와 봇"
 _CAT_PROJECT = "📁 프로젝트"
 _CAT_SCHED = "🗓️ 스케쥴러"
 _CAT_SYSTEM = "⚙️ 시스템"
-_CAT_QUESTION = "❓ 질문"  # 게스트질문(개발자 외 서버 멤버 Q&A) 전용 — 시스템↔PlayList 사이.
 _CAT_VOICE = "🎵 PlayList"
-# 위치 순서(0..4): 프로젝트 아래 스케쥴러, 시스템 아래·PlayList 위에 질문.
+# 위치 순서(0..3): 프로젝트 아래 스케쥴러, 시스템 아래 PlayList.
 _CAT_ORDER = [
     _CAT_PROJECT,
     _CAT_SCHED,
     _CAT_SYSTEM,
-    _CAT_QUESTION,
     _CAT_VOICE,
 ]
 # 카테고리별 코어 별칭(기존 탐색) — 대부분 코어명 1개, 음성은 이전 이름 '음성' 포함.
@@ -130,7 +144,6 @@ _CAT_ALIASES: dict[str, list[str]] = {
     _CAT_PROJECT: ["프로젝트"],
     _CAT_SCHED: ["스케쥴러"],
     _CAT_SYSTEM: ["시스템"],
-    _CAT_QUESTION: ["질문"],
     _CAT_VOICE: ["PlayList", "음성"],
 }
 _VOICE_NAME = "PlayList"  # 음성 채널(재생 기능은 후속 — 자리만). 기본 음성 '일반'을 리네임/생성.
@@ -140,37 +153,26 @@ _DEFAULT_CATEGORIES = ("채팅 채널", "Text Channels", "음성 채널", "Voice
 # ponytail: 빈이름 targeting 폐기 — 디스코드가 U+3164·U+2800 둘 다 400 거부(라이브 실측). 두 채널
 # (프로젝트 텍스트·PlayList 음성)은 정상 표시명을 갖고 일반 리네임 경로를 탄다.
 _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
-    # 게스트질문(개발자 외 서버 멤버·웹검색 Q&A·cwd 격리·코어 bridge._GUEST_ROLE 와 태그 일치)은
-    # 별도 '질문' 카테고리. role tag/채널명 불변(격리 매칭 유지) — 카테고리 배치만 분리.
-    _CAT_QUESTION: [("게스트질문", "role", "게스트질문")],
     # ⚠️ **표시명과 tag 가 일부러 다르다 — 맞추려고 tag 를 고치지 마라.** 채널 탐색은
     # ①`channel_map.json` 의 `(kind, tag)` → ②이름 canon 순인데, tag 를 바꾸면 1·2차 모두
     # 빗나가 **새 채널이 생긴다**. 옛 채널의 히스토리도, 손으로 설정한 읽기전용 권한도 새
     # 채널엔 없다. 표시명만 바꾸면 `_rename_if_needed` 가 **기존 채널을 제자리에서 rename**
     # 한다(히스토리·권한 보존). `_READONLY_TAGS`·`notify.json` 의 `channel` 도 tag 기준이라
-    # 함께 무변경. 같은 규칙의 선례 = 위 게스트질문("role tag/채널명 불변").
-    # 2026-08-02: 카드가 미국장 7 + 국내장 3 이 되어 표시명 `미국주식` → `반도체주식`.
-    # 2026-08-13: 유튜브 노트 파이프라인 채널 3개 추가(개발자 지시). 순서도 개발자 지정.
-    #   표시명은 **하이픈 제거 후 실제로 보일 이름을 그대로** 적는다 — 위 98줄대로 채널명에서
-    #   하이픈이 지워지므로 `유튜브-Dev` 라 써도 `#유튜브dev` 로 뜬다. 헷갈리지 않게 결과를 적었다.
-    #   tag 는 **레포·드라이브 폴더명과 일치**시켜 `notify.json` 의 `channel` 값과 갈리지 않게 한다
-    #   (tag 는 절대 고치지 말 것 — 위 경고. 표시명만 바꾸면 기존 채널이 제자리 rename 된다).
+    # 함께 무변경.
     _CAT_SCHED: [
-        ("반도체주식", "role", "미국주식"),
-        ("오픈소스", "role", "오픈소스"),
-        ("유튜브dev", "role", "유튜브-Dev"),
-        ("유튜브일반", "role", "유튜브-일반"),
-        # ⚠️ `개발자료` 는 2026-08-15 제거(개발자 지시) — 채널·드라이브 폴더 둘 다 삭제했다.
+        ("마이크론", "role", "미국주식"),
+        # ⚠️ `개발자료` 는 제거했다(채널·드라이브 폴더 둘 다 삭제).
         # **순서는 «디스코드 채널 삭제 → 이 목록에서 제거»** 다. 반대로 하면 재기동 한 번에
         # 고아 채널이 남고, 그 채널에 온 메시지는 미매핑이라 **채널명이 프로젝트명으로 해석된다**.
         # **이 목록에서 지우는 것이 삭제의 일부다** — 남겨두면 다음 재기동의 채널 자동생성이
         # 조용히 되살린다(지운 사람은 지웠다고 믿는데 이틀 뒤 다시 있다).
     ],
-    _CAT_SYSTEM: [("알림", "role", "알림"), ("봇상태", "role", "봇상태")],  # 하이픈 원천 제거
+    # 예약 알림·시스템 소식은 tag `봇상태` = 표시명 `알림` 채널로 간다(tag 는 위 경고대로 고정).
+    # 봇은 채널을 지우지 않는다: 빠진 채널은 channel_map 에서만 빠지고 서버에 남는다(사람이 지운다).
+    _CAT_SYSTEM: [("알림", "role", "봇상태")],
 }
-# 사람이 글을 못 쓰는 채널(tag 기준 — 표시명 `#반도체주식`). **봇이 카드를 밀어넣기만 하고
-# 왕복이 없는 곳만** 넣는다 — `#오픈소스` 는 📌 버튼 상호작용이 있어 대상이 아니다
-# (사용자: "매일 보는 용도로만 사용").
+# 사람이 글을 못 쓰는 채널(tag 기준 — 표시명 `#마이크론`). **봇이 카드를 밀어넣기만 하고
+# 왕복이 없는 곳만** 넣는다(사용자: "매일 보는 용도로만 사용").
 _READONLY_TAGS = frozenset({"미국주식"})
 # 프로젝트 채널 내부 정본 순서(폴더명). 목록에 없는 프로젝트는 뒤로. h_* 를 맨 위(개발자 확정).
 _PROJECT_ORDER = [
@@ -241,7 +243,7 @@ def _style(style: str) -> Any:
 def _status_color(text: str) -> int | None:
     """text 헤더로 상태색 판정(§4.1). 매칭 안 되면 None(=plain 마크다운 경로, 기존 무변경).
 
-    완료/실패/확인 헤더는 접두 일치, 진행/알림은 선두 이모지. 목록·도움말·짧은 회신은 어디에도
+    완료/실패/확인 헤더는 접두 일치, 진행은 선두 이모지. 목록·도움말·짧은 회신은 어디에도
     안 걸려 None → plain(디스코드에서 마크다운 렌더).
     """
     for head, col in (
@@ -275,63 +277,6 @@ def _build_embed(text: str, color: int) -> tuple[Any, str]:
     return embed, body[_EMBED_DESC_LIMIT:]
 
 
-def build_card_embed(card: dict[str, Any], secrets: list[str]) -> Any:
-    """카드 스펙(코어 dict, adapter.py 「Card 규약」) → discord.Embed. 다이제스트 카드 렌더 경로.
-
-    **공용 `_build_embed`(진행·완료·실패·확인)와 분리된 별도 경로**다 — 일상 회신 렌더에 카드
-    분기를 섞으면 그쪽이 깨진다. 문자열 슬롯은 전부 마스킹(§2.1 방어심층: 카드도 send/edit 과
-    같은 문을 지난다)하고 디스코드 한도로 자른다. 색은 코어가 판정별로 정해 넘긴다.
-
-    **총합 가드는 필수다.** 호출자가 둘이고 산식이 서로 다르다:
-    ① 오픈소스 다이제스트 = `DIGEST_MAX_CARDS`(5) x `DIGEST_CARD_MAXLEN`(1000) + 제목·footer ≈ 5.1KB
-    ② 미국주식 다이제스트(#반도체주식) = 필드 10 x `us_digest.FIELD_MAXLEN`(550) + 필드명·제목
-       ·footer ≈ 5.7KB
-    ②는 6000 까지 여유가 300자 남짓이라 **필드를 하나 늘리는 순간 400 으로 메시지가 통째로
-    사라진다**(슬롯별 한도는 전부 지켜도 걸린다). 넘치는 필드는 버리되 **footer 에 `⚠️N개 생략`
-    을 남긴다** — 한 필드를 잃는 편이 카드 전체를 잃는 것보다 낫지만, 조용히 잃으면 읽는 사람은
-    그 카드의 마지막 필드들(국내장 지수·메모리·장비소재)이 사라진 걸 모른다. 필드를 늘릴 때
-    `us_digest.FIELD_MAXLEN` 을 같이 낮추라는 계약이 그 상수 주석에 있다.
-    description 도 남은 예산으로 한 번 더 자른다 — 슬롯별 한도만 지킨 조합(256+4096+256+2048)은
-    **필드가 0개여도** 6000 을 넘는다.
-    """
-
-    def m(v: object, limit: int) -> str:
-        return mask_secrets(str(v), secrets)[:limit]
-
-    title = m(card.get("title") or "", _EMBED_TITLE_LIMIT)
-    author = m(card.get("author") or "", _EMBED_AUTHOR_LIMIT)
-    footer = m(card.get("footer") or "", _EMBED_FOOTER_LIMIT)
-    budget = _EMBED_TOTAL_LIMIT - _OMIT_NOTE_MAXLEN  # 생략 안내 몫을 미리 뺀다
-    fixed = len(title) + len(author) + len(footer)
-    description = m(card.get("description") or "", min(_EMBED_DESC_LIMIT, max(0, budget - fixed)))
-    embed = discord.Embed(
-        color=int(card.get("color") or _COLOR_INFO),
-        title=title or None,
-        description=description or None,
-    )
-    if author:
-        embed.set_author(name=author)
-    total = fixed + len(description)
-    entries = list(card.get("fields") or [])[:_EMBED_FIELDS_MAX]
-    omitted = 0
-    for i, (name, value, inline) in enumerate(entries):
-        # 이름·값이 빈 필드는 디스코드가 400 으로 거부한다 — 코어가 안 넣지만 여기서도 막는다.
-        fname, fvalue = m(name, _EMBED_FIELD_NAME_LIMIT), m(value, _EMBED_FIELD_VALUE_LIMIT)
-        if not (fname and fvalue):
-            continue
-        if total + len(fname) + len(fvalue) > budget:
-            omitted = len(entries) - i
-            log.warning("카드 임베드 총합 초과 — 이후 %d개 필드 생략(%s)", omitted, fname[:40])
-            break
-        embed.add_field(name=fname, value=fvalue, inline=bool(inline))
-        total += len(fname) + len(fvalue)
-    if omitted:
-        footer = f"⚠️{omitted}개 필드 생략(길이 초과)" + (f" · {footer}" if footer else "")
-    if footer:
-        embed.set_footer(text=footer[:_EMBED_FOOTER_LIMIT])
-    return embed
-
-
 def _send_kwargs(payload: Any, view: Any) -> dict[str, Any]:
     """발송 파트(plain str | discord.Embed) → channel.send kwargs. 버튼은 view 로 부착."""
     kwargs: dict[str, Any] = (
@@ -362,7 +307,7 @@ def _is_vertical_list(buttons: list[Button] | None) -> bool:
     """버튼 묶음을 세로 1열 V2(LayoutView) 로 렌더할까 — 프로젝트 목록(p:)·선택지(c:) 전용.
 
     둘 다 항목 수가 가변(프로젝트 7+·선택지 N+직접입력)이라 classic View 5행 한도를 넘을 수 있어
-    세로 V2 로 편다. push/취소/알림/오라클 등 고정 소수 버튼은 현행 가로(classic) 유지(계약 무변경).
+    세로 V2 로 편다. push/취소/오라클 등 고정 소수 버튼은 현행 가로(classic) 유지(계약 무변경).
     """
     return buttons is not None and len(buttons) > 0 and all(b.action in {"p", "c"} for b in buttons)
 
@@ -416,6 +361,8 @@ class DiscordAdapter:
         limit: int = DISCORD_LIMIT,
         channel_map_file: Path | None = None,
         music_playlist_url: str = "",
+        clock: Callable[[], float] = time.time,
+        quiet_boot: bool = False,
     ) -> None:
         self.token = token
         self.secrets = secrets
@@ -432,6 +379,14 @@ class DiscordAdapter:
         self._thread: threading.Thread | None = None
         # Gateway 접속 완료(on_ready) 신호 — 재시작 복귀 통지 등 접속 후 send 를 여기서 기다린다.
         self._ready = threading.Event()
+        # #봇상태 시스템 소식 상태. discord.py 이벤트 처리는 전부 이 파일(이벤트 루프 스레드)에서만.
+        # clock 은 «끊긴 시간» 측정용 — 노트북 절전 시간이 포함되도록 벽시계(time.time)가 기본이고,
+        # 테스트는 가짜 시계를 주입한다.
+        self._clock = clock
+        self._disconnected_at: float | None = None  # 끊긴 시각(첫 on_disconnect 만 기록)
+        # 🟢 기동 알림은 프로세스당 1회. quiet_boot(코드 변경 자동 재시작 직후)면 처음부터 «이미
+        # 알렸다» 로 둔다 — 재연결 Off/On 쌍 로직(_report_reconnect)은 그대로 돈다.
+        self._boot_announced = quiet_boot
         # F1: on_ready 는 재접속마다 재발화 → 첫 셋업 중 겹치면 둘 다 옛 맵으로 시작해 중복 생성.
         # 이 락으로 _ensure_channels 를 직렬화(둘째는 첫째의 channel_map 커밋 후 진입 → 기존 발견).
         self._setup_lock = asyncio.Lock()
@@ -477,12 +432,17 @@ class DiscordAdapter:
         """Gateway on_ready 까지 대기(접속 후 send 안전 타이밍). Adapter 계약 밖 디스코드 훅."""
         return self._ready.wait(timeout)
 
+    def is_music_active(self) -> bool:
+        """음성채널에 붙어 재생 중인가(자동 재시작 한가함 판정용). Adapter 계약 밖 디스코드 훅."""
+        v = self._voice
+        return v is not None and bool(v.is_connected())
+
     def setup_channels(self, project_names: list[str]) -> None:
         """①: 프로젝트 채널 목록을 주입(on_ready 의 _ensure_channels 가 사용). 생성은 접속 후."""
         self._project_names = list(project_names)
 
     def role_channel(self, role: str) -> int | None:
-        """특수 채널 역할("알림"|"봇상태"|…) → channelID(channel_map 역조회). 없으면 None."""
+        """특수 채널 역할("봇상태"|…) → channelID(channel_map 역조회). 없으면 None."""
         for cid, (kind, tag) in self._channel_map.items():
             if kind == "role" and tag == role:
                 return cid
@@ -769,7 +729,7 @@ class DiscordAdapter:
         self._music_entries.insert(self._music_index + 1, entry)
         self._voice.stop()  # → _after → _advance(index+1) = 방금 끼운 곡
         # 성공 회신 없음("") — 곧 _advance → _play_current 가 '💿 현재 재생 곡' 으로 같은 곡을
-        # 알린다. 종전의 '⏭️ <제목>' 은 그 알림과 같은 말을 두 번 하는 꼴이었다(운영자 지적).
+        # 알린다 — 여기서 회신하면 같은 말을 두 번 하는 꼴이다.
         return ""
 
     async def _await_dave_ready(self) -> None:
@@ -999,7 +959,6 @@ class DiscordAdapter:
             (_CAT_PROJECT, proj_chans),
             (_CAT_SCHED, _SPECIAL[_CAT_SCHED]),
             (_CAT_SYSTEM, _SPECIAL[_CAT_SYSTEM]),
-            (_CAT_QUESTION, _SPECIAL[_CAT_QUESTION]),
         ]
         old_by_keytag = {(k, t): cid for cid, (k, t) in self._channel_map.items()}
         by_id = {c.id: c for c in guild.channels}
@@ -1244,6 +1203,18 @@ class DiscordAdapter:
                 log.error("채널 자동생성 실패(%s) — 폴백: 채널명 매칭", type(e).__name__)
             finally:
                 self._ready.set()  # 접속 완료 — wait_ready 대기자 해제
+            await self._announce_ready()
+
+        @self._client.event
+        async def on_disconnect() -> None:
+            # 첫 접속 완료 전의 끊김은 «돌아왔다» 보고 대상이 아니다. 재시도 중 반복 발화해도
+            # 가장 처음 끊긴 시각을 유지한다(끊긴 총 시간을 재야 한다).
+            if self._ready.is_set() and self._disconnected_at is None:
+                self._disconnected_at = self._clock()
+
+        @self._client.event
+        async def on_resumed() -> None:
+            await self._report_reconnect()
 
         @self._client.event
         async def on_message(message: discord.Message) -> None:
@@ -1253,24 +1224,51 @@ class DiscordAdapter:
         async def on_interaction(interaction: discord.Interaction) -> None:
             await self._on_interaction(interaction)
 
+    async def _post_status(self, text: str) -> None:
+        """#봇상태 로 시스템 소식 1회. 이벤트 루프 안이라 동기 send(_run) 대신 코루틴을 직접 쓴다.
+
+        미매핑·전송 실패는 로그만 남긴다 — 소식 때문에 on_ready/이벤트 처리가 죽으면 안 된다.
+        """
+        channel_id = self.role_channel("봇상태")
+        if channel_id is None:
+            log.warning("#봇상태 채널 미매핑 — 시스템 소식 스킵: %.60s", text)
+            return
+        try:
+            await self._send_coro(channel_id, mask_secrets(text, self.secrets), None)
+        except Exception as e:  # 네트워크·권한 — 로그+계속
+            log.warning("시스템 소식 전송 실패(%s)", type(e).__name__)
+
+    async def _report_reconnect(self) -> None:
+        """끊긴 시각이 있으면 소거하고, 10분 이상이었을 때만 알린다(resumed/재 ready 공용)."""
+        since, self._disconnected_at = self._disconnected_at, None
+        if since is None:
+            return
+        for text in reconnect_notice_texts(since, self._clock()):
+            await self._post_status(text)
+
+    async def _announce_ready(self) -> None:
+        """on_ready 마다 호출: 재연결 보고 → (프로세스 최초 1회만) 🟢 기동 알림."""
+        try:
+            await self._report_reconnect()
+            if not self._boot_announced:
+                self._boot_announced = True  # 전송 실패해도 재연결 on_ready 에서 되풀이하지 않는다
+                await self._post_status(boot_notice_text(datetime.now()))
+        except Exception as e:  # on_ready 가 알림 때문에 터지지 않게(방어적)
+            log.warning("시스템 소식 처리 실패(%s)", type(e).__name__)
+
     def _is_playlist_channel(self, channel_id: int) -> bool:
         """channel_map 상 ("role","playlist") 채널인지 — 인가 우회 선필터용(코어가 최종 판정)."""
         return self._channel_map.get(channel_id) == ("role", "playlist")
-
-    def _is_guest_channel(self, channel_id: int) -> bool:
-        """channel_map 상 ("role","게스트질문") 채널인지 — 인가 우회 선필터용(코어가 최종 판정)."""
-        return self._channel_map.get(channel_id) == ("role", "게스트질문")
 
     async def _on_message(self, message: discord.Message) -> None:
         """텍스트/사진 메시지 → 정규화 Event 큐 적재. 자기 메시지·비허용은 드롭."""
         me = self._client.user
         if me is not None and message.author.id == me.id:
             return  # 자기 메시지 무시(에코 루프 방지)
-        # 선-필터(코어도 재검증). 단 플레이리스트·게스트질문 채널은 비인가라도 통과 — 코어가
-        # 화이트리스트 음악 명령(_playlist_bypass)·순수 질문 텍스트(_guest_bypass)만 우회 허용한다.
-        # 그 외 채널의 비인가는 여기서 드롭(스팸 유입 차단). 게스트 버튼/사진은 코어가 최종 배제.
-        cid = message.channel.id
-        bypass = self._is_playlist_channel(cid) or self._is_guest_channel(cid)
+        # 선-필터(코어도 재검증). 단 플레이리스트 채널은 비인가라도 통과 — 코어가
+        # 화이트리스트 음악 명령(_playlist_bypass)만 우회 허용한다.
+        # 그 외 채널의 비인가는 여기서 드롭(스팸 유입 차단).
+        bypass = self._is_playlist_channel(message.channel.id)
         if message.author.id not in self._allowed and not bypass:
             return
         self._queue.put(self._message_event(message))
@@ -1288,9 +1286,6 @@ class DiscordAdapter:
         else:
             project = getattr(channel, "name", None)
             channel_role = None
-        # §4.7 델타2: 답장 이어가기(④). message.reference.message_id 를 채운다(소비는 1c).
-        ref = message.reference
-        reply_to = ref.message_id if ref is not None else None
         image = next(
             (a for a in message.attachments if Path(a.filename or "").suffix.lower() in PHOTO_EXTS),
             None,
@@ -1304,7 +1299,6 @@ class DiscordAdapter:
                 message_id=message.id,
                 photo_ref=image.url,
                 project=project,
-                reply_to=reply_to,
                 channel_role=channel_role,
             )
         return Event(
@@ -1314,7 +1308,6 @@ class DiscordAdapter:
             text=message.content or "",
             message_id=message.id,
             project=project,
-            reply_to=reply_to,
             channel_role=channel_role,
         )
 
@@ -1435,22 +1428,13 @@ class DiscordAdapter:
         channel_id: int,
         text: str,
         buttons: list[Button] | None = None,
-        card: dict[str, Any] | None = None,
     ) -> int | None:
         """마스킹 후 청크 분할 전송. 버튼은 마지막 청크에만. 첫 청크 message_id 반환(실패 None).
 
-        예외 1: `card` 가 있으면 구조화 Embed 1장으로 렌더한다(다이제스트 전용 경로 —
-        `text` 는 카드를 못 그리는 어댑터용 폴백이라 여기선 쓰지 않는다). 카드는 항상 단일
-        메시지라 청킹·오버플로가 없다(초과분은 build_card_embed 가 슬롯별로 자름).
-        예외 2: 세로 목록(전부 p:/c: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
+        예외: 세로 목록(전부 p:/c: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
         V2 flag 는 메시지 생성 시 고정(edit 로 classic 전환 불가)이라, 그 id 를 _v2_messages 에
         기록해 이후 edit 도 V2 로 유지한다(선택지 갱신·버튼 제거 편집이 400 나지 않게).
         """
-        if card is not None:
-            embed = build_card_embed(card, self.secrets)
-            view = render_view(buttons) if buttons else None
-            mid = self._run(self._send_coro(channel_id, embed, view))
-            return mid if isinstance(mid, int) else None
         if _is_vertical_list(buttons):
             assert buttons is not None  # _is_vertical_list 가 보장(mypy 좁히기)
             view = render_project_view(mask_secrets(text, self.secrets), buttons)
@@ -1467,26 +1451,19 @@ class DiscordAdapter:
         message_id: int,
         text: str,
         buttons: list[Button] | None = None,
-        card: dict[str, Any] | None = None,
     ) -> None:
         """진행 메시지 in-place 갱신. 오버플로(§2.2): 첫 파트 편집 + 나머지 후속 발행, 버튼 말미.
 
         상태 헤더면 첫 파트가 Embed 라 진행(노랑)→완료(초록)/실패(빨강) 전이가 같은 message_id
         편집으로 색만 바뀐다(§4.0 상태 전이=같은 메시지 편집).
 
-        예외 1: `card` 가 있으면 구조화 Embed 로 교체(다이제스트 버튼 반영 — footer·버튼만 바뀐다).
-        예외 2: send 가 V2(세로 목록)로 만든 메시지는 flag 가 고정이라 classic 으로 못 돌린다 →
+        예외: send 가 V2(세로 목록)로 만든 메시지는 flag 가 고정이라 classic 으로 못 돌린다 →
         같은 세로 V2 로 편집한다(버튼 갱신·제거·만료 문구 모두 TextDisplay 흡수). buttons 없으면
         빈 목록으로 렌더해 버튼만 사라진다(텍스트는 유지).
         """
         if message_id in self._v2_messages:
             view = render_project_view(mask_secrets(text, self.secrets), buttons or [])
             self._run(self._edit_view_coro(channel_id, message_id, view))
-            return
-        if card is not None:
-            embed = build_card_embed(card, self.secrets)
-            head_view = render_view(buttons) if buttons else None
-            self._run(self._edit_coro(channel_id, message_id, embed, head_view))
             return
         parts = self._render_parts(text)
         last = len(parts) - 1
@@ -1496,15 +1473,10 @@ class DiscordAdapter:
             view = render_view(buttons) if buttons is not None and j == last else None
             self._run(self._send_coro(channel_id, extra, view))
 
-    def ack(self, callback_id: str | None, note: str | None = None) -> None:
-        """이미 defer 됨(§2.3) → note 있으면 followup.send, 없으면 no-op. callback_id 소비(정리)."""
-        if not callback_id:
-            return
-        interaction = self._interactions.pop(callback_id, None)
-        if interaction is None:
-            return  # 이미 소비/미등록 — no-op(멱등)
-        if note:
-            self._run(self._followup_coro(interaction, note))
+    def ack(self, callback_id: str | None) -> None:
+        """이미 defer 됨(§2.3) → 응답할 것 없음. callback_id 소비(맵 정리)만 한다. 멱등."""
+        if callback_id:
+            self._interactions.pop(callback_id, None)
 
     def fetch_file(self, photo_ref: str, dest_dir: Path) -> Path:
         """attachment.url 다운로드 — 디스코드 CDN 도메인·확장자·크기·트래버설 잠금(§2.4 계승).
@@ -1619,9 +1591,6 @@ class DiscordAdapter:
         else:
             content, embed = payload, None
         await channel.get_partial_message(message_id).edit(content=content, embed=embed, view=view)
-
-    async def _followup_coro(self, interaction: Any, note: str) -> None:
-        await interaction.followup.send(note)
 
     async def _purge_coro(self, channel_id: int) -> int:
         """채널 메시지를 100개씩 반복 purge 해 전부 삭제, 삭제 건수 합 반환(§clear_channel).

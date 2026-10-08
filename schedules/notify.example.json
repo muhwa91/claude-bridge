@@ -6,51 +6,27 @@
       "project": "example_project",
       "days": ["mon", "tue", "wed", "thu", "fri"],
       "at": "08:00",
-      "label": "장 개장 점검",
-      "note": "개장 직후 화면이 정상 상태로 전환되는지 example 확인. at/grace_min 은 '카드가 오는 창'(= 호스트가 켜져 있어야 하는 시간)이고, check_from/check_to 는 '확인시작 버튼이 실제로 유효한 창'이다 — 둘은 다르다. 관측 목표 시각이 있으면 at 을 목표보다 최소 1시간 이르게 잡아 카드를 미리 받고(확인할 시간을 벌고), 창은 목표 시각까지만 늘린다(목표를 지나면 관측 대상이 사라지므로 뒤로는 못 늘린다).",
       "grace_min": 60,
-      "check_from": "09:00",
-      "check_to": "09:30"
-    },
-    {
-      "id": "example-ticker-check",
-      "project": "example_project",
-      "days": ["mon", "tue", "wed", "thu", "fri"],
-      "at": "17:00",
-      "label": "예시 종목 등락률",
-      "note": "예시 종목의 등락률이 기준값과 일치하는지 확인",
-      "grace_min": 30
-    },
-    {
-      "id": "example-weekend",
-      "project": "example_project",
-      "days": ["sat"],
-      "at": "06:00",
-      "label": "주말 상태 점검",
-      "note": "주말 진입 시 인라인 표시가 example 규칙대로 바뀌는지 확인",
-      "grace_min": 30
-    },
-    {
-      "id": "pending-checks",
-      "on": "session",
-      "label": "미처리 검증 건 리마인더",
-      "note": "아직 졸업하지 않은 시각 항목(on:session 이 아닌 것)을 세션 기동 시 하루 1회 요약한다. 시각 항목은 [at, at+grace_min] 창에 브리지가 떠 있어야 카드가 뜨는데, 그 창에 호스트가 꺼져 있으면 알람이 조용히 지나가 다음 주로 밀린다 — 그걸 막는 안전망이다. 0건이면 카드를 보내지 않는다(다 졸업했는데 빈 카드가 매일 뜨면 그게 소음이다). 이 항목을 지우면 기능이 꺼진다."
-    },
-    {
-      "id": "os-digest",
-      "on": "session",
-      "channel": "오픈소스",
-      "label": "오픈소스 다이제스트",
-      "note": "시각 대신 세션 시작으로 발화한다(on:session) — 호스트가 꺼져 있어도 유실되지 않는다"
+      "label": "장 개장 점검",
+      "note": "개장 직후 화면이 정상으로 전환되는지 확인. [at, at+grace_min] 창에 브리지가 켜져 있으면 하루 1회 '[시각] ⏰ <스케쥴> 제목' 한 줄로 해당 프로젝트 채널에 보낸다. 확인이 끝나면 이 항목을 지운다(핫리로드)."
     },
     {
       "id": "us-digest",
-      "on": "session",
       "channel": "미국주식",
-      "days": ["tue", "wed", "thu", "fri", "sat"],
-      "days_note": "on:session 항목도 days 가 있으면 요일 화이트리스트로 쓴다(없으면 매일). 이 카드는 소재가 '마지막으로 끝난 미장'이라 KST 일·월은 둘 다 금요일장이 마지막 = 토요일 카드의 재탕이다(미장 종료 05:00 / 개장 22:30 KST).",
-      "label": "미국주식 다이제스트",
-      "note": "전일 반도체·AI 재료"
+      "days": ["mon", "tue", "wed", "thu", "fri", "sun"],
+      "at": "21:30",
+      "grace_min": 150,
+      "label": "마이크론 다이제스트",
+      "note": "id 가 다이제스트 러너에 등록돼 있으면 텍스트 대신 러너가 돈다 — 평일은 시세·공시·뉴스, 일요일은 분석. 창이 자정을 넘지 않게 grace_min 을 잡는다. days 가 없으면 '매일'이 아니라 '안 돎'이다."
+    },
+    {
+      "id": "spotify-monthly",
+      "channel": "playlist",
+      "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+      "at": "09:00",
+      "grace_min": 899,
+      "label": "스포티파이 월간 차트 담기",
+      "note": "매일 하루 1회 확인 — 실제 주기는 월 스탬프가 정한다. 이번 달 미완료면 담고, 완료면 조용히 통과."
     }
   ]
 }

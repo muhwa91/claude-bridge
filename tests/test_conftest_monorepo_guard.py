@@ -1,9 +1,9 @@
 """`conftest.IN_MONOREPO` 가 **실제 상황과 일치하는지** 본다.
 
 이 플래그가 잘못 False 로 굳으면 `requires_monorepo` 가 경로 드리프트 방어
-(`test_repo_paths_actually_exist`·`test_backlog_read_returns_content`)를
+(`test_repo_paths_actually_exist`)를
 **조용히 skip** 시킨다 — 2026-08-14 실사고
-(`BACKLOG_FILE` 만 옛 경로에 남았는데 1,362건이 전부 초록)와 똑같은 무음 실패로 돌아간다.
+(경로 상수 하나만 옛 경로에 남았는데 1,362건이 전부 초록)와 똑같은 무음 실패로 돌아간다.
 그래서 skip 스위치 자체에 검사를 하나 건다.
 
 모노레포·공개 미러 **양쪽에서 의미가 있는** 단언이다: 플래그와 실물이 어긋나는 순간 빨개진다.

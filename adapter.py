@@ -22,7 +22,7 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|nb:*(_NB_VERBS)|od:rev + §4.7 델타3(r|rec|fav|…).
+    # 정규화 액션: push|x|p|c|clean:ok.
     action: str
     arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
@@ -44,21 +44,11 @@ class Event:
     callback_id: str | None = None  # ack 핸들 (interaction 토큰)
     photo_ref: str | None = None  # 파일 핸들 (attachment.url)
     project: str | None = None  # 어댑터가 채널→프로젝트(channel_map)를 미리 채움. 미매핑(DM)은 None
-    # §4.7 델타2: 답장 이어가기(④). message.reference.msg_id.
-    # 1a 는 어댑터가 채우기만·코어 소비는 1c(frozen 기본값이라 기존 생성부는 무영향).
-    reply_to: int | None = None
-    # ①(채널 자동생성): 특수 채널 역할 태그("간단처리"|"데이터분석"|"알림"|"봇상태"). 어댑터가
+    # ①(채널 자동생성): 특수 채널 역할 태그("간단처리"|"데이터분석"|"봇상태"). 어댑터가
     # channel_map 으로 채운다. 프로젝트 채널은 project, 특수 채널은 이 필드로 라우팅. 미매핑은 None.
     channel_role: str | None = None
 
 
-# ── Card 규약(send/edit 의 선택 인자 `card`) ────────────────────────────────
-# 평범한 dict 다(dataclass·TypedDict 아님 — 코어가 만들고 어댑터가 읽기만 하는 렌더 힌트).
-#   {"author": str, "title": str, "description": str,
-#    "fields": [(name, value, inline)], "footer": str, "color": int}
-# 전부 선택 — 없는 키는 그 슬롯을 비운다. 플랫폼 한도 절단은 **어댑터 책임**(디스코드 기준
-# author/title 256 · description 4096 · field value 1024 · footer 2048). 코어는 의미만 만든다.
-# 현재 유일한 사용처 = 🧩 오픈소스 다이제스트 카드(디스코드 Embed fields 렌더, 2026-07-27).
 class Adapter(Protocol):
     """플랫폼 어댑터 계약(동결). 코어는 이 인터페이스만 호출한다.
 
@@ -81,14 +71,8 @@ class Adapter(Protocol):
         channel_id: int,
         text: str,
         buttons: list[Button] | None = None,
-        card: dict[str, Any] | None = None,
     ) -> int | None:
-        """전송(마스킹·청킹·버튼렌더는 어댑터 흡수). 첫 청크 message_id | 실패 시 None.
-
-        `card`(선택, 2026-07-27 추가): 구조화 카드 스펙 — 아래 Card 규약. 리치 렌더가 되는
-        어댑터는 이걸로 그리고, 못 그리는 어댑터는 **무시하고 `text` 를 그대로 보낸다**
-        (텍스트가 항상 폴백이라 정보 손실 0). 기존 호출은 인자를 안 주면 종전과 동일.
-        """
+        """전송(마스킹·청킹·버튼렌더는 어댑터 흡수). 첫 청크 message_id | 실패 시 None."""
         ...
 
     def edit(
@@ -97,16 +81,12 @@ class Adapter(Protocol):
         message_id: int,
         text: str,
         buttons: list[Button] | None = None,
-        card: dict[str, Any] | None = None,
     ) -> None:
-        """진행 메시지 in-place 갱신(+오버플로 후속 발행). 실패는 로그만·계속.
-
-        `card`: send 와 같은 규약(미지원 어댑터는 무시하고 `text` 로 편집).
-        """
+        """진행 메시지 in-place 갱신(+오버플로 후속 발행). 실패는 로그만·계속."""
         ...
 
-    def ack(self, callback_id: str | None, note: str | None = None) -> None:
-        """버튼 탭 응답(디스코드 followup). callback_id=None 이면 no-op."""
+    def ack(self, callback_id: str | None) -> None:
+        """버튼 탭 응답(이미 defer 됨 — callback_id 소비). callback_id=None 이면 no-op."""
         ...
 
     def fetch_file(self, photo_ref: str, dest_dir: Path) -> Path:
@@ -121,22 +101,22 @@ class Adapter(Protocol):
         """①(채널 자동생성): 봇 기동 시 1회 카테고리·채널 구성(있으면 재사용).
 
         project_names = 프로젝트 카테고리 채널 목록(코어 list_projects). 특수 채널(간단처리·데이터
-        분석·알림·봇상태) 구조는 어댑터가 안다. channelID→역할/폴더 매핑을 영속(channel_map.json).
+        분석·봇상태) 구조는 어댑터가 안다. channelID→역할/폴더 매핑을 영속(channel_map.json).
         """
         ...
 
     def role_channel(self, role: str) -> int | None:
-        """특수 채널 역할("알림"|"봇상태"|…) → channelID(channel_map 역조회). 없으면 None.
+        """특수 채널 역할("봇상태"|…) → channelID(channel_map 역조회). 없으면 None.
 
-        DM 폐기로 알림·재시작완료가 이 채널로 간다. 매핑이 없으면(자동생성 실패) None 을 반환하고
-        코어가 해당 발송을 스킵/폴백한다.
+        DM 폐기로 시스템 소식(기동·재연결·로그인 만료 등)이 이 채널로 간다. 매핑이 없으면
+        (자동생성 실패) None 을 반환하고 코어가 해당 발송을 스킵/폴백한다.
         """
         ...
 
     def project_channel(self, project: str) -> int | None:
         """프로젝트 폴더명 → 그 프로젝트 채널 channelID(channel_map 역조회). 없으면 None.
 
-        예약 확인 실행이 #알림 대신 프로젝트 채널로 스트리밍되게 라우팅에 쓴다(없으면 현 채널 폴백).
+        프로젝트 알림의 발송 채널 라우팅에 쓴다(없으면 #봇상태 폴백).
         """
         ...
 
@@ -225,10 +205,9 @@ def fold_title(text: str) -> str:
 def _valid_id(s: object) -> bool:
     """알림 id 안전 규칙(방출·수신 계약 대칭): 비어있지 않고 ≤54자, [A-Za-z0-9_-] 만.
 
-    이 규칙은 callback_data(nb:ok:<id>·nb:later:<id>) 로 왕복하므로 인바운드(parse_callback)와
-    아웃바운드(load_schedules→notify_buttons) 양측이 같은 문을 써야 한다. 상한 54 = callback_data
-    캡(100)에서 최장 접두(`nb:handoff:`·`nb:recheck:` 11B)를 빼고도 한참 남는 여유. 길면 render
-    절단으로 왕복이 깨져(탭해도 매칭 실패) 방출을 여기서 막는다(근본 차단, 실사용 id 는 짧다).
+    예약 알림(notify.json) id 의 안전 규칙이다 — 이상한 id 가 로그·상태 파일로 흘러드는 것을
+    로더(load_schedules)가 방출측에서 막는다. 상한 54 는 callback_data 100B 캡 안에서
+    id 가 왕복하던 시절의 값이며, 실사용 id 는 짧아 그대로 둔다.
     """
     return isinstance(s, str) and 0 < len(s) <= 54 and all(c.isalnum() or c in "-_" for c in s)
 
@@ -240,37 +219,16 @@ def chunk_text(text: str, limit: int) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
-def _dig(s: str) -> bool:
-    """정수 arg 안전 검사(§4.7 재사용): isascii()+isdigit() — 전각·위첨자 유니코드 숫자 차단."""
-    return s.isascii() and s.isdigit()
-
-
-# 예약 알림 버튼 액션(nb:*) — 코덱 단일 소스(디코드·인코드가 같은 목록을 쓴다).
-# ok=확인시작 / recheck=다시 확인(판정 불가 재시도, ok 와 동작 동일) / later=스누즈 /
-# done=확인완료 1단계(재확인 카드) / confirm=그 진행 / cancel=그 취소 / handoff=이관처리.
-# ⚠️ 이름을 바꾸면 **이미 나간 카드의 버튼이 깨진다**(od:rev 와 같은 계약).
-_NB_VERBS = ("ok", "recheck", "later", "done", "confirm", "cancel", "handoff")
-_NB_ACTIONS = tuple(f"nb:{v}" for v in _NB_VERBS)
-_NB_PREFIXES = tuple(f"{a}:" for a in _NB_ACTIONS)
-
-
 def parse_callback(data: str) -> tuple[str, str] | None:
     """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
 
     `push`/`x`/`clean:ok` → (그대로, ""), `p:<name>` → ("p", name),
-    `nb:<verb>:<id>` → ("nb:<verb>", id) — verb 는 _NB_VERBS 화이트리스트. 정확 매칭만.
+    정확 매칭만 — 화이트리스트 밖(삭제된 옛 `nb:*` 버튼 포함)은 None 이라 코어가 ack 후 무시한다.
     """
     if data in ("push", "x", "clean:ok"):
         return (data, "")
     if data.startswith("p:") and len(data) > 2:
         return ("p", data[2:])
-    for prefix in _NB_PREFIXES:
-        if data.startswith(prefix):
-            item_id = data[len(prefix) :]
-            # id 는 우리가 발행하지만 callback_data 는 신뢰 경계 밖 — 방출측과 같은 문(_valid_id).
-            if _valid_id(item_id):
-                return (prefix[:-1], item_id)
-            return None
     if data.startswith("c:"):
         # c:<msg_id>:<idx|other> — msg_id 정수, 선택은 정수 인덱스 또는 'other'.
         # L-3: isascii() 병행으로 전각·위첨자 등 유니코드 숫자(int() 통과)를 차단.
@@ -279,45 +237,6 @@ def parse_callback(data: str) -> tuple[str, str] | None:
         sel_ok = mid_ok and (parts[2] == "other" or (parts[2].isascii() and parts[2].isdigit()))
         if sel_ok:
             return ("c", f"{parts[1]}:{parts[2]}")
-        return None
-    # §4.7 델타3: 후속버튼(②)·매크로(③) 콜백. 전부 정수 arg(isascii+isdigit 재사용) — 라우팅은
-    # 1b·1e, 여기선 코덱만. 정확 매칭 밖은 None(폐기) 불변. 코어 _handle_button 은 미분기라
-    # "ack 후 무시"로 안전(1a 는 이 버튼들을 방출하지 않음 — 코덱만 준비).
-    if data.startswith("r:"):
-        # r:<mid> (재실행 확인 게이트) | r:<mid>:go (게이트 통과 실행) | r:<mid>:why (원인 분석).
-        # mid 정수, 접미는 정확히 'go'|'why' — 그 밖은 None(폐기) 불변.
-        # `why` 는 1b 구현(2026-08-16) 때 추가했다: 계약 §4.2 가 실패 메시지에 `[🔍 원인 분석]`
-        # 버튼을 명시하는데 코덱에 자리가 없어 눌러도 죽는 버튼이 될 뻔했다. 읽기전용 진단이라
-        # 확인 게이트를 태우지 않는다(사용량이 거의 없고, 게이트가 있으면 아무도 안 누른다).
-        parts = data.split(":")
-        mid_ok = len(parts) in (2, 3) and _dig(parts[1])
-        if mid_ok and len(parts) == 2:
-            return ("r", parts[1])
-        if mid_ok and len(parts) == 3 and parts[2] in ("go", "why"):
-            return ("r", f"{parts[1]}:{parts[2]}")
-        return None
-    if data.startswith("fav:"):
-        # fav:<idx> (실행) | fav:add:<idx> (등록) | fav:del:<idx> (삭제). idx 정수.
-        parts = data.split(":")
-        if len(parts) == 2 and _dig(parts[1]):
-            return ("fav", parts[1])
-        if len(parts) == 3 and parts[1] in ("add", "del") and _dig(parts[2]):
-            return (f"fav:{parts[1]}", parts[2])
-        return None
-    if data.startswith("od:"):
-        # od:rev:<seq> — 🧩 오픈소스 다이제스트 [🔍N] 버튼(그 레포를 검토·보고). seq = 보류맵 키.
-        # 레포명이 아니라 seq 를 싣는 이유 = custom_id 100자 한도(레포명은 길 수 있다).
-        # 폐기 이력: `od:skip`(🚫)은 v2 에서 30일 쿨다운이 대신했고, `od:add`(📌 백로그)는
-        # 2026-08-02 검토가 흡수했다 — **되살리지 마라**(코어에 핸들러가 없어 ack 후 무시된다).
-        parts = data.split(":")
-        if len(parts) == 3 and parts[1] == "rev" and _dig(parts[2]):
-            return ("od:rev", parts[2])
-        return None
-    if data.startswith("rec:"):
-        # rec:<idx> — 최근 실행. idx 정수.
-        idx = data[len("rec:") :]
-        if _dig(idx):
-            return ("rec", idx)
         return None
     return None
 
@@ -329,19 +248,8 @@ def encode_callback(action: str, arg: str) -> str:
     """
     if action in ("push", "x", "clean:ok"):
         return action
-    # 콜론-join 액션(§1.3 + §4.7 델타3): arg(id·mid·idx·"mid:idx"·"mid:go")를 그대로 이어붙인다.
-    _joined = (
-        "p",
-        *_NB_ACTIONS,
-        "c",
-        "r",
-        "rec",
-        "fav",
-        "fav:add",
-        "fav:del",
-        "od:rev",
-    )
-    if action in _joined:
+    # 콜론-join 액션(§1.3): arg(프로젝트명·"mid:idx")를 그대로 이어붙인다.
+    if action in ("p", "c"):
         return f"{action}:{arg}"
     return action  # 방출측이 유효 액션만 넘기므로 폴백은 그대로
 

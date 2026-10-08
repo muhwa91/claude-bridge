@@ -11,6 +11,7 @@ discord.py 미설치 환경(예: CI 최소셋)에서는 importorskip 으로 전�
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import urllib.error
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ import pytest
 
 discord = pytest.importorskip("discord")  # 미설치면 이 파일 전체 스킵(코어 236 은 무영향)
 
+import bridge  # noqa: E402
 import discord_adapter  # noqa: E402  (importorskip 뒤에 와야 함)
 from adapter import Button, Event  # noqa: E402
 from bridge import (  # noqa: E402
@@ -59,11 +61,9 @@ def test_render_view_default_style_is_secondary():
     assert it.label == "데모"
 
 
-def test_render_view_choice_and_notify_custom_ids():
-    from bridge import choice_buttons, notify_buttons
+def test_render_view_choice_custom_ids():
+    from bridge import choice_buttons
 
-    v1 = render_view(notify_buttons("ti-open"))
-    assert [c.custom_id for c in v1.children] == ["nb:ok:ti-open", "nb:later:ti-open"]
     v2 = render_view(choice_buttons(55, [("유지", "keep"), ("교체", "swap")]))
     assert [c.custom_id for c in v2.children] == ["c:55:0", "c:55:1", "c:55:other"]
 
@@ -76,10 +76,6 @@ def test_render_view_custom_id_within_discord_100_char_limit():
         ("push", ""),
         ("x", ""),
         ("p", "x" * 64),
-        ("nb:ok", "y" * 64),
-        ("nb:later", "z" * 64),
-        ("nb:handoff", "y" * 64),  # 최장 접두(11B) — 캡 100 안인지 확인
-        ("nb:recheck", "z" * 64),
         ("c", "999999:12"),
     ):
         assert len(encode_callback(action, arg)) <= discord_adapter._CUSTOM_ID_LIMIT
@@ -194,7 +190,6 @@ def _msg(
     channel_name="trading_info",
     msg_id=5,
     atts=None,
-    reference=None,
 ):
     channel = SimpleNamespace(id=channel_id, name=channel_name)
     return SimpleNamespace(
@@ -203,7 +198,6 @@ def _msg(
         content=content,
         id=msg_id,
         attachments=atts or [],
-        reference=reference,  # §4.7 델타2: 답장 참조(None=일반 메시지)
     )
 
 
@@ -231,7 +225,6 @@ def test_message_event_dm_channel_project_none():
         content="hi",
         id=1,
         attachments=[],
-        reference=None,
     )
     assert _adapter()._message_event(m).project is None
 
@@ -255,24 +248,6 @@ def test_on_message_playlist_channel_lets_unauth_through():
     ev = a._queue.get_nowait()
     assert ev.channel_role == "playlist" and ev.user_id == 999
     asyncio.run(a._on_message(_msg(999, "hax", channel_id=100)))  # 다른 채널 비인가 → 여전히 드롭
-    assert a._queue.qsize() == 0
-
-
-def test_on_message_guest_channel_lets_unauth_through():
-    # M-1: 비인가 게스트의 텍스트 질문이 선필터를 통과해 코어(_guest_bypass)까지 도달해야 동작.
-    a = _adapter()
-    a._channel_map = {600: ("role", "게스트질문")}
-    asyncio.run(a._on_message(_msg(999, "파이썬이 뭐야", channel_id=600)))
-    assert a._queue.qsize() == 1
-    ev = a._queue.get_nowait()
-    assert ev.channel_role == "게스트질문" and ev.user_id == 999
-
-
-def test_on_interaction_guest_channel_button_still_dropped():
-    # M-1: 게스트 채널 버튼은 선필터 그대로 드롭(코어 _guest_bypass 도 button 제외 — 대칭).
-    a = _adapter()
-    a._channel_map = {600: ("role", "게스트질문")}
-    asyncio.run(a._on_interaction(_interaction(999, "clean:ok", channel_id=600)))
     assert a._queue.qsize() == 0
 
 
@@ -443,34 +418,13 @@ def test_ack_none_callback_is_noop():
     assert ran == []
 
 
-def test_ack_unknown_callback_is_noop():
-    a = _adapter()
-    ran = []
-    a._run = lambda coro: ran.append(coro)  # type: ignore[assignment]
-    a.ack("nope", "note")
-    assert ran == []  # 맵에 없으면 followup 도 안 함
-
-
-def test_ack_with_note_sends_followup_and_consumes_map():
-    a = _adapter()
-    inter = SimpleNamespace(name="i")
-    a._interactions["9001"] = inter
-    a._followup_coro = lambda interaction, note: ("followup", interaction, note)  # type: ignore[assignment]
-    ran = []
-    a._run = lambda coro: ran.append(coro)  # type: ignore[assignment]
-    a.ack("9001", "확인")
-    assert ran == [("followup", inter, "확인")]
-    assert "9001" not in a._interactions  # 소비(맵 정리)
-
-
-def test_ack_without_note_consumes_map_no_followup():
+def test_ack_consumes_map_and_is_idempotent():
     a = _adapter()
     a._interactions["9001"] = SimpleNamespace()
-    ran = []
-    a._run = lambda coro: ran.append(coro)  # type: ignore[assignment]
-    a.ack("9001")  # note 없음 → 이미 defer 됨, followup 안 함
-    assert ran == []
+    a.ack("9001")  # 이미 defer 됨 → 응답할 것 없음, 맵만 정리
     assert "9001" not in a._interactions
+    a.ack("9001")  # 재호출·미등록도 무해
+    a.ack("nope")
 
 
 def test_close_before_start_is_safe_and_sets_sentinel():
@@ -538,7 +492,7 @@ def test_status_color_matches_headers_and_leaders():
     assert sc(f"{HEADER_FAIL}\n\n실패") == discord_adapter._COLOR_FAIL  # 빨강
     assert sc(f"{HEADER_NOTE}\n\n확인") == discord_adapter._COLOR_INFO  # 블러플
     assert sc("🔄 작업 중") == discord_adapter._COLOR_WAIT  # 모든 진행 헤더 단일 문구 → 노랑
-    assert sc("⏰ 개장 알림\n등락률 확인") == discord_adapter._COLOR_WAIT  # 예약 알림
+    assert sc("⏰ 개장 알림\n등락률 확인") is None  # ⏰ 는 상태 헤더가 아니다(plain)
 
 
 def test_status_color_plain_returns_none():
@@ -592,16 +546,6 @@ def test_edit_progress_to_done_transitions_embed_same_message():
     assert calls[0][3].color.value == discord_adapter._COLOR_DONE
 
 
-def test_notify_status_renders_yellow_embed():
-    # 예약 알림(⏰ 선두 이모지) → 진행/대기 노랑 임베드. #알림 채널 send 경로로 검증.
-    a = _adapter()
-    calls = _stub_calls(a, [1])
-    a.send(999, "⏰ 개장 알림\n등락률 확인", [Button("✅ 확인시작", "nb:ok", "a")])
-    payload = calls[0][2]
-    assert isinstance(payload, discord.Embed)
-    assert payload.color.value == discord_adapter._COLOR_WAIT
-
-
 def test_embed_overflow_sends_followup_plain_chunk():
     a = _adapter()  # 기본 limit=2000 — 오버플로(104자)는 단일 후속 청크
     calls = _stub_calls(a, [111, None])
@@ -611,126 +555,10 @@ def test_embed_overflow_sends_followup_plain_chunk():
     assert isinstance(calls[1][2], str) and calls[1][2] == "y" * 104  # 오버플로 = 후속 plain
 
 
-# ---------------------------------------------------------------------------
-# 카드 렌더(🧩 다이제스트 — adapter.py 「Card 규약」). 공용 _build_embed 와 별도 경로.
-# ---------------------------------------------------------------------------
-_CARD_SPEC = {
-    "author": "🧩 MCP축 · 1/2",
-    "title": "claude-mem (⭐88,643)",
-    "description": "**보류** · 세션 메모리 영속화.",
-    "fields": [("👍 장점", "결손 축을 메움", True), ("🔧 적용", "훅 1건 — 20분", False)],
-    "footer": "검토 24 · 기각 22",
-    "color": 0xEEBB4D,
-}
-
-
-def test_build_card_embed_fills_every_slot():
-    embed = discord_adapter.build_card_embed(_CARD_SPEC, [])
-    assert embed.author.name == "🧩 MCP축 · 1/2"  # 축·순번은 author 슬롯(작은 회색 줄)
-    assert embed.title == "claude-mem (⭐88,643)"
-    assert embed.description == "**보류** · 세션 메모리 영속화."
-    assert [(f.name, f.value, f.inline) for f in embed.fields] == _CARD_SPEC["fields"]
-    assert embed.footer.text == "검토 24 · 기각 22"
-    assert embed.color.value == 0xEEBB4D
-
-
-def test_build_card_embed_two_layer_when_slots_missing():
-    none_card = {
-        "author": "🧩 에이전트 정의축",
-        "title": "오늘 적용할 것 없음",
-        "footer": "검토 12 · 기각 12",
-    }
-    embed = discord_adapter.build_card_embed(none_card, [])
-    assert embed.description is None and embed.fields == []  # 본문·필드 없는 2층
-    assert embed.color.value == discord_adapter._COLOR_INFO  # color 미지정 폴백
-
-
-def test_build_card_embed_truncates_to_discord_limits():
-    embed = discord_adapter.build_card_embed(
-        {
-            "author": "가" * 400,
-            "title": "나" * 400,
-            "fields": [("다" * 400, "라" * 2000, True)],
-            "footer": "마" * 3000,
-        },
-        [],
-    )
-    assert len(embed.author.name) == discord_adapter._EMBED_AUTHOR_LIMIT
-    assert len(embed.title) == discord_adapter._EMBED_TITLE_LIMIT
-    assert len(embed.fields[0].name) == discord_adapter._EMBED_FIELD_NAME_LIMIT
-    assert len(embed.fields[0].value) == discord_adapter._EMBED_FIELD_VALUE_LIMIT
-    assert len(embed.footer.text) == discord_adapter._EMBED_FOOTER_LIMIT
-
-
-def test_build_card_embed_masks_secrets_and_drops_empty_fields():
-    embed = discord_adapter.build_card_embed(
-        {"title": "T SECRET", "fields": [("👍 장점", "", True), ("", "값", True)]}, ["SECRET"]
-    )
-    assert embed.title == "T ***"  # 카드도 send/edit 과 같은 마스킹 문을 지난다
-    assert embed.fields == []  # 이름·값이 빈 필드는 디스코드가 400 → 애초에 안 싣는다
-
-
-def test_send_with_card_renders_single_embed_with_buttons():
-    a = _adapter()
-    calls = _stub_calls(a, [777])
-    mid = a.send(100, "🧩 평문 폴백", [Button("🔍 검토", "od:rev", "3")], card=_CARD_SPEC)
-    assert mid == 777
-    assert len(calls) == 1  # 카드는 항상 단일 메시지(청킹 없음)
-    payload, view = calls[0][2], calls[0][3]
-    assert isinstance(payload, discord.Embed) and payload.title == _CARD_SPEC["title"]
-    assert [c.custom_id for c in view.children] == ["od:rev:3"]
-
-
-def test_edit_with_card_replaces_embed_and_drops_buttons():
-    a = _adapter()
-    calls = _stub_calls(a, [None])
-    a.edit(100, 42, "🧩 평문 폴백", None, card=_CARD_SPEC)
-    assert calls[0][0] == "edit" and calls[0][2] == 42
-    assert isinstance(calls[0][3], discord.Embed)
-    assert calls[0][4] is None  # 버튼 없음 → view=None(컴포넌트 제거)
-
-
-def test_card_absent_keeps_existing_paths_untouched():
-    # 무회귀: card 를 안 주면 상태 임베드·plain 경로가 그대로다(_build_embed 시그니처·판정 불변).
-    a = _adapter()
-    calls = _stub_calls(a, [1, 2])
-    a.send(100, f"{HEADER_DONE}\n\n완료")
-    a.send(100, "대상 프로젝트 2")
-    assert isinstance(calls[0][2], discord.Embed) and calls[0][2].author.name is None
-    assert calls[1][2] == "대상 프로젝트 2"
-    # 🧩 는 상태색 대상이 아니다 — 카드는 card= 로 판정별 색을 싣고, 형식 이탈분은 임베드 없이
-    # 평문 그대로 나간다(노랑은 진행·⏰예약알림 전용이라 폰에서 헷갈리지 않게).
-    assert discord_adapter._status_color("🧩 MCP축 · x") is None
-
-
-def test_digest_plain_fallback_is_plain_text_not_yellow_embed():
-    """카드 파싱 실패분(card 없음)은 임베드 없이 평문 — ⏰ 예약알림 노랑으로 나가지 않는다."""
-    a = _adapter()
-    calls = _stub_calls(a, [1])
-    a.send(100, "🧩 MCP축 owner/repo 차용\n적용 : 훅에 · 30분")
-    assert calls[0][2] == "🧩 MCP축 owner/repo 차용\n적용 : 훅에 · 30분"  # str = plain
-
-
-def test_digest_card_color_comes_from_core_spec():
-    """카드 색은 코어가 판정별로 정해 넘긴 값 그대로(어댑터 상태색이 덮어쓰지 않는다)."""
-    a = _adapter()
-    calls = _stub_calls(a, [1])
-    a.send(100, "🧩 평문 폴백", None, card={**_CARD_SPEC, "color": 0x3ECF85})
-    assert calls[0][2].color.value == 0x3ECF85  # 즉시적용 초록
-
-
 def test_render_view_success_and_secondary_styles():
     view = render_view(push_buttons())
     assert view.children[0].style == discord.ButtonStyle.success  # Push
     assert view.children[1].style == discord.ButtonStyle.secondary  # 취소
-
-
-def test_message_event_fills_reply_to():
-    # §4.7 델타2: message.reference.message_id → Event.reply_to.
-    ref = SimpleNamespace(message_id=42)
-    ev = _adapter()._message_event(_msg(777, "이어서", reference=ref))
-    assert ev.reply_to == 42
-    assert _adapter()._message_event(_msg(777, "일반")).reply_to is None
 
 
 def test_wait_ready_reflects_on_ready_event():
@@ -748,7 +576,7 @@ def test_wait_ready_reflects_on_ready_event():
 
 def test_channel_map_roundtrip(tmp_path):
     p = tmp_path / "cm.json"
-    m = {10: ("role", "알림"), 20: ("project", "etf_info")}
+    m = {10: ("role", "데이터분석"), 20: ("project", "etf_info")}
     discord_adapter.save_channel_map(p, m)
     assert discord_adapter.load_channel_map(p) == m
 
@@ -762,17 +590,21 @@ def test_load_channel_map_missing_and_corrupt(tmp_path):
 
 def test_role_channel_reverse_lookup():
     a = _adapter()
-    a._channel_map = {10: ("role", "알림"), 20: ("project", "etf_info"), 30: ("role", "봇상태")}
-    assert a.role_channel("알림") == 10
+    a._channel_map = {
+        10: ("role", "간단처리"),
+        20: ("project", "etf_info"),
+        30: ("role", "봇상태"),
+    }
+    assert a.role_channel("간단처리") == 10
     assert a.role_channel("봇상태") == 30
     assert a.role_channel("없는역할") is None
 
 
 def test_project_channel_reverse_lookup():
     a = _adapter()
-    a._channel_map = {10: ("role", "알림"), 20: ("project", "etf_info")}
+    a._channel_map = {10: ("role", "데이터분석"), 20: ("project", "etf_info")}
     assert a.project_channel("etf_info") == 20  # 히트
-    assert a.project_channel("알림") is None  # role 태그는 매칭 안 됨
+    assert a.project_channel("데이터분석") is None  # role 태그는 매칭 안 됨
     assert a.project_channel("없는프로젝트") is None  # 미스
 
 
@@ -1497,11 +1329,11 @@ def test_enqueue_coro_noop_when_stopping():
 
 def test_message_event_channel_map_project_and_role():
     a = _adapter()
-    a._channel_map = {100: ("project", "etf_info"), 200: ("role", "알림")}
+    a._channel_map = {100: ("project", "etf_info"), 200: ("role", "데이터분석")}
     ev_p = a._message_event(_msg(777, "hi", channel_id=100, channel_name="딴이름"))
     assert ev_p.project == "etf_info" and ev_p.channel_role is None  # 채널ID 매핑 우선
     ev_r = a._message_event(_msg(777, "hi", channel_id=200))
-    assert ev_r.channel_role == "알림" and ev_r.project is None
+    assert ev_r.channel_role == "데이터분석" and ev_r.project is None
 
 
 def test_message_event_unmapped_falls_back_to_channel_name():
@@ -1658,12 +1490,10 @@ def test_ensure_channels_creates_categories_channels_and_persists(tmp_path):
     a._client = SimpleNamespace(guilds=[guild])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())
     tags = set(a._channel_map.values())
-    assert {
-        ("role", "알림"),
-        ("role", "봇상태"),
-    } <= tags
+    assert ("role", "봇상태") in tags
+    assert ("role", "알림") not in tags  # 검증 카드 기능 삭제(2026-10-08) — 더는 만들지 않는다
     assert {("project", "etf_info"), ("project", "trading_info")} <= tags
-    assert a.role_channel("알림") is not None and a.role_channel("봇상태") is not None
+    assert a.role_channel("봇상태") is not None and a.role_channel("알림") is None
     assert cm.exists()  # 영속
     assert discord_adapter.load_channel_map(cm) == a._channel_map
 
@@ -1691,8 +1521,8 @@ def test_concurrent_on_ready_no_duplicate(monkeypatch):
         await asyncio.gather(a._ensure_channels(), a._ensure_channels())
 
     asyncio.run(two_on_ready())
-    # 카테고리 5개(프로젝트·스케쥴러·시스템·질문·PlayList) — 간단처리·데이터분석 제거(2026-08-16).
-    assert len(guild.categories) == 5  # 간단처리·데이터분석 제거(2026-08-16)
+    # 카테고리 4개(프로젝트·스케쥴러·시스템·PlayList) — 간단처리·데이터분석·질문 제거.
+    assert len(guild.categories) == 4
     assert [n for n, _ in guild.created].count("etf_info") == 1
 
 
@@ -1756,7 +1586,7 @@ def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch)
 
     class _RejectingGuild(_FakeGuild):
         async def create_text_channel(self, name, **kwargs):
-            if name == "봇상태":  # 특정 채널만 생성 거부(권한 없음 모사)
+            if name == "마이크론":  # 특정 채널만 생성 거부(권한 없음 모사)
                 raise discord.DiscordException("forbidden")
             return await super().create_text_channel(name, **kwargs)
 
@@ -1766,9 +1596,9 @@ def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch)
     a._client = SimpleNamespace(guilds=[guild])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())  # 예외로 안 죽음
     tags = set(a._channel_map.values())
-    assert ("role", "봇상태") not in tags  # 실패한 채널은 미매핑(스킵)
-    # 형제 채널·프로젝트·다른 특수채널은 정상 매핑(부분 실패가 전체를 무너뜨리지 않음)
-    assert {("role", "알림"), ("project", "etf_info")} <= tags
+    assert ("role", "미국주식") not in tags  # 실패한 채널은 미매핑(스킵)
+    # 프로젝트·다른 특수채널은 정상 매핑(부분 실패가 전체를 무너뜨리지 않음)
+    assert {("role", "봇상태"), ("project", "etf_info")} <= tags
 
 
 # ---------------------------------------------------------------------------
@@ -1822,14 +1652,14 @@ def test_hyphen_form_force_renamed_to_joined(monkeypatch):
 
 
 def test_special_channel_names_are_joined(monkeypatch):
-    # 특수 채널명 붙여쓰기(하이픈 없음): 간단처리·데이터분석·알림·봇상태. (빈이름 폐기 — 정상명)
+    # 특수 채널명 붙여쓰기(하이픈 없음): 표시명 알림(tag 봇상태) 등. (빈이름 폐기 — 정상명).
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     created = {n for n, _ in guild.created}
-    assert {"알림", "봇상태"} <= created
+    assert "알림" in created and "봇상태" not in created  # 표시명만 알림 — tag 는 봇상태
     assert not any("-" in n for n in created)  # 하이픈 없음
 
 
@@ -1839,11 +1669,11 @@ def test_rename_rejected_keeps_mapping(monkeypatch):
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
     simple = _FakeChannel(700, "구이름", reject_rename=True)  # 목표명과 달라 리네임 시도됨
-    a._channel_map = {700: ("role", "알림")}
+    a._channel_map = {700: ("role", "봇상태")}
     _guild_for(a, text_channels=[simple])
     asyncio.run(a._ensure_channels())
     assert simple.renames == ["알림"] and simple.name == "구이름"  # 시도했으나 거부→기존명 보존
-    assert a._channel_map[700] == ("role", "알림")  # 매핑 유지(라우팅 OK)
+    assert a._channel_map[700] == ("role", "봇상태")  # 매핑 유지(라우팅 OK)
 
 
 def test_label_fallback_to_folder_when_no_label(monkeypatch):
@@ -1867,27 +1697,6 @@ def test_voice_playlist_renames_default_general(monkeypatch):
     assert default_voice.renames == ["PlayList"]  # 기본음성 → PlayList 리네임(삭제+생성 아님)
     assert guild.voice_created == []  # 새 음성 생성 안 함
     assert a._channel_map[900] == ("role", "playlist")
-
-
-def test_special_registers_guest_role_in_question_category(monkeypatch):
-    # 게스트질문 role 은 ❓ 질문 카테고리, 간단처리 role 은 🗂️ 간단처리(게스트 뺌·무손상).
-    assert ("게스트질문", "role", "게스트질문") in discord_adapter._SPECIAL[
-        discord_adapter._CAT_QUESTION
-    ]
-    # 카테고리 순서: 시스템 < 질문 < PlayList.
-    order = discord_adapter._CAT_ORDER
-    assert (
-        order.index(discord_adapter._CAT_SYSTEM)
-        < order.index(discord_adapter._CAT_QUESTION)
-        < order.index(discord_adapter._CAT_VOICE)
-    )
-    # 봇 재기동(_ensure_channels) 시 채널 자동 생성·매핑되는지(role tag 불변).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
-    _guild_for(a)
-    asyncio.run(a._ensure_channels())
-    assert ("role", "게스트질문") in set(a._channel_map.values())
 
 
 def test_voice_playlist_created_when_no_default(monkeypatch):
@@ -1923,8 +1732,7 @@ def test_categories_ordered(monkeypatch):
     assert order["프로젝트"] == 0
     assert order["스케쥴러"] == 1  # 🗓️ 스케쥴러 (프로젝트 아래·시스템 위)
     assert order["시스템"] == 2
-    assert order["질문"] == 3  # ❓ 질문 (시스템 아래·PlayList 위)
-    assert order["playlist"] == 4  # 🎵 PlayList
+    assert order["playlist"] == 3  # 🎵 PlayList (시스템 아래)
 
 
 def test_scheduler_category_in_order_between_data_and_system():
@@ -1936,17 +1744,14 @@ def test_scheduler_category_in_order_between_data_and_system():
 
 
 def test_scheduler_special_role_channels():
-    """**표시명과 tag 가 일부러 다르다** — 표시명은 `반도체주식`, tag 는 `미국주식` 그대로.
+    """**표시명과 tag 가 일부러 다르다** — 표시명은 `마이크론`, tag 는 `미국주식` 그대로.
 
     tag 를 표시명에 맞추면 채널 탐색 1차(`channel_map` 의 `(kind, tag)`)·2차(이름 canon)가
     모두 빗나가 **새 채널이 생긴다** — 옛 채널의 히스토리도 손으로 건 읽기전용 권한도 안 따라온다.
     표시명만 바꾸면 `_rename_if_needed` 가 기존 채널을 제자리에서 rename 한다.
     """
     assert discord_adapter._SPECIAL[discord_adapter._CAT_SCHED] == [
-        ("반도체주식", "role", "미국주식"),
-        ("오픈소스", "role", "오픈소스"),
-        ("유튜브dev", "role", "유튜브-Dev"),
-        ("유튜브일반", "role", "유튜브-일반"),
+        ("마이크론", "role", "미국주식"),
         # `개발자료` 는 2026-08-15 제거 — 이 단언이 **되살아나는 것을 막는 자물쇠**다
         # (목록에 다시 들어가면 재기동이 채널을 자동생성한다).
     ]
@@ -1957,24 +1762,24 @@ def test_scheduler_special_role_channels():
     # (종전 주석은 *"바꾸면 채널이 재배치된다"* 였으나 **거짓이었다** — 2026-08-15 점검에서
     #  두 게이트가 독립 실측: 항목 제거 전후 4채널 position 불변. 거짓 주석은 없느니만 못하다.)
     # notify.json 의 `channel` 은 **표시명이 아니라 tag** 를 쓴다:
-    # us-digest → "미국주식"(표시명 `#반도체주식` 아님).
+    # us-digest → "미국주식"(표시명 `#마이크론` 아님).
     # 읽기전용·notify.json 라우팅도 tag 기준이라 함께 무변경이어야 한다.
     assert "미국주식" in discord_adapter._READONLY_TAGS
 
 
 def test_scheduler_channels_created_and_mapped(monkeypatch):
-    # 새 카테고리 🗓️ 스케쥴러 아래에 반도체주식·오픈소스 role 채널 생성 + channel_map 매핑.
+    # 새 카테고리 🗓️ 스케쥴러 아래에 마이크론 role 채널 생성 + channel_map 매핑.
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     tags = set(a._channel_map.values())
-    assert ("role", "미국주식") in tags and ("role", "오픈소스") in tags
+    assert ("role", "미국주식") in tags
     created = {n for n, _ in guild.created}
-    assert {"반도체주식", "오픈소스"} <= created
+    assert "마이크론" in created
     # 라우팅 키는 **tag** 다 — 표시명이 바뀌어도 `notify.json` 의 `channel: "미국주식"` 이 산다.
-    assert a.role_channel("미국주식") is not None and a.role_channel("오픈소스") is not None
+    assert a.role_channel("미국주식") is not None
     assert any(discord_adapter._cat_core(c.name) == "스케쥴러" for c in guild.categories)
 
 
@@ -1987,22 +1792,22 @@ def test_existing_us_channel_is_renamed_not_recreated(monkeypatch):
     a._channel_map = {777: ("role", "미국주식")}
     guild = _guild_for(a, text_channels=[old])
     asyncio.run(a._ensure_channels())
-    assert old.name == "반도체주식"  # 제자리 rename
-    assert "반도체주식" not in {n for n, _ in guild.created}  # 새 채널을 만들지 않았다
+    assert old.name == "마이크론"  # 제자리 rename
+    assert "마이크론" not in {n for n, _ in guild.created}  # 새 채널을 만들지 않았다
     assert a._channel_map[777] == ("role", "미국주식")  # tag 는 그대로 → 라우팅 유지
 
 
 def test_us_channel_is_readonly_for_people_but_writable_by_bot(monkeypatch):
-    # #반도체주식 은 읽기 전용(사용자: "매일 보는 용도로만"). **봇까지 잠그면 카드가 못 나간다.**
+    # #마이크론 은 읽기 전용(사용자: "매일 보는 용도로만"). **봇까지 잠그면 카드가 못 나간다.**
     monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
     a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
-    ch = next(c for c in guild.text_channels if c.name == "반도체주식")
+    ch = next(c for c in guild.text_channels if c.name == "마이크론")
     assert ch.bit("@everyone") is False  # 사람은 못 쓴다
     assert ch.bit("bot") is True  # 봇은 쓴다
-    others = [c for c in guild.text_channels if c.name in ("오픈소스", "알림")]
+    others = [c for c in guild.text_channels if c.name in ("알림",)]
     assert others and all(c.perm_calls == [] for c in others)  # 다른 채널은 안 건드린다
 
 
@@ -2437,10 +2242,8 @@ def test_edit_untracked_message_stays_classic():
 
 
 # ---------------------------------------------------------------------------
-# 무회귀 골든 — card 미지정(= 카드 도입 전 모든 메시지)의 렌더 결과를 문자 단위로 고정한다.
-# `card` 인자 추가·build_card_embed 신설이 공용 _build_embed/_status_color 경로를 건드리지
-# 않았음을 증명한다(HEAD 실행 결과와 대조해 동일 확인, 2026-07-27 QA). 여기가 깨지면 폰에서
-# 받는 일상 회신(진행·완료·실패·확인·예약알림·목록·선택지)이 전부 바뀐 것이다.
+# 무회귀 골든 — 일상 회신의 렌더 결과를 문자 단위로 고정한다. 여기가 깨지면 폰에서 받는
+# 회신(진행·완료·실패·확인·예약알림·목록·선택지)이 전부 바뀐 것이다.
 # ---------------------------------------------------------------------------
 def _stub_all(adapter, ids):
     """_stub_calls + V2(LayoutView) 코루틴까지 — 목록·선택지가 실코루틴을 만들지 않게."""
@@ -2467,7 +2270,7 @@ _BASE = 15645517, 4116357, 15750747, 5793266  # 노랑·초록·빨강·블러�
 
 
 def _kinds():
-    from bridge import HEADER_CHOICE, choice_buttons, notify_buttons
+    from bridge import HEADER_CHOICE, choice_buttons
 
     wait, done, fail, info = _BASE
     return [
@@ -2531,21 +2334,7 @@ def _kinds():
             ),
             None,
         ),
-        (
-            "⏰ 알림\n\n장 열림",
-            notify_buttons("ti-open"),
-            (
-                "E",
-                {
-                    "flags": 0,
-                    "color": wait,
-                    "type": "rich",
-                    "description": "장 열림",
-                    "title": "⏰ 알림",
-                },
-            ),
-            ["nb:ok:ti-open", "nb:later:ti-open"],
-        ),
+        ("⏰ 알림\n\n장 열림", None, ("P", "⏰ 알림\n\n장 열림"), None),
         (
             f"{HEADER_CHOICE}\n\n고르세요",
             None,
@@ -2579,7 +2368,7 @@ def _kinds():
 
 
 @pytest.mark.parametrize(("text", "buttons", "expect", "cids"), _kinds())
-def test_send_without_card_is_byte_identical_baseline(text, buttons, expect, cids):
+def test_send_payload_kinds_baseline(text, buttons, expect, cids):
     a = _adapter(secrets=["SECRET"])
     calls = _stub_all(a, [1, 2])
     a.send(100, text, buttons)
@@ -2588,19 +2377,8 @@ def test_send_without_card_is_byte_identical_baseline(text, buttons, expect, cid
         assert _cids(calls[0]) == cids
 
 
-@pytest.mark.parametrize(("text", "buttons", "expect", "cids"), _kinds())
-def test_send_with_card_none_equals_omitted(text, buttons, expect, cids):
-    """card=None 은 인자를 아예 안 준 것과 완전히 같아야 한다(기존 호출부 전부 이 경로)."""
-    a = _adapter(secrets=["SECRET"])
-    calls = _stub_all(a, [1, 2])
-    a.send(100, text, buttons, card=None)
-    assert [_payload(c) for c in calls] == [expect]
-    if expect[0] != "V2":
-        assert _cids(calls[0]) == cids
-
-
 @pytest.mark.parametrize(("text", "buttons", "expect", "_cid"), _kinds())
-def test_edit_without_card_is_byte_identical_baseline(text, buttons, expect, _cid):
+def test_edit_payload_kinds_baseline(text, buttons, expect, _cid):
     a = _adapter(secrets=["SECRET"])
     calls = _stub_all(a, [None, None])
     a.edit(100, 42, text, buttons)
@@ -2611,106 +2389,162 @@ def test_edit_without_card_is_byte_identical_baseline(text, buttons, expect, _ci
         assert got == expect
 
 
-def test_send_overflow_without_card_still_splits():
-    """4096 초과 본문의 오버플로 후속 청크 = 종전 그대로(카드 경로가 청킹을 건드리지 않았다)."""
+# ---------------------------------------------------------------------------
+# 시스템 소식 채널(표시명 알림 · tag 봇상태) — 🟢 기동 1회 · 🔌 재연결(10분 이상)
+# ---------------------------------------------------------------------------
+_STAMP_HEAD = r"^\[\d{4}-\d{2}-\d{2} (AM|PM) \d{2}:\d{2}\] "  # notice_stamp 머리(시각 비의존)
+
+
+def test_special_system_category_has_one_channel_display_alert_tag_status():
+    chans = discord_adapter._SPECIAL[discord_adapter._CAT_SYSTEM]
+    assert chans == [("알림", "role", "봇상태")]  # 🔴 표시명 알림 · tag 봇상태(변경 금지)
+
+
+def test_boot_notice_text_format():
+    from datetime import datetime
+
+    assert discord_adapter.boot_notice_text(datetime(2026, 10, 8, 9, 5)) == (
+        "[2026-10-08 AM 09:05] 🟢 bridge On"
+    )
+
+
+def _at(ts):
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts)  # 어댑터와 같은 방식 — 로컬 타임존에 흔들리지 않는다
+
+
+def test_reconnect_notice_texts_threshold():
+    f = discord_adapter.reconnect_notice_texts
+    since = 1_000_000.0
+    assert f(since, since) == [] and f(since, since + 599) == []  # 10분 미만은 조용히
+    for gap in (600, 1500):
+        got = f(since, since + gap)
+        assert got == [
+            f"{bridge.notice_stamp(_at(since))} 🔴 bridge Off",
+            f"{bridge.notice_stamp(_at(since + gap))} 🟢 bridge On",
+        ]  # 순서: 끊긴 시각의 Off → 돌아온 시각의 On
+        assert all("🔌" not in t and "동안" not in t for t in got)
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _status_adapter():
+    clock = _Clock()
+    a = DiscordAdapter("tok", [], _ALLOWED, clock=clock)
+    posted: list[str] = []
+
+    async def fake_post(text):
+        posted.append(text)
+
+    a._post_status = fake_post  # type: ignore[method-assign]
+    return a, posted, clock
+
+
+def test_boot_notice_only_once_across_reconnect_ready():
+    a, posted, _clock = _status_adapter()
+    asyncio.run(a._announce_ready())
+    asyncio.run(a._announce_ready())  # 재연결로 on_ready 가 다시 와도 반복하지 않는다
+    assert len(posted) == 1
+    assert re.match(_STAMP_HEAD + "🟢 bridge On$", posted[0])
+
+
+def test_reconnect_over_ten_minutes_reports_on_resumed():
+    a, posted, clock = _status_adapter()
+    a._ready.set()
+    asyncio.run(a._client.on_disconnect())
+    clock.t += 17 * 60
+    asyncio.run(a._client.on_resumed())
+    assert posted == [
+        f"{bridge.notice_stamp(_at(1000.0))} 🔴 bridge Off",
+        f"{bridge.notice_stamp(_at(1000.0 + 17 * 60))} 🟢 bridge On",
+    ]
+    asyncio.run(a._client.on_resumed())  # 소거됐다 — 두 번 말하지 않는다
+    assert len(posted) == 2
+
+
+def test_reconnect_under_ten_minutes_is_silent():
+    a, posted, clock = _status_adapter()
+    a._ready.set()
+    asyncio.run(a._client.on_disconnect())
+    clock.t += 9 * 60 + 59
+    asyncio.run(a._client.on_resumed())
+    assert posted == [] and a._disconnected_at is None
+
+
+def test_reconnect_reported_on_second_ready_too():
+    a, posted, clock = _status_adapter()
+    a._ready.set()
+    asyncio.run(a._announce_ready())  # 최초 ready → 기동 알림
+    asyncio.run(a._client.on_disconnect())
+    clock.t += 30 * 60
+    asyncio.run(a._announce_ready())  # resume 대신 재-ready 가 온 경로
+    # 기동 🟢 1건 + 재연결 Off/On 쌍 — 재-ready 가 기동 🟢 를 또 내지 않는다
+    assert len(posted) == 3
+    assert posted[0].endswith("🟢 bridge On") and re.match(_STAMP_HEAD, posted[0])
+    assert posted[1] == f"{bridge.notice_stamp(_at(1000.0))} 🔴 bridge Off"
+    assert posted[2] == f"{bridge.notice_stamp(_at(1000.0 + 30 * 60))} 🟢 bridge On"
+    asyncio.run(a._announce_ready())  # 또 재-ready — 끊긴 시각이 소거됐으니 아무것도 안 나간다
+    assert len(posted) == 3
+
+
+def test_repeated_disconnects_keep_the_first_timestamp():
+    a, posted, clock = _status_adapter()
+    a._ready.set()
+    asyncio.run(a._client.on_disconnect())
+    clock.t += 8 * 60
+    asyncio.run(a._client.on_disconnect())  # 재시도 중 반복 발화
+    clock.t += 8 * 60
+    asyncio.run(a._client.on_resumed())
+    # Off 의 시각은 «처음» 끊긴 시각(1000)이지 재시도 중 반복 발화 시각이 아니다
+    assert len(posted) == 2
+    assert posted[0] == f"{bridge.notice_stamp(_at(1000.0))} 🔴 bridge Off"
+    assert posted[1] == f"{bridge.notice_stamp(_at(1000.0 + 16 * 60))} 🟢 bridge On"
+
+
+def test_disconnect_before_first_ready_is_ignored():
+    a, posted, clock = _status_adapter()
+    asyncio.run(a._client.on_disconnect())  # 접속 한 번도 못 한 상태
+    clock.t += 60 * 60
+    asyncio.run(a._announce_ready())
+    assert len(posted) == 1 and re.match(_STAMP_HEAD + "🟢 ", posted[0])  # 🔴 Off 없음
+
+
+def test_post_status_unmapped_does_not_raise(caplog):
     a = _adapter()
-    calls = _stub_calls(a, [1, 2])
-    a.send(100, f"{HEADER_DONE}\n\n" + "y" * 4200)
-    assert len(calls) == 2
-    assert isinstance(calls[0][2], discord.Embed) and len(calls[0][2].description) == 4096
-    assert calls[1][2] == "y" * 104
+    with caplog.at_level("WARNING", logger="bridge"):
+        asyncio.run(a._post_status("소식"))
+    assert "미매핑" in caplog.text
 
 
-# ── 카드 한도·마스킹 보강(기존 테스트 미커버분) ─────────────────────────────
-def test_build_card_embed_caps_description_and_field_count():
-    embed = discord_adapter.build_card_embed(
-        {
-            "description": "설" * 5000,
-            "fields": [(f"n{i}", f"v{i}", True) for i in range(40)],
-        },
-        [],
-    )
-    assert len(embed.description) == discord_adapter._EMBED_DESC_LIMIT  # 4096
-    assert len(embed.fields) == discord_adapter._EMBED_FIELDS_MAX  # 25개 초과분 절단
-    assert [f.name for f in embed.fields] == [f"n{i}" for i in range(25)]  # 앞에서부터
+def test_post_status_sends_masked_text_to_status_channel():
+    a = DiscordAdapter("tok", ["SECRET"], _ALLOWED)
+    a._channel_map = {88: ("role", "봇상태")}
+    got = []
+
+    async def fake_send(cid, payload, view):
+        got.append((cid, payload, view))
+        return 1
+
+    a._send_coro = fake_send  # type: ignore[method-assign]
+    asyncio.run(a._post_status("소식 SECRET"))
+    assert got == [(88, "소식 ***", None)]
 
 
-def test_build_card_embed_announces_omitted_fields_in_footer():
-    """조용한 절단 금지 — 반도체주식 카드면 맨 뒤 국내장 3필드(지수·메모리·장비소재)가 소리 없이
-    사라진다.
-    이 모듈의 원칙("조용히 죽는 것보다 안 쓴다고 말하고 죽는 것이 낫다")과 어긋난다."""
-    embed = discord_adapter.build_card_embed(
-        {"footer": "출처", "fields": [(f"n{i}", "값" * 1000, False) for i in range(10)]}, []
-    )
-    assert "생략" in embed.footer.text and "출처" in embed.footer.text
-    assert len(embed.footer.text) <= discord_adapter._OMIT_NOTE_MAXLEN + len("출처") + 3
+def test_post_status_send_failure_is_swallowed(caplog):
+    a = _adapter()
+    a._channel_map = {88: ("role", "봇상태")}
 
+    async def boom(*_args):
+        raise RuntimeError("down")
 
-def test_omit_note_reserve_matches_the_us_digest_budget_assumption():
-    """`test_us_digest` 의 필드 예산 계약이 이 값을 **숫자로 베껴 둔다** — 그 파일은 discord.py
-    없이도 도느라 어댑터를 import 하지 않는다(공개 미러본 사정).
-
-    여기가 커지면 실제 예산은 줄어드는데 그쪽 계산은 그대로라 **조용히 낙관적**이 된다 →
-    카드 뒤쪽(국내장 3필드)이 말없이 잘린다. 두 숫자를 이 한 줄로 묶어 둔다.
-    """
-    import test_us_digest
-
-    assert discord_adapter._OMIT_NOTE_MAXLEN == test_us_digest.DISCORD_OMIT_NOTE_RESERVE
-
-
-def test_build_card_embed_clamps_description_to_total_budget():
-    # 슬롯별 한도만 지킨 조합(title 256 + desc 4096 + author 256 + footer 2048 = 6656)은
-    # **필드가 0개여도** 6000 을 넘겨 400 이 난다.
-    embed = discord_adapter.build_card_embed(
-        {
-            "title": "제" * 256,
-            "author": "저" * 256,
-            "footer": "꼬" * 2048,
-            "description": "설" * 4096,
-            "fields": [],
-        },
-        [],
-    )
-    total = (
-        len(embed.title) + len(embed.description) + len(embed.author.name) + len(embed.footer.text)
-    )
-    assert total <= discord_adapter._EMBED_TOTAL_LIMIT
-
-
-def test_build_card_embed_drops_fields_past_total_limit():
-    """슬롯별 한도를 다 지켜도 **합계 6000 을 넘으면 디스코드가 400 으로 거부**해 메시지 자체가
-    사라진다. 호출자가 둘(오픈소스 5x1000 · 반도체주식 10x550)이고 산식이 달라 누적으로도 센다.
-    넘치는 필드는 버리되 앞쪽은 살린다 — 한 필드를 잃는 게 카드 전체를 잃는 것보다 낫다.
-    """
-    embed = discord_adapter.build_card_embed(
-        {"title": "T", "fields": [(f"n{i}", "값" * 1000, False) for i in range(10)]}, []
-    )
-    total = len(embed.title or "") + sum(len(f.name) + len(f.value) for f in embed.fields)
-    assert total <= discord_adapter._EMBED_TOTAL_LIMIT
-    assert 0 < len(embed.fields) < 10  # 일부는 실리고 초과분만 잘린다
-    assert [f.name for f in embed.fields] == [f"n{i}" for i in range(len(embed.fields))]
-
-
-def test_build_card_embed_masks_every_slot():
-    """author·title·description·field name·field value·footer — 한 슬롯이라도 새면 결함."""
-    embed = discord_adapter.build_card_embed(
-        {
-            "author": "🧩 SECRET축",
-            "title": "SECRET/repo",
-            "description": "**차용** · SECRET 쓴다",
-            "fields": [("👍 SECRET", "값 SECRET 있음", True)],
-            "footer": "검토 SECRET · 기각 1",
-            "color": 0x3ECF85,
-        },
-        ["SECRET"],
-    )
-    dumped = str(embed.to_dict())
-    assert "SECRET" not in dumped
-    assert dumped.count("***") == 6  # 6개 슬롯 전부 마스킹됨
-
-
-def test_build_card_embed_ignores_unknown_keys_and_bad_color():
-    """코어가 키를 더 넣거나 color 를 안 줘도 400 나지 않는다(규약: 없는 키 = 빈 슬롯)."""
-    embed = discord_adapter.build_card_embed({"foo": "bar", "color": 0}, [])
-    assert embed.color.value == discord_adapter._COLOR_INFO  # color=0 → 폴백
-    assert embed.title is None and embed.description is None and embed.fields == []
+    a._send_coro = boom  # type: ignore[method-assign]
+    with caplog.at_level("WARNING", logger="bridge"):
+        asyncio.run(a._post_status("소식"))  # 예외 없음
+    assert "전송 실패" in caplog.text

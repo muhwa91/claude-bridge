@@ -85,3 +85,9 @@ Thumbs.db
 .idea/
 .vscode/
 
+
+# 호스트 마커·감독자 런타임 파일
+bridge_host.local
+logs/run_loop.pid
+logs/reload_marker
+logs/stop_requested

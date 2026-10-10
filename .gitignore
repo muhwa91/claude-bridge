@@ -91,3 +91,8 @@ bridge_host.local
 logs/run_loop.pid
 logs/reload_marker
 logs/stop_requested
+
+# SNS정보 수집 — 수집 시작점·판정 중 카드(상태)와 판정 세션의 완료 신호
+logs/sns_state.json
+logs/sns_state.json.tmp
+logs/sns_judge_done.json

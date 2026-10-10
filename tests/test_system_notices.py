@@ -388,13 +388,14 @@ def test_legacy_pending_checks_entry_sends_nothing_and_records_no_fired(
 
 
 # ---------------------------------------------------------------------------
-# 15. 실제 schedules/notify.json — 정확히 3건
+# 15. 실제 schedules/notify.json — 정확히 4건
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(not bridge.SCHEDULES_FILE.exists(), reason="배포용 notify.json 없음(공개 미러)")
-def test_real_notify_json_has_exactly_three_items():
+def test_real_notify_json_has_exactly_four_items():
     items = bridge.load_schedules(bridge.SCHEDULES_FILE)
     assert sorted(it["id"] for it in items) == [
         "agent-usage-compare",
+        "sns-inbox",
         "spotify-monthly",
         "us-digest",
     ]

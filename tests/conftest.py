@@ -31,6 +31,8 @@ requires_monorepo = pytest.mark.skipif(
     not IN_MONOREPO, reason="모노레포 밖(공개 미러 클론) — LIVE_PATHS 실물이 없다"
 )
 
+ORIG_SNS_SPAWN = bridge._sns_spawn  # 아래 격리 fixture 가 갈아끼우기 전의 진짜(스레드) 구현
+
 # 브리지가 **실제로 쓰는** 상태 파일. 모듈 상수를 직접 읽는 함수를 부르는 테스트가 monkeypatch 를
 # 빠뜨리면 라이브가 오염된다.
 _STATE_ATTRS = (
@@ -39,6 +41,10 @@ _STATE_ATTRS = (
     # 덮어 **그 달의 자동 실행이 통째로 사라진다**.
     "SPOTIFY_MONTH_F",
     "RELOAD_MARKER",  # 자동 재시작 마커 — 라이브 logs/ 에 남기면 다음 기동이 🟢 를 건너뛴다
+    # SNS 수집 — 상태·완료 신호·**옵시디언 수집함**(빠뜨리면 테스트 노트가 실제 수집함에 쌓인다).
+    "SNS_STATE_FILE",
+    "SNS_DONE_FILE",
+    "SNS_INBOX_DIR",
 )
 
 
@@ -55,6 +61,9 @@ def _isolate_state_files(monkeypatch, tmp_path_factory):
     tmp_path **밖**에 둔다 — tmp_path 를 프로젝트 루트로 쓰는 테스트(list_projects)가 있어
     거기에 폴더를 만들면 가짜 프로젝트로 잡힌다.
     """
+    # SNS 느린 작업의 데몬 스레드를 테스트에선 그 자리에서 돌린다(결과를 바로 단언하려고).
+    # 실제 스레드로 띄우는지는 ORIG_SNS_SPAWN 으로 따로 검사한다(test_bridge).
+    monkeypatch.setattr(bridge, "_sns_spawn", lambda _name, fn, *args: fn(*args))
     state = tmp_path_factory.mktemp("state")
     for attr in _STATE_ATTRS:
         monkeypatch.setattr(bridge, attr, state / getattr(bridge, attr).name)

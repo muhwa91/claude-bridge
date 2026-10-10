@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,7 +22,7 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|clean:ok.
+    # 정규화 액션: push|x|p|c|clean:ok|clean:link|clean:all|clean:x|sns_judge.
     action: str
     arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
@@ -120,8 +120,20 @@ class Adapter(Protocol):
         """
         ...
 
-    def clear_channel(self, channel_id: int) -> int:
+    def clear_channel(
+        self,
+        channel_id: int,
+        *,
+        after_id: int | None = None,
+        upto_id: int | None = None,
+        keep: Callable[[str, int], bool] | None = None,
+    ) -> int:
         """채널의 메시지를 전부 삭제하고 삭제 건수 반환. 파괴적 — 코어가 확인 버튼 뒤에만 호출.
+
+        after_id/upto_id(선택)를 주면 **after_id 초과 ~ upto_id 이하** 메시지만 지운다(경계는 메시지
+        id = snowflake 비교라 지워진 id 도 된다). #SNS정보 는 수집기가 본 범위만 지운다.
+        안 주면 전체. keep(본문, 작성자 id) 가 True 인 메시지는 범위 안이어도 남긴다
+        (#SNS정보: 수집함에 없는 링크가 든 메시지).
 
         TextChannel.purge(14일 이내 일괄삭제 + 초과분 개별삭제로 전부 지움). 권한(Manage
         Messages) 없음·오류는 예외를 삼켜 **삭제된 만큼만** 반환(부분 성공 허용)하고 로깅한다.
@@ -148,6 +160,21 @@ class Adapter(Protocol):
 
     def skip_music(self, channel_id: int) -> str:
         """현재 곡을 건너뛰고 다음 곡 재생(디스코드 전용). 회신(""=미발송). 타 어댑터 미지원."""
+        ...
+
+    def history_after(self, channel_id: int, message_id: int, limit: int) -> list[Event] | None:
+        """채널에서 message_id **뒤**에 올라온 메시지(오래된 순, 최대 limit 건) → Event 목록.
+
+        상한을 넘는 나머지는 돌려주지 않는다 — 호출측이 마지막 id 까지 전진해 다음에 이어 읽는다.
+
+        SNS정보 정오 러너가 밀린 공유를 읽는 데 쓴다. 허용목록 필터는 코어가 한다(자기 메시지·
+        비허용 작성자도 그대로 돌려준다 — 러너가 last_message_id 를 그 끝까지 전진시켜야 해서).
+        실패는 로그+None(빈 채널은 [] — 둘을 구분해야 러너가 «읽기 실패»를 재시도한다).
+        """
+        ...
+
+    def delete_message(self, channel_id: int, message_id: int) -> None:
+        """메시지 1건 삭제(청소 확인의 «✖ 취소» — 확인 메시지 자체를 지운다). 실패는 로그만."""
         ...
 
     def search_candidates(self, query: str) -> list[tuple[str, str, str]]:
@@ -219,13 +246,18 @@ def chunk_text(text: str, limit: int) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
+# 인자 없는 버튼 액션(custom_id = 액션 그대로). sns_judge 는 «누른 그 카드» 가 대상이라
+# 인자가 필요 없다 — 카드 id 는 Event.message_id 로 온다.
+_BARE_ACTIONS = ("push", "x", "clean:ok", "clean:link", "clean:all", "clean:x", "sns_judge")
+
+
 def parse_callback(data: str) -> tuple[str, str] | None:
     """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
 
-    `push`/`x`/`clean:ok` → (그대로, ""), `p:<name>` → ("p", name),
+    `push`/`x`/`clean:ok`/`sns_judge` → (그대로, ""), `p:<name>` → ("p", name),
     정확 매칭만 — 화이트리스트 밖(삭제된 옛 `nb:*` 버튼 포함)은 None 이라 코어가 ack 후 무시한다.
     """
-    if data in ("push", "x", "clean:ok"):
+    if data in _BARE_ACTIONS:
         return (data, "")
     if data.startswith("p:") and len(data) > 2:
         return ("p", data[2:])
@@ -246,7 +278,7 @@ def encode_callback(action: str, arg: str) -> str:
 
     코어 Button.action/arg 를 어댑터 전송 문자열로 직렬화. 디코드(parse_callback)의 역.
     """
-    if action in ("push", "x", "clean:ok"):
+    if action in _BARE_ACTIONS:
         return action
     # 콜론-join 액션(§1.3): arg(프로젝트명·"mid:idx")를 그대로 이어붙인다.
     if action in ("p", "c"):

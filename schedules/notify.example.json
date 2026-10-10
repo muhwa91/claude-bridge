@@ -4,7 +4,13 @@
     {
       "id": "example-market-open",
       "project": "example_project",
-      "days": ["mon", "tue", "wed", "thu", "fri"],
+      "days": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri"
+      ],
       "at": "08:00",
       "grace_min": 60,
       "label": "장 개장 점검",
@@ -13,7 +19,14 @@
     {
       "id": "us-digest",
       "channel": "미국주식",
-      "days": ["mon", "tue", "wed", "thu", "fri", "sun"],
+      "days": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri",
+        "sun"
+      ],
       "at": "21:30",
       "grace_min": 150,
       "label": "마이크론 다이제스트",
@@ -22,11 +35,36 @@
     {
       "id": "spotify-monthly",
       "channel": "playlist",
-      "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+      "days": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri",
+        "sat",
+        "sun"
+      ],
       "at": "09:00",
       "grace_min": 899,
       "label": "스포티파이 월간 차트 담기",
       "note": "매일 하루 1회 확인 — 실제 주기는 월 스탬프가 정한다. 이번 달 미완료면 담고, 완료면 조용히 통과."
+    },
+    {
+      "id": "sns-inbox",
+      "channel": "SNS정보",
+      "days": [
+        "mon",
+        "tue",
+        "wed",
+        "thu",
+        "fri",
+        "sat",
+        "sun"
+      ],
+      "at": "12:00",
+      "grace_min": 719,
+      "label": "SNS정보 수집함 저장",
+      "note": "#SNS정보 에 공유된 인스타·X 링크를 하루 1회 묶어 옵시디언 수집함 노트로 저장하고 🔍 판정하기 버튼이 달린 카드를 보낸다. 놓친 날은 마지막 처리 위치 뒤부터 몰아서 처리. days 는 7일 전부여야 한다."
     }
   ]
 }

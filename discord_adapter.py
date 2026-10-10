@@ -81,6 +81,10 @@ MUSIC_NOW_HEADER = f"{MUSIC_NOW_EMOJI} 현재 재생 곡"  # 알림 첫 줄(둘�
 _SEARCH_MAX = 5  # 'ㅁ추가' 검색 후보 수(ytsearch5) — 필터가 거른 뒤 고를 여지 + 회신에 보여줄 목록.
 _CUSTOM_ID_LIMIT = 100  # 디스코드 custom_id 한도(§1.3). 우리 콜백 문자열은 항상 이 안(id·name≤64).
 _CALL_TIMEOUT = 30  # run_coroutine_threadsafe().result() 타임아웃(§3.2).
+_HISTORY_TIMEOUT = 120  # 채널 히스토리(여러 페이지 왕복)는 REST 1회보다 길다
+# 채널 청소(purge) — 14일 넘은 메시지는 1건씩 DELETE 라 rate limit 대기까지 수 분이 걸린다.
+# 이보다 짧으면 코어가 먼저 «끝» 으로 보고 «바쁨» 을 풀어, 자동 재시작이 진행 중인 삭제를 끊는다.
+_PURGE_TIMEOUT = 600
 # fetch_file 다운로드 도메인 고정(§2.4 — 임의 URL 다운로드=SSRF 차단).
 _DISCORD_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 # ffmpeg stderr 수집 파일(코어 LOG_DIR 과 같은 자리·같은 규칙 — `logs/*.log` 는 gitignore).
@@ -166,6 +170,9 @@ _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
         # 고아 채널이 남고, 그 채널에 온 메시지는 미매핑이라 **채널명이 프로젝트명으로 해석된다**.
         # **이 목록에서 지우는 것이 삭제의 일부다** — 남겨두면 다음 재기동의 채널 자동생성이
         # 조용히 되살린다(지운 사람은 지웠다고 믿는데 이틀 뒤 다시 있다).
+        # 사람이 링크를 공유하는 채널 — _READONLY_TAGS 에 넣지 않는다. 실시간 메시지는 코어가
+        # 조용히 무시하고(handle_event), 정오 러너(run_sns_inbox)가 히스토리로 읽는다.
+        ("SNS정보", "role", "SNS정보"),
     ],
     # 예약 알림·시스템 소식은 tag `봇상태` = 표시명 `알림` 채널로 간다(tag 는 위 경고대로 고정).
     # 봇은 채널을 지우지 않는다: 빠진 채널은 channel_map 에서만 빠지고 서버에 남는다(사람이 지운다).
@@ -455,12 +462,25 @@ class DiscordAdapter:
                 return cid
         return None
 
-    def clear_channel(self, channel_id: int) -> int:
-        """채널 메시지 전체 삭제(purge) 후 삭제 건수. 파괴적 — 코어가 확인 버튼 뒤에만 호출.
+    def clear_channel(
+        self,
+        channel_id: int,
+        *,
+        after_id: int | None = None,
+        upto_id: int | None = None,
+        keep: Callable[[str, int], bool] | None = None,
+    ) -> int:
+        """채널 메시지 삭제(purge) 후 삭제 건수. 파괴적 — 코어가 확인 버튼 뒤에만 호출.
 
+        경계를 안 주면 전체. after_id/upto_id 를 주면 (after_id, upto_id] 만 지운다.
+        keep(본문, 작성자 id) 가 True 인 메시지는 범위 안이어도 남긴다.
         _run 이 루프 미준비·예외를 삼켜 None 을 줄 수 있으므로 int 아니면 0(안전 폴백).
+        타임아웃은 _PURGE_TIMEOUT(10분) — 14일 넘은 메시지는 개별 삭제라 수 분이 걸릴 수 있고,
+        짧으면 코어가 먼저 «끝» 으로 보고(바쁨 해제) 삭제가 뒤에서 계속 돌다 자동 재시작에 끊긴다
+        (2026-10-10 실측).
         """
-        result = self._run(self._purge_coro(channel_id))
+        coro = self._purge_coro(channel_id, after_id=after_id, upto_id=upto_id, keep=keep)
+        result = self._run(coro, timeout=_PURGE_TIMEOUT)
         return result if isinstance(result, int) else 0
 
     # ── 음악 재생(ㅁ노래·ㅁ정지·ㅁ다음·ㅁ재생·ㅁ삭제) capability(디스코드 음성) ──────────
@@ -1321,7 +1341,7 @@ class DiscordAdapter:
             return  # 컴포넌트 외(슬래시 명령 등)는 0단계 미사용
         ch_id = interaction.channel_id or 0
         # 선-필터: 비인가는 드롭(defer 도 안 함). 단 플레이리스트 채널 버튼은 통과 — 코어가
-        # clean:ok/x(ㅁ청소 확인·취소)만 우회 허용(_playlist_bypass), 그 외는 코어 게이트가 무시.
+        # clean:ok/x/clean:x(ㅁ청소 확인·취소)만 우회 허용(_playlist_bypass), 그 외는 코어가 무시.
         if interaction.user.id not in self._allowed and not self._is_playlist_channel(ch_id):
             return
         try:
@@ -1342,6 +1362,8 @@ class DiscordAdapter:
                 channel_id=ch_id,
                 user_id=interaction.user.id,
                 message_id=msg.id if msg is not None else None,
+                # 누른 카드의 본문(봇이 보낸 것) — 코어가 카드를 고칠 때 원문이 필요하다(sns_judge).
+                text=getattr(msg, "content", None) or "",
                 action=action,
                 action_arg=arg,
                 callback_id=callback_id,
@@ -1510,6 +1532,34 @@ class DiscordAdapter:
         dest.write_bytes(payload)
         return dest
 
+    def delete_message(self, channel_id: int, message_id: int) -> None:
+        """메시지 1건 삭제. 실패(이미 지워짐·권한)는 _run 이 로그만 남기고 삼킨다(계약)."""
+        self._run(self._delete_message_coro(channel_id, message_id))
+
+    async def _delete_message_coro(self, channel_id: int, message_id: int) -> None:
+        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
+            channel_id
+        )
+        await channel.get_partial_message(message_id).delete()
+
+    def history_after(self, channel_id: int, message_id: int, limit: int) -> list[Event] | None:
+        """message_id 뒤 메시지 최대 limit 건(오래된 순) → Event. 실패는 _run 이 로그+None(계약)."""
+        coro = self._history_coro(channel_id, message_id, limit)
+        result = self._run(coro, timeout=_HISTORY_TIMEOUT)
+        return result if isinstance(result, list) else None
+
+    async def _history_coro(self, channel_id: int, message_id: int, limit: int) -> list[Event]:
+        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
+            channel_id
+        )
+        # discord.py 가 100건씩 페이지로 받아 limit 에서 멈춘다(무제한 폭주 방지).
+        return [
+            self._message_event(m)
+            async for m in channel.history(
+                limit=limit, after=discord.Object(id=message_id), oldest_first=True
+            )
+        ]
+
     def close(self) -> None:
         """Gateway·이벤트루프·워커 정리. 중복 호출 무해."""
         self._closed = True
@@ -1592,7 +1642,14 @@ class DiscordAdapter:
             content, embed = payload, None
         await channel.get_partial_message(message_id).edit(content=content, embed=embed, view=view)
 
-    async def _purge_coro(self, channel_id: int) -> int:
+    async def _purge_coro(
+        self,
+        channel_id: int,
+        *,
+        after_id: int | None = None,
+        upto_id: int | None = None,
+        keep: Callable[[str, int], bool] | None = None,
+    ) -> int:
         """채널 메시지를 100개씩 반복 purge 해 전부 삭제, 삭제 건수 합 반환(§clear_channel).
 
         bulk=True 는 14일 이내는 일괄삭제, 14일 초과분은 개별삭제로 폴백한다(discord.py 규약).
@@ -1602,10 +1659,27 @@ class DiscordAdapter:
         channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
             channel_id
         )
+        # 범위 한정(선택): (after_id, upto_id] — purge 의 before 는 미만이라 upto_id+1.
+        bounds: dict[str, Any] = {}
+        if after_id is not None:
+            bounds["after"] = discord.Object(id=after_id)
+        if upto_id is not None:
+            bounds["before"] = discord.Object(id=upto_id + 1)
         total = 0
         try:
+            if keep is not None:
+                # discord.py `_purge_helper`(2.7.1 소스 확인): limit 는 «지운 수» 가 아니라
+                # **훑은 수**. check 가 False 인 메시지는 건너뛰고 지울 것만 100개씩 모아 bulk 삭제
+                # (14일 초과는 개별). 그래서 아래 «100개 미만이면 끝» 반복은 남길 메시지가 섞이면
+                # 덜 지운 채 멈추거나 같은 메시지를 다시 훑는다 → 범위 전체를 한 번에 훑는다
+                # (limit=None — 범위는 after/before 로 유계).
+                def check(m: Any) -> bool:
+                    return not keep(m.content or "", int(m.author.id))
+
+                deleted = await channel.purge(limit=None, bulk=True, check=check, **bounds)
+                return len(deleted)
             while True:
-                deleted = await channel.purge(limit=100, bulk=True)
+                deleted = await channel.purge(limit=100, bulk=True, **bounds)
                 total += len(deleted)
                 if len(deleted) < 100:  # 이번 배치가 100 미만 = 더 지울 게 없음
                     break

@@ -36,10 +36,11 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from collections.abc import Callable, Iterator
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, ParamSpec
+from typing import Any, ParamSpec, TypeGuard
 
+import sns_inbox
 import us_digest
 import youtube
 from adapter import _NOREDIRECT_OPENER, Adapter, Button, Event, _valid_id, mask_secrets
@@ -1135,9 +1136,12 @@ US_DIGEST_NOTIFY_ID = "us-digest"  # 미국주식 다이제스트(#미국주식)
 # 월 1회 스포티파이 주간차트 담기(#playlist). 다이제스트는 아니지만 «세션마다 후보 → 러너가
 # 판정» 이라는 배선이 똑같아 같은 맵을 탄다(스케줄러를 새로 들이지 않는다).
 SPOTIFY_NOTIFY_ID = "spotify-monthly"
+# 매일 정오 #SNS정보 → 옵시디언 수집함(run_sns_inbox). 역시 «시각 창 + 러너» 배선이 같다.
+SNS_NOTIFY_ID = "sns-inbox"
 DIGEST_RUNNERS: dict[str, str] = {
     US_DIGEST_NOTIFY_ID: "run_us_digest",
     SPOTIFY_NOTIFY_ID: "run_spotify_monthly",
+    SNS_NOTIFY_ID: "run_sns_inbox",
 }
 DIGEST_MAX_ATTEMPTS = 3  # 하루 실패-되돌림 상한(종일 실패 시 25초마다 재시도하지 않게)
 # 도구 0개 티어 — 미국주식 LLM 이 뉴스만 요약하는 날(실적 스킬 창 밖)에 쓴다. cwd 가 레포 밖
@@ -1255,18 +1259,21 @@ def _revert_digest_fired(item_id: str, today: str, reason: str) -> bool:
 
 def _start_digest(adapter: Adapter, channel_id: int, item_id: str, today: str) -> None:
     """다이제스트를 별도 데몬 스레드로 띄운다 — 수집·판정 1~2분이 타이머 스레드를 막지 않게."""
-    threading.Thread(
-        target=_run_digest,
-        args=(adapter, channel_id, item_id, today),
-        name=item_id,  # 스레드 이름 = 다이제스트 id(로그에서 어느 쪽이 도는지 구분)
-        daemon=True,
-    ).start()
+
+    def run() -> None:
+        try:
+            _run_digest(adapter, channel_id, item_id, today)
+        finally:
+            _busy_add(-1)
+
+    _start_busy_thread(run, item_id)  # 스레드 이름 = 다이제스트 id(로그에서 어느 쪽이 도는지 구분)
 
 
 # 포기 알림에 쓰는 이름(목적격 «를» 로 이어지는 형태). 맵에 없는 id 는 id 자체를 쓴다.
 _DIGEST_GIVEUP_LABEL = {
     US_DIGEST_NOTIFY_ID: "마이크론 카드",
     SPOTIFY_NOTIFY_ID: "스포티파이 월간 차트",
+    SNS_NOTIFY_ID: "SNS정보 수집",
 }
 
 
@@ -1799,7 +1806,8 @@ def do_push(root: Path) -> str:
 
 
 # ── 코드 변경 자동 재시작 ────────────────────────────────────────────────
-# «바쁨» = 진행 중 claude 실행 + 다이제스트 스레드. 둘 다 _working() 으로 감싼다.
+# «바쁨» = 이벤트 처리 중(handle_event) + 진행 중 claude 실행 + 백그라운드 스레드(다이제스트·SNS·
+# 청소). 음악 재생은 바쁨이 아니라 is_idle 의 is_music_active 로 따로 본다(재생은 끝이 없어서).
 _busy = 0
 _busy_lock = threading.Lock()
 _reload_requested = False  # main 이 종료 코드를 RELOAD_EXIT_CODE 로 바꾸는 신호
@@ -1815,6 +1823,25 @@ def _working() -> Iterator[None]:
     finally:
         with _busy_lock:
             _busy -= 1
+
+
+def _busy_add(n: int) -> None:
+    global _busy
+    with _busy_lock:
+        _busy += n
+
+
+def _start_busy_thread(run: Callable[[], None], name: str) -> None:
+    """«바쁨» 을 **start 전에** 올리고 데몬 스레드를 띄운다 — 감소는 run 의 finally 몫.
+
+    스레드 안에서 올리면 start 와 첫 줄 사이에 자동 재시작 감시가 «한가함» 으로 보고 끊을 수 있다.
+    """
+    _busy_add(1)
+    try:
+        threading.Thread(target=run, name=name, daemon=True).start()
+    except BaseException:
+        _busy_add(-1)  # 못 띄웠으면 되돌린다(스레드가 없으니 finally 도 없다)
+        raise
 
 
 def code_snapshot(root: Path) -> dict[str, int]:
@@ -1933,6 +1960,8 @@ HELP_TEXT = (
     "\n"
     "### 채널 청소 — ㅁ청소\n"
     "확인을 거친 뒤 이 채널의 메시지를 전부 지웁니다(되돌릴 수 없음).\n"
+    "#SNS정보 에서는 🔗 링크청소(저장된 링크·명령·카드만) · 🧹 전체청소(링크 수집 뒤 전부)"
+    " 버튼이 뜹니다.\n"
     "\n"
     "### 재시작 — ㅁ재시작\n"
     "브리지(봇)를 다시 켭니다. 코드 수정을 반영하거나 봇이 멈췄을 때 씁니다.\n"
@@ -2488,11 +2517,36 @@ def _handle_button(
             adapter.edit(channel_id, message_id, "취소했습니다")
         else:
             adapter.send(channel_id, "취소했습니다")
-    elif action == "clean:ok":
-        # 청소 확인 탭 → 채널 메시지 전체 삭제(무음: 완료 메시지 없음, 개발자 요청). purge 가
-        # 확인 메시지까지 지워 채널이 깨끗해지고 끝 — send/edit 안 함(edit 은 사라진 메시지라 실패).
-        log.info("chat=%s callback clean:ok", channel_id)
-        adapter.clear_channel(channel_id)
+    elif action == "clean:x":
+        # 청소 확인의 «✖ 취소» — 답장 없이 확인 메시지 자체를 지운다(Push 취소 `x` 와 다르다).
+        log.info("chat=%s callback 청소 취소", channel_id)
+        if isinstance(message_id, int):
+            adapter.delete_message(channel_id, message_id)
+    elif action in ("clean:ok", "clean:link", "clean:all"):
+        # 청소 확인 탭 → 무음(완료 메시지 없음, 개발자 요청). purge 가 확인 메시지까지 지워 채널이
+        # 깨끗해지고 끝 — send/edit 안 함(edit 은 사라진 메시지라 실패).
+        log.info("chat=%s callback %s", channel_id, action)
+        if event.channel_role == SNS_ROLE:
+            # 🔗 링크청소(clean:link — 이미 떠 있던 옛 확인의 clean:ok 도 같다) = 수집 → 수집기가 본
+            # 범위에서 저장 안 된 링크 메시지는 남기고 정리. 🧹 전체청소(clean:all) = 수집 → 전부.
+            # 지우기 전에 링크 수집(유실 방지) — 히스토리+삭제가 길어 데몬 스레드로.
+            # 연타는 무시 — 두 번째 청소가 첫 청소가 보낸 저장 카드를 지우지 않게.
+            if _sns_clean_lock.acquire(blocking=False):
+                full = action == "clean:all"
+                _sns_spawn("sns-clean", _clean_sns_locked, adapter, channel_id, full)
+            else:
+                log.info("chat=%s SNS 청소 진행 중 — 연타 무시", channel_id)
+        else:
+            # 다른 채널도 백그라운드 스레드 + «바쁨» — 14일 넘은 메시지 개별 삭제는 수 분이
+            # 걸리는데, 바쁨 없이 돌면 자동 재시작이 진행 중인 purge 를 끊는다(2026-10-10 실측).
+            # 연타는 채널별 락.
+            lock = _channel_clean_lock(channel_id)
+            if lock.acquire(blocking=False):
+                _sns_spawn("clean", _clear_channel_locked, adapter, channel_id, lock)
+            else:
+                log.info("chat=%s 청소 진행 중 — 연타 무시", channel_id)
+    elif action == "sns_judge":
+        _handle_sns_judge(adapter, event)
     elif action == "c":
         # ③ 선택지 탭 — arg="<msg_id>:<idx|other>". 보류맵에서 세션·프로젝트를 찾아 resume 재실행.
         # M-1: channel_id + user_id 소유 항목만 조회(공유 채널 다중 유저·타 chat 세션 탈취 차단).
@@ -2585,7 +2639,7 @@ def _playlist_bypass(event: Event) -> bool:
     개발자 결정). 조건을 의도적으로 좁게 유지한다:
       · (channel_role == "playlist")  AND
       · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제·ㅁ목록·ㅁ스포티파이는 뺀다**
-        button → clean:ok/x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
+        button → clean:ok/x/clean:x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
 
     🔴 **우회 판정 3조건** — 셋을 모두 지키는 명령만 넣는다(하나라도 어기면 뺀다):
       1. **상태변경 없음**(또는 되돌릴 수 있음) — 재생목록·레포·세션을 파괴하지 않는다
@@ -2614,7 +2668,7 @@ def _playlist_bypass(event: Event) -> bool:
             is_music_del(event.text) or is_music_list(event.text) or is_music_spotify(event.text)
         )
     if event.kind == "button":
-        return event.action in ("clean:ok", "x")
+        return event.action in ("clean:ok", "x", "clean:x")
     return False
 
 
@@ -2935,6 +2989,615 @@ def run_spotify_monthly(adapter: Adapter, channel_id: int, today: str) -> bool:
     return _handle_music_spotify(adapter, channel_id, today[:7])
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 📥 SNS정보 → 옵시디언 수집함 (정오 러너 · 🔍 판정하기 버튼 · 완료 신호)
+# ══════════════════════════════════════════════════════════════════════════
+# 정본 = docs/기능/SNS정보_수집/01_계획.md. 링크 추출·노트·문구는 sns_inbox(순수), 여기는 배선만.
+SNS_ROLE = "SNS정보"  # 채널 tag(discord_adapter._SPECIAL) — notify.json 의 channel 도 이 값
+SNS_STATE_FILE = LOG_DIR / "sns_state.json"  # last_message_id·last_run_date·pending_cards
+SNS_DONE_FILE = LOG_DIR / "sns_judge_done.json"  # VS Code 판정 세션이 남기는 완료 신호
+SNS_INBOX_DIR = REPO_ROOT / "Hachiware" / "_Obsidian" / "수집함"  # 레포 상대 고정(계획 §1)
+# 판정 입구(muhwa-dev `python -m core.judge_inbox`) — 고정 argv, 사용자 입력은 싣지 않는다.
+JUDGE_PROJECT_DIR = REPO_ROOT / "Hachiware" / "_Project" / "muhwa-dev"
+JUDGE_TIMEOUT_SEC = 60
+# 한 번에 읽는 히스토리 상한(어댑터가 100건씩 페이지로 받는다) — 넘치면 처리한 데까지 전진하고
+# 나머지는 다음 실행. 통째 실패로 같은 자리에서 영원히 멈추지 않게 한다.
+SNS_HISTORY_MAX = 1000
+SNS_PENDING_STALE_SEC = 24 * 3600  # 이보다 오래 «판정 중» 인 카드는 정오 러너가 되돌린다
+_URL_SCHEME_RE = re.compile(r"(https?)://", re.IGNORECASE)  # 판정완료 카드 칸 값의 생 URL
+# 완료 신호 크기 상한 — `항목`(칸당 200자, 여러 건)이 들어가 32KB. 넘으면 읽지 않고 스키마 오류.
+_SNS_DONE_MAX_BYTES = 32 * 1024
+_SNS_FIELD_MAXLEN = 200  # 판정완료 카드 칸 값 상한(초과분은 잘라 `…`)
+# 판정완료 카드 한 통의 길이 예산. 카드는 상태 헤더가 아니라 **일반 메시지**(디스코드 2000자)로
+# 나간다 — 마스킹(***)이 길이를 늘릴 수 있어 MUSIC_LIST_MSG_LIMIT 과 같은 여유를 둔다.
+_SNS_JUDGE_CARD_LIMIT = 1800
+# 판정완료 카드 항목 스키마(판정_절차.md §4) — 판정별 필수 칸. 값은 전부 문자열.
+_SNS_ITEM_FIELDS = {
+    "사용": ("제목", "무엇", "추가", "쓰는법"),
+    "폐기": ("제목", "사유"),
+}
+_SNS_DONE_STAMP_MAXLEN = 64  # `시각` 길이 상한(ISO 시각이면 30자 안팎)
+SNS_JUDGE_BUTTON = Button(sns_inbox.JUDGE_LABEL, "sns_judge", style="primary")
+# 히스토리 허용목록 — main 이 .env 의 허용목록으로 채운다(비어 있으면 아무것도 저장하지 않는다).
+# ponytail: 모듈 상수 대입(youtube.PLAYLIST_ID 방식) — 러너 시그니처가 DIGEST_RUNNERS 공용이라.
+sns_allowed: frozenset[int] = frozenset()
+# 상태 파일은 러너 스레드·워커(버튼)·타이머(완료 신호) 셋이 쓴다 → 읽기-수정-쓰기는 이 락 아래서.
+_sns_lock = threading.RLock()
+_sns_clean_lock = threading.Lock()  # #SNS정보 청소 1건씩(연타 무시) — 클릭 때 잡고 스레드가 푼다
+# 스키마 오류 경고를 파일 (mtime, 크기) 당 1번만(25초 틱 도배 방지)
+_sns_done_warned: tuple[float, int] | None = None
+# #SNS정보 채널 미매핑 경고도 같은 방식으로 파일 (mtime, 크기) 당 1번만
+_sns_channel_warned: tuple[float, int] | None = None
+
+# 디스코드 snowflake = (ms - 2015-01-01) << 22. 공유 시각과 «지금» 기준 id 를 여기서 구한다.
+# ponytail: 플랫폼 지식이 코어에 1줄 샌다 — 어댑터가 바뀌면 Event 에 created_at 을 싣는다.
+_DISCORD_EPOCH_MS = 1_420_070_400_000
+
+
+def snowflake_time(message_id: int) -> datetime:
+    return datetime.fromtimestamp(((message_id >> 22) + _DISCORD_EPOCH_MS) / 1000, _KST)
+
+
+def snowflake_now() -> int:
+    return (int(time.time() * 1000) - _DISCORD_EPOCH_MS) << 22
+
+
+def _load_sns_state() -> dict[str, Any]:
+    try:
+        raw = json.loads(SNS_STATE_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:  # ValueError = JSON 손상·비UTF-8
+        log.warning("sns_state 를 못 읽었다(%s) — 첫 실행으로 취급", type(e).__name__)
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _sns_update(**changes: Any) -> None:
+    """상태 파일의 필드만 바꿔 원자 저장. 값이 None 이면 그 키를 지운다.
+
+    🔴 파일이 **없을 때만** 빈 상태에서 시작한다. 읽기 오류·JSON 손상이면 OSError 로 올리고
+    **덮어쓰지 않는다** — 빈 dict 로 덮으면 pending_cards·baseline_id 같은 남은 필드가 통째로
+    사라진다. 호출측은 기존 실패 경로(OSError)로 처리한다.
+    """
+    with _sns_lock:
+        try:
+            raw = json.loads(SNS_STATE_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw = {}
+        except ValueError as e:  # JSON 손상·비UTF-8 — 덮어쓰지 않고 실패로 올린다
+            raise OSError(f"sns_state 손상({type(e).__name__}) — 덮어쓰지 않음") from e
+        if not isinstance(raw, dict):
+            raise OSError("sns_state 형식 오류 — 덮어쓰지 않음")
+        state = raw
+        for k, v in changes.items():
+            if v is None:
+                state.pop(k, None)
+            else:
+                state[k] = v
+        SNS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        sns_inbox.write_atomic(SNS_STATE_FILE, json.dumps(state, ensure_ascii=False))
+
+
+def sns_init_state() -> bool:
+    """상태가 없으면 last_message_id 를 «지금» 으로 심는다(과거 백필 없음). 심었으면 True.
+
+    main 이 기동 때 한 번 부른다 — 그래야 첫 정오 전에 공유한 것도 첫 실행에 잡힌다.
+    """
+    with _sns_lock:
+        if isinstance(_load_sns_state().get("last_message_id"), int):
+            return False
+        now = snowflake_now()
+        # baseline_id = 수집기가 «보기 시작한» 지점. 청소는 (baseline_id, last_message_id] 만 지운다
+        # — 그 앞은 수집기가 본 적 없는 메시지라(상태 파일 유실 뒤 재기동 등) 지우면 유실이다.
+        try:
+            _sns_update(last_message_id=now, baseline_id=now)
+        except OSError:
+            # 손상된 상태 파일을 덮어쓰지 않는다(main 기동 경로라 죽지 않는다) — 사람이 고칠 때까지
+            # 수집·청소는 시작점이 없는 것으로 남는다(청소는 지우지 않는다).
+            log.exception("SNS 시작점 기록 실패 — 상태 파일 확인 필요")
+            return False
+    log.info("SNS 수집 시작점 기록(과거 백필 없음)")
+    return True
+
+
+def _pending_cards(state: dict[str, Any]) -> dict[str, str]:
+    """«판정 중» 카드 {카드 id(str): 본문}. 옛 단일값(pending_card_id/_text)도 읽는다(호환)."""
+    raw = state.get("pending_cards")
+    cards: dict[str, str] = {}
+    if isinstance(raw, dict):
+        cards = {
+            k: v
+            for k, v in raw.items()
+            if isinstance(k, str) and k.isascii() and k.isdigit() and isinstance(v, str)
+        }
+    old = state.get("pending_card_id")
+    if isinstance(old, int) and not isinstance(old, bool):
+        text = state.get("pending_card_text")
+        cards.setdefault(str(old), text if isinstance(text, str) else sns_inbox.JUDGING_LINE)
+    return cards
+
+
+def _pending_since(state: dict[str, Any], cards: dict[str, str]) -> dict[str, float]:
+    """카드별 «판정 중» 이 된 시각(epoch). 기록이 없으면(옛 상태) 카드가 올라온 시각(snowflake)."""
+    raw = state.get("pending_since")
+    since = raw if isinstance(raw, dict) else {}
+    out: dict[str, float] = {}
+    for k in cards:
+        v = since.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = float(v)
+        else:
+            out[k] = snowflake_time(int(k)).timestamp()
+    return out
+
+
+def _set_pending_cards(cards: dict[str, str], added_at: dict[str, float] | None = None) -> None:
+    """목록 저장 — 옛 단일값 키는 함께 걷는다(새 형식으로 넘어간다). 빈 목록은 키 삭제.
+
+    pending_since 는 남은 카드만 유지하고 added_at(새로 «판정 중» 이 된 카드)을 더한다.
+    """
+    with _sns_lock:
+        since = {
+            k: v
+            for k, v in _pending_since(_load_sns_state(), cards).items()
+            if k not in (added_at or {})
+        }
+        since.update({k: v for k, v in (added_at or {}).items() if k in cards})
+        _sns_update(
+            pending_cards=cards or None,
+            pending_since=since or None,
+            pending_card_id=None,
+            pending_card_text=None,
+        )
+
+
+def _restore_stale_cards(adapter: Adapter, channel_id: int, now: float | None = None) -> None:
+    """24시간 넘게 «판정 중» 인 카드를 원래 본문 + 🔍 판정하기 버튼으로 되돌리고 목록에서 뺀다.
+
+    판정 세션을 시작하지 않고 닫으면 완료 신호가 영영 안 와 카드가 목록에 남는다 — 그대로 두면
+    다음 완료 신호 1건이 옛 카드까지 🎉 로 바꾸고, 사람은 그 카드를 다시 누를 수도 없다.
+    정오 러너가 부른다. 새 문구 없음 — 원래 카드 본문을 복원한다.
+    """
+    now = time.time() if now is None else now
+    with _sns_lock:
+        state = _load_sns_state()
+        cards = _pending_cards(state)
+        since = _pending_since(state, cards)
+        stale = [k for k in cards if now - since[k] > SNS_PENDING_STALE_SEC]
+        if not stale:
+            return
+        suffix = "\n" + sns_inbox.JUDGING_LINE
+        for k in stale:
+            judging = cards.pop(k)
+            card = "" if judging == sns_inbox.JUDGING_LINE else judging.removesuffix(suffix)
+            if card:  # 본문을 모르면(옛 상태) 목록에서만 뺀다 — 빈 카드로 덮지 않는다
+                adapter.edit(channel_id, int(k), card, [SNS_JUDGE_BUTTON])
+        _set_pending_cards(cards)
+    log.info("SNS 오래된 «판정 중» 카드 %d장 되돌림", len(stale))
+
+
+def _save_sns_notes(events: list[Event]) -> tuple[int, int, int, int, list[date]]:
+    """허용 사용자 메시지의 인스타·X 링크를 미판정 노트로 쓴다 → (인스타, X, 중복, 링크X, 공유일들).
+
+    중복은 (플랫폼, 게시물 id) 로 본다 — 수집함 전 노트의 `출처` + 이번 묶음. 이름이 겹치는데
+    키가 다르면(대소문자만 다른 shortcode 가 NTFS 에서 한 파일이 되는 경우) `_2` 를 붙여 저장한다.
+    쓰기 예외(OSError)는 그대로 올린다 — 호출측이 sns_fail 을 내고 last_message_id 를 멈춘다.
+    """
+    inbox = SNS_INBOX_DIR / "미판정"
+    seen = sns_inbox.known_sources(SNS_INBOX_DIR)
+    counts = {"insta": 0, "x": 0}
+    dup = nolink = 0
+    dates: list[date] = []
+    for ev in events:
+        if not isinstance(ev.message_id, int) or not is_allowed(ev.user_id, sns_allowed):
+            continue  # 봇 자신의 카드·비허용 작성자 — 이벤트 경로와 같은 기준으로 버린다
+        if ev.text.lstrip().startswith("ㅁ"):
+            continue  # `ㅁ청소` 같은 봇 명령은 공유가 아니다 — «링크X» 로 세지 않는다
+        links = sns_inbox.extract_links(ev.text)
+        if not links:
+            nolink += 1
+            continue
+        shared = snowflake_time(ev.message_id)
+        for link in links:
+            if link.key in seen:
+                dup += 1
+                continue
+            path = sns_inbox.free_path(inbox, sns_inbox.note_name(link, shared))
+            sns_inbox.write_atomic(path, sns_inbox.note_body(link, shared, ev.message_id))
+            seen.add(link.key)  # 같은 묶음 안 중복도 한 번만
+            counts[link.platform] += 1
+            dates.append(shared.date())
+    return counts["insta"], counts["x"], dup, nolink, dates
+
+
+_SnsCounts = tuple[int, int, int, int, list[date]]  # (인스타, X, 중복, 링크X, 공유일들)
+
+
+def _collect_sns(adapter: Adapter, channel_id: int, run_date: str | None) -> tuple[str, _SnsCounts]:
+    """last_message_id 뒤 히스토리 → 미판정 노트 저장 → 시작점 전진. 정오 러너·청소 직전 공용.
+
+    반환 상태: "ok"(저장 끝 — 0건 포함) · "more"(저장했지만 상한에 걸려 안 읽은 메시지가 남았을 수
+    있다) · "fail"(폴더 없음·저장 실패, 안내를 이미 냈다) · "retry"(히스토리 읽기 실패, 안내 없음 —
+    러너는 재시도, 청소는 공통 실패 안내) · "init"(첫 실행 — 시작점을 지금으로 심었을 뿐 아직 아무
+    것도 읽지 않았다. 러너는 "ok" 와 같게 취급하고, 청소는 **절대 지우지 않는다** — 안 그러면 한
+    건도 수집하지 않은 채 채널을 통째로 비우게 된다).
+    run_date 가 있으면 last_run_date 도 기록한다(정오 러너만 — 청소는 «밀린 날» 판정에 손대지 않음).
+    실패면 시작점이 그대로라 다음 실행이 같은 메시지를 다시 읽는다. 한 번에 SNS_HISTORY_MAX 건까지.
+    """
+    empty: _SnsCounts = (0, 0, 0, 0, [])
+    if not (SNS_INBOX_DIR / "미판정").is_dir():
+        log.warning("SNS 수집함 폴더 없음 — 저장 건너뜀(링크는 채널에 남는다)")
+        post_system_notice(adapter, f"{notice_stamp()} {sns_inbox.NO_FOLDER_TEXT}")
+        return "fail", empty
+    # 🔴 «읽기 → 저장 → 전진» 전체를 한 락 아래서 — 정오 러너와 `ㅁ청소` 수집이 겹치면 둘 다
+    # 같은 시작점에서 읽어 같은 게시물을 두 번(`_2`) 저장한다. RLock — 안의 _sns_update 는 재진입.
+    with _sns_lock:
+        state = _load_sns_state()
+        last = state.get("last_message_id")
+        if not isinstance(last, int):
+            sns_init_state()  # 첫 실행 — 지금부터(백필 없음)
+            return "init", empty
+        events = adapter.history_after(channel_id, last, SNS_HISTORY_MAX)
+        if events is None:
+            log.warning("SNS 채널 히스토리 읽기 실패")
+            return "retry", empty
+        more = len(events) == SNS_HISTORY_MAX  # 받은 건수 == 상한 → 뒤가 더 있을 수 있다
+        if more:
+            log.warning(
+                "SNS 히스토리 %d건 상한 — 나머지는 다음 실행이 이어 읽는다", SNS_HISTORY_MAX
+            )
+        ids = [ev.message_id for ev in events if isinstance(ev.message_id, int)]
+        try:
+            counts = _save_sns_notes(events)
+            changes: dict[str, Any] = {"last_message_id": max(ids, default=last)}
+            if not isinstance(state.get("baseline_id"), int):
+                # 옛 상태(baseline 기록 전) — 이번 읽기의 시작점을 하한으로 삼는다. 그 앞은 이미
+                # 수집했을 수도 있지만 «모른다» 쪽으로 기운다: 청소가 덜 지울 뿐 링크를 잃지 않는다.
+                changes["baseline_id"] = last
+            if run_date is not None:
+                changes["last_run_date"] = run_date
+            _sns_update(**changes)
+        except OSError:
+            log.exception("SNS 저장 실패 — last_message_id 유지(다음 실행 재시도)")
+            post_system_notice(adapter, f"{notice_stamp()} {sns_inbox.FAIL_TEXT}")
+            return "fail", empty
+    log.info("SNS 수집 인스타=%d X=%d 중복=%d 링크X=%d", *counts[:4])
+    return ("more" if more else "ok"), counts
+
+
+def _send_sns_card(adapter: Adapter, channel_id: int, counts: _SnsCounts, catchup: bool) -> None:
+    """저장 카드(sns_daily/sns_catchup) — 저장 0건이면 보내지 않는다(sns_none)."""
+    text = sns_inbox.card_text(*counts, catchup)
+    if text is not None and adapter.send(channel_id, text, [SNS_JUDGE_BUTTON]) is None:
+        # 노트는 이미 저장됐다 — 되돌려 재시도하면 전부 «중복» 이 돼 카드가 영영 안 나간다.
+        # 그래서 재시도 대신 사람에게 알린다(다이제스트 실패 공통 문구).
+        log.warning("SNS 카드 게시 실패 — 노트는 저장됨(수집함 확인)")
+        post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+
+
+def run_sns_inbox(adapter: Adapter, channel_id: int, today: str) -> bool:
+    """정오 러너 — last_message_id 뒤의 공유를 수집함 노트로 만들고 카드를 낸다.
+
+    반환 False = 히스토리 읽기 실패(다음 틱 재시도, 상한은 _revert_digest_fired). 폴더 없음·저장
+    실패는 #봇상태 로 알리고 **True**(그날은 끝 — 25초마다 같은 알림을 내지 않는다).
+    """
+    _restore_stale_cards(adapter, channel_id)
+    with _sns_lock:
+        last_run = _load_sns_state().get("last_run_date")
+    status, counts = _collect_sns(adapter, channel_id, today)
+    if status not in ("ok", "more", "init"):  # 상한에 걸린 나머지는 다음 실행이 이어 읽는다
+        return status == "fail"
+    # 밀린 날 = 지난 실행일이 어제보다 이르다. 첫 실행(값 없음)·값 손상은 평소 카드.
+    catchup = False
+    if isinstance(last_run, str):
+        with contextlib.suppress(ValueError):
+            catchup = (date.fromisoformat(today) - date.fromisoformat(last_run)).days > 1
+    _send_sns_card(adapter, channel_id, counts, catchup)
+    return True
+
+
+# 일반 채널 청소 연타 락 — 채널별(서로 다른 채널 청소는 동시에 돌아도 된다). #SNS정보 는
+# _sns_clean_lock(수집 상태를 공유하는 채널이 하나뿐이라 전역 1개로 충분).
+_clean_locks: dict[int, threading.Lock] = {}
+_clean_locks_guard = threading.Lock()
+
+
+def _channel_clean_lock(channel_id: int) -> threading.Lock:
+    with _clean_locks_guard:
+        return _clean_locks.setdefault(channel_id, threading.Lock())
+
+
+def _clear_channel_locked(adapter: Adapter, channel_id: int, lock: threading.Lock) -> None:
+    """일반 채널 청소 스레드 본체 — 클릭 때 잡은 채널 락을 끝나면 반드시 푼다."""
+    try:
+        adapter.clear_channel(channel_id)
+    finally:
+        lock.release()
+
+
+def _clean_sns_locked(adapter: Adapter, channel_id: int, full: bool = False) -> None:
+    """청소 스레드 본체 — 클릭 시점에 잡은 _sns_clean_lock 을 끝나면 반드시 푼다."""
+    try:
+        _clean_sns_channel(adapter, channel_id, full)
+    finally:
+        _sns_clean_lock.release()
+
+
+def _clean_sns_channel(adapter: Adapter, channel_id: int, full: bool = False) -> None:
+    """#SNS정보 청소 — 지우기 **전에** 정오 러너와 같은 수집을 한 번 돌려 링크를 잃지 않는다.
+
+    full=False(🔗 링크청소) = 수집기가 본 범위에서 저장 안 된 링크가 든 메시지는 남긴다.
+    full=True(🧹 전체청소) = 수집이 성공했을 때만 채널 **전체**(범위·keep 없음) — 저장 대상이 아닌
+    링크도 지워진다(개발자 선택). 수집 실패·상한·시작점 없음이면 둘 다 지우지 않는다.
+
+    순서 = 수집 → 청소 → 저장 1건 이상이면 저장 카드(청소가 카드까지 지우지 않게 청소 뒤에).
+    수집이 실패하면 청소하지 않는다(링크를 남긴다) — 폴더 없음·저장 실패는 각자 안내를 이미 냈고,
+    히스토리 읽기 실패는 공통 실패 안내를 낸다. last_run_date 는 건드리지 않는다.
+    상한(SNS_HISTORY_MAX)에 걸려 안 읽은 메시지가 남았을 수 있으면 수집한 만큼만 저장(+카드)하고
+    청소는 건너뛴다 — 공통 실패 안내 1번. 다시 누르면 이어 읽는다.
+    """
+    status, counts = _collect_sns(adapter, channel_id, None)
+    if status == "init":
+        # 시작점이 없던 첫 실행 — 아직 한 건도 읽지 않았다(시작점 없음 = 지우지 않는다).
+        log.warning("SNS 청소 보류 — 시작점 없음(첫 실행), 채널 유지")
+        post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+        return
+    if status == "more":
+        log.warning("SNS 청소 중단 — 히스토리 상한, 안 읽은 메시지가 남았을 수 있다")
+        post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+        _send_sns_card(adapter, channel_id, counts, catchup=False)
+        return
+    if status != "ok":
+        log.warning("SNS 청소 중단 — 수집 실패(%s), 링크 유지", status)
+        if status == "retry":
+            post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+        return
+    if full:
+        adapter.clear_channel(channel_id)  # 🧹 전체청소 — 수집을 마친 뒤 전부
+        _send_sns_card(adapter, channel_id, counts, catchup=False)
+        return
+    # 🔴 **수집기가 본 범위만** 지운다 — (baseline_id, last_message_id]. 채널 전체를 지우면 상태
+    # 파일이 사라져 시작점이 «지금» 으로 다시 심긴 뒤(브리지가 멈춘 사이 등) 그 앞 링크가 수집
+    # 0건인 채 전멸한다. 수집 뒤에 올라온 메시지도 남는다(확인 메시지·카드는 범위 안이면 지워진다).
+    with _sns_lock:
+        state = _load_sns_state()
+    base, upto = state.get("baseline_id"), state.get("last_message_id")
+    if not isinstance(base, int) or not isinstance(upto, int) or upto <= base:
+        log.info("SNS 청소 — 수집기가 본 범위가 비어 지울 것 없음")
+    else:
+        # 범위 안이어도 **수집함에 없는 링크가 든 메시지는 남긴다**(개발자 결정 A) —
+        # 비허용 작성자의 인스타·X, 스토리·유튜브 같은 대상 밖 링크.
+        # 저장된 링크만 있는 메시지·명령·잡담·카드는 지운다.
+        try:
+            saved = sns_inbox.known_sources(SNS_INBOX_DIR)
+        except OSError:
+            log.exception("SNS 청소 중단 — 수집함 출처를 못 읽음, 링크 유지")
+            post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+            return
+        adapter.clear_channel(
+            channel_id,
+            after_id=base,
+            upto_id=upto,
+            keep=lambda text, _author: sns_inbox.has_unsaved_link(text, saved),
+        )
+    _send_sns_card(adapter, channel_id, counts, catchup=False)
+
+
+def _sns_spawn(name: str, fn: Callable[..., None], *args: Any) -> None:
+    """SNS 의 느린 작업(판정 입구 60초·청소 전 수집+삭제)을 데몬 스레드로 — 워커를 막지 않게.
+
+    다이제스트(_start_digest)와 같은 방식. 바쁨 표시(_working)로 감싸 자동 재시작이 그 사이에 끊지
+    않게 하고, 스레드 안 예외는 역추적과 함께 로그로 남긴다(상위로 전파되지 않으니 유일한 증거다).
+    """
+
+    def run() -> None:
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("SNS 작업 예외 (%s)", name)
+        finally:
+            _busy_add(-1)
+
+    _start_busy_thread(run, name)
+
+
+def launch_judge() -> bool:
+    """AI비서 판정 입구를 고정 argv 서브프로세스로 부른다. 종료코드 0 = 성공.
+
+    🔴 shell=False·고정 argv — 화면(디스코드)에서 온 문자열은 하나도 싣지 않는다.
+    출력은 DEVNULL — 파이프를 열면 자식이 띄운 VS Code 가 핸들을 물려받아 timeout 까지 막힌다.
+    """
+    venv = JUDGE_PROJECT_DIR / ".venv" / "Scripts" / "python.exe"
+    exe = str(venv) if venv.is_file() else sys.executable
+    try:
+        proc = subprocess.run(
+            [exe, "-m", "core.judge_inbox"],
+            cwd=JUDGE_PROJECT_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            timeout=JUDGE_TIMEOUT_SEC,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as e:  # TimeoutExpired 포함
+        log.warning("판정 입구 실행 실패(%s)", type(e).__name__)
+        return False
+    if proc.returncode != 0:
+        log.warning("판정 입구 종료코드 %s", proc.returncode)
+    return proc.returncode == 0
+
+
+def _handle_sns_judge(adapter: Adapter, event: Event) -> None:
+    """🔍 판정하기 — 카드를 «판정 중» 으로 고치고(버튼 제거) VS Code 판정 세션을 띄운다.
+
+    «판정 중» 카드는 목록으로 쌓는다(A 를 누른 뒤 B 를 눌러도 완료 신호가 둘 다 고친다). 같은
+    카드 두 번 누름은 «목록에 있나» 로 거른다. 실행 실패면 그 카드만 목록에서 빼고 원래대로
+    (버튼 포함) 되돌린 뒤 sns_launch_fail 을 보낸다 — 다시 누를 수 있다.
+    """
+    mid = event.message_id
+    if event.channel_role != SNS_ROLE or not isinstance(mid, int):
+        return
+    card = event.text.strip()
+    judging = f"{card}\n{sns_inbox.JUDGING_LINE}" if card else sns_inbox.JUDGING_LINE
+    with _sns_lock:
+        cards = _pending_cards(_load_sns_state())
+        if str(mid) in cards:
+            log.info("SNS 판정 중복 누름 무시 card=%s", mid)
+            return
+        cards[str(mid)] = judging
+        _set_pending_cards(cards, {str(mid): time.time()})
+        # 같은 락 안에서 — 완료 신호가 등록과 편집 사이에 끼면 🎉 로 고친 카드를 이 편집이 다시
+        # «판정 중» 으로 덮어, 목록 밖·버튼 없는 카드가 영구히 남는다.
+        adapter.edit(event.channel_id, mid, judging)  # 즉시 — buttons 없음 = 버튼 제거
+    # 입구 실행(최대 60초)은 데몬 스레드로 — 이벤트 워커를 막지 않는다.
+    _sns_spawn("sns-judge", _launch_judge_for_card, adapter, event.channel_id, mid, card)
+
+
+def _launch_judge_for_card(adapter: Adapter, channel_id: int, mid: int, card: str) -> None:
+    """판정 입구 실행 — 실패면 그 카드만 목록에서 빼고 원래대로(버튼 포함) + sns_launch_fail."""
+    if launch_judge():
+        log.info("SNS 판정 세션 실행 card=%s", mid)
+        return
+    with _sns_lock:
+        cards = _pending_cards(_load_sns_state())
+        cards.pop(str(mid), None)
+        _set_pending_cards(cards)
+    adapter.edit(channel_id, mid, card, [SNS_JUDGE_BUTTON])
+    adapter.send(channel_id, sns_inbox.LAUNCH_FAIL_TEXT)
+
+
+def _valid_done(raw: object) -> TypeGuard[dict[str, Any]]:
+    """완료 신호 스키마 — {"사용": int, "폐기": int, "시각": str(≤64자)}(bool 은 int 가 아니다)."""
+    if not isinstance(raw, dict):
+        return False
+    counts = [raw.get("사용"), raw.get("폐기")]
+    stamp = raw.get("시각")
+    return (
+        all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts)
+        and isinstance(stamp, str)
+        and len(stamp) <= _SNS_DONE_STAMP_MAXLEN
+    )
+
+
+def _judged(text: str) -> str:
+    if sns_inbox.JUDGING_LINE in text:
+        return text.replace(sns_inbox.JUDGING_LINE, sns_inbox.JUDGED_LINE)
+    return f"{text}\n{sns_inbox.JUDGED_LINE}"
+
+
+def check_sns_judge_done(adapter: Adapter) -> None:
+    """완료 신호가 있으면 «판정 중» 카드 **전부**를 🎉 판정완료 로 고치고 신호 파일을 지운다.
+
+    타이머 틱(_dispatch_loop)마다 부른다. 스키마가 틀리거나 32KB 를 넘으면 파일을 남기고 경고만
+    (파일이 바뀔 때마다 1번) — 사람이 고치거나 세션이 다시 쓰면 잡힌다.
+    `항목` 이 있으면 «😎 판정완료» 카드를 새 메시지로 보낸다(없으면 🎉 만 — 호환).
+    """
+    global _sns_done_warned, _sns_channel_warned
+    try:
+        st = SNS_DONE_FILE.stat()
+    except FileNotFoundError:
+        return
+    raw: object = None
+    if st.st_size <= _SNS_DONE_MAX_BYTES:  # 큰 파일은 읽지도 않는다
+        try:
+            raw = json.loads(SNS_DONE_FILE.read_text(encoding="utf-8-sig"))  # BOM 흡수
+        except (OSError, ValueError):
+            raw = None
+    if not _valid_done(raw):
+        if _sns_done_warned != (st.st_mtime, st.st_size):
+            _sns_done_warned = (st.st_mtime, st.st_size)
+            log.warning("sns_judge_done.json 스키마 오류 — 무시(파일 유지)")
+        return
+    use, drop = _judge_items(raw.get("항목"))
+    if raw.get("항목") is not None and (raw["사용"], raw["폐기"]) != (len(use), len(drop)):
+        # 카드는 항목 기준으로 낸다 — 숫자와 다르면 카드·로그가 다른 값을 말하니 흔적을 남긴다.
+        log.warning(
+            "완료 신호 숫자(사용=%d 폐기=%d) ≠ 항목(사용=%d 폐기=%d) — 카드는 항목 기준",
+            raw["사용"],
+            raw["폐기"],
+            len(use),
+            len(drop),
+        )
+    summary = sns_inbox.judge_cards(use, drop, _SNS_JUDGE_CARD_LIMIT)
+    # 긴 수집(히스토리 최대 120초)이 락을 쥐고 있으면 기다리지 않고 다음 25초 틱에 다시 본다 —
+    # 알림 타이머 스레드가 막히면 다른 예약 알림까지 밀린다.
+    if not _sns_lock.acquire(blocking=False):
+        log.info("SNS 완료 신호 — 수집 중이라 다음 틱에 처리")
+        return
+    try:
+        cards = _pending_cards(_load_sns_state())
+        channel = adapter.role_channel(SNS_ROLE) if cards or summary else None
+        if (cards or summary) and channel is None:
+            if _sns_channel_warned != (st.st_mtime, st.st_size):
+                _sns_channel_warned = (st.st_mtime, st.st_size)
+                log.warning("#%s 채널 미매핑 — 판정완료 표시 보류", SNS_ROLE)
+            return
+        for cid, text in cards.items():
+            assert channel is not None  # 위 가드(cards 면 channel 이 있다) — mypy 좁히기
+            adapter.edit(channel, int(cid), _judged(text))
+        if cards:
+            _set_pending_cards({})
+        else:
+            log.info("판정 완료 신호 — 대기 카드 없음")
+        # 카드 전송 **전에** 신호를 지운다 — 전송이 실패해도 다음 틱이 카드를 두 번 보내지 않게.
+        SNS_DONE_FILE.unlink(missing_ok=True)
+    finally:
+        _sns_lock.release()
+    log.info(
+        "SNS 판정 완료 카드=%d 사용=%d 폐기=%d 항목=%d",
+        len(cards),
+        raw["사용"],
+        raw["폐기"],
+        len(use) + len(drop),
+    )
+    # 🔴 칸 값은 SNS 원문을 요약한 외부 유래 문자열 — 어댑터 send 가 마스킹하고, 멘션은
+    # 클라이언트 전역 allowed_mentions=none 이 막는다(@everyone·역할·유저 멘션 무발사).
+    # 로그엔 건수만. 카드 수정은 휴대폰 알림이 안 와서 **새 메시지**로 보낸다(계획 §2).
+    # 요약 → 사용 카드 순으로 동기 전송(send 가 끝나야 다음 장) — 순서가 보장된다. 디스코드
+    # rate limit(채널당 5건/5초)은 discord.py 가 429 를 받아 기다렸다 보낸다(11장 ≈ 10초, 호출
+    # 타임아웃 30초 안). 한 장이 실패해도 나머지는 계속 보내고, 실패 안내는 한 번만.
+    gap = sns_inbox.CARD_GAP  # 카드 사이 한 줄(디스코드가 연속 메시지를 붙여 그린다)
+    failed = sum(adapter.send(channel, card + gap) is None for card in summary) if channel else 0
+    if failed:
+        log.warning("판정완료 카드 %d/%d장 게시 실패", failed, len(summary))
+        post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+
+
+def _judge_items(raw: object) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """완료 신호 `항목` → (사용, 폐기) 칸 목록. 정화(제어문자·개행 접기) + 칸당 200자 자르기.
+
+    없음 = 빈 목록(호환). 모르는 판정·빠진 칸·문자열 아닌 값은 **그 항목만** 버리고 경고 1번.
+    """
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        log.warning("완료 신호 항목이 목록이 아님 — 판정완료 카드 생략")
+        return [], []
+    out: dict[str, list[dict[str, str]]] = {"사용": [], "폐기": []}
+    bad = 0
+    for item in raw:
+        verdict = item.get("판정") if isinstance(item, dict) else None
+        fields = _SNS_ITEM_FIELDS.get(verdict) if isinstance(verdict, str) else None
+        if fields is None or not all(isinstance(item.get(f), str) for f in fields):
+            bad += 1
+            continue
+        clean = {}
+        for f in fields:
+            value = strip_control_line(item[f])
+            if len(value) > _SNS_FIELD_MAXLEN:
+                value = value[:_SNS_FIELD_MAXLEN] + "…"
+            # 생 URL 자동 링크·미리보기 차단 — `://` 사이에 폭0 공백(U+200B)을 넣는다. 보이는 글자는
+            # 같다. 정화(strip_control_line)가 폭0 문자를 지우므로 반드시 그 **뒤**에 넣는다.
+            clean[f] = _URL_SCHEME_RE.sub("\\1:\u200b//", value)
+        out[item["판정"]].append(clean)
+    if bad:
+        log.warning("완료 신호 항목 %d건 형식 오류 — 그 항목만 버림", bad)
+    return out["사용"], out["폐기"]
+
+
 def _handle_text(
     adapter: Adapter,
     event: Event,
@@ -3097,11 +3760,23 @@ def _handle_text(
     if cmd == "ㅁ청소":
         # 파괴적: 바로 삭제하지 않고 확인 버튼을 거친다(clean:ok 탭 시 _handle_button 에서 실행).
         log.info("chat=%s cmd=clean 확인요청", channel_id)
-        adapter.send(
-            channel_id,
-            "🧹 이 채널의 메시지를 전부 삭제할까요?\n되돌릴 수 없습니다",
-            [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "x", "")],
-        )
+        if event.channel_role == SNS_ROLE:
+            # #SNS정보 — 🔗 링크청소(파랑) · 🧹 전체청소(빨강·파괴) · ✖ 취소(확인 메시지 삭제)
+            adapter.send(
+                channel_id,
+                sns_inbox.SNS_CLEAN_CONFIRM,
+                [
+                    Button("🔗 링크청소", "clean:link", style="primary"),
+                    Button("🧹 전체청소", "clean:all", style="danger"),
+                    Button("✖ 취소", "clean:x", style="secondary"),
+                ],
+            )
+        else:
+            adapter.send(
+                channel_id,
+                "🧹 메시지를 청소할까요?",
+                [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "clean:x", "")],
+            )
         return
     if cmd == "ㅁ새대화":
         # ⑤ 대화 세션 리셋 — 이 채널 세션을 버려 다음 메시지가 새(백지) 세션으로 시작하게 한다.
@@ -3204,6 +3879,39 @@ def handle_event(
     if not is_allowed(event.user_id, allowed) and not _playlist_bypass(event):
         log.warning("미허용 user_id=%s %s 무시", event.user_id, event.kind)
         return
+    # 🔴 이벤트 처리 전체를 «바쁨» 으로 — 워커가 디스코드 코루틴(ㅁ스포티파이 90곡·ㅁ목록 여러
+    # 페이지·음악 추가·push 회신 등)을 기다리는 동안 자동 재시작이 어댑터를 닫으면 그 코루틴이
+    # 이벤트 루프와 함께 끊긴다(«Task was destroyed but it is pending»). 핸들러 끝까지 기다린다.
+    with _working():
+        _dispatch_event(
+            adapter,
+            event,
+            claude_exe=claude_exe,
+            repo_root=repo_root,
+            target_root=target_root,
+            timeout=timeout,
+        )
+
+
+def _dispatch_event(
+    adapter: Adapter,
+    event: Event,
+    *,
+    claude_exe: str,
+    repo_root: Path,
+    target_root: str,
+    timeout: int,
+) -> None:
+    """인가를 통과한 이벤트의 kind 분기(handle_event 가 «바쁨» 안에서 부른다)."""
+    # #SNS정보 는 실시간 처리하지 않는다 — 공유 링크는 정오 러너가 히스토리로 읽는다(계획 §3-1).
+    # 반응·안내 없이 조용히 무시(플레이리스트 게이트와 같은 태도). 버튼(🔍 판정하기·청소 확인)과
+    # `ㅁ청소` 만 통과 — 청소는 확인 시점에 수집을 먼저 돌린다(_clean_sns_channel).
+    if (
+        event.channel_role == SNS_ROLE
+        and event.kind != "button"
+        and not (event.kind == "text" and event.text.strip() == "ㅁ청소")
+    ):
+        return
     if event.kind == "button":
         _handle_button(
             adapter,
@@ -3259,6 +3967,10 @@ def _dispatch_loop(
             dispatch_notifications(adapter)
         except Exception as e:  # 알림 발송 오류로 스레드가 죽지 않게(타입만 기록)
             log.error("알림 발송 중 예외: %s", type(e).__name__)
+        try:
+            check_sns_judge_done(adapter)  # 판정 완료 신호(계획의 «1분 주기» — 이 틱이 더 촘촘하다)
+        except Exception as e:
+            log.error("SNS 완료 신호 확인 중 예외: %s", type(e).__name__)
 
 
 def main() -> int:
@@ -3302,6 +4014,9 @@ def main() -> int:
     schedules = load_schedules(SCHEDULES_FILE)
     notify_fired.update(load_notify_state(NOTIFY_STATE_FILE, datetime.now(_KST).date().isoformat()))
     channel_sessions.update(load_channel_sessions(CHANNEL_SESSIONS_FILE))  # ⑤ 대화 세션 연속성 복원
+    global sns_allowed
+    sns_allowed = allowed  # SNS 히스토리도 이벤트 경로와 같은 허용목록으로 거른다
+    sns_init_state()  # 첫 기동이면 «지금» 을 수집 시작점으로(과거 백필 없음)
 
     # 지연 import: discord.py 는 discord_adapter 에만 격리 — 코어(bridge)를 직접 import 하는
     # 경로(단위 테스트)는 이 줄에 닿지 않아 discord.py 미설치 환경에서도 죽지 않는다

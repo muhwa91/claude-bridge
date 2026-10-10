@@ -20,6 +20,7 @@ from pathlib import Path
 
 import bridge
 import pytest
+import sns_inbox
 import youtube
 from adapter import (
     Button,
@@ -51,7 +52,7 @@ from bridge import (
     run_claude,
     save_notify_state,
 )
-from conftest import requires_monorepo  # pytest 가 conftest 를 먼저 로드한다
+from conftest import ORIG_SNS_SPAWN, requires_monorepo  # pytest 가 conftest 를 먼저 로드한다
 
 _ALLOWED = frozenset({777})
 _ALLOWED2 = frozenset({777, 888})
@@ -133,8 +134,29 @@ class FakeAdapter:
     def project_channel(self, project):
         return self._projects.get(project)
 
-    def clear_channel(self, channel_id):
+    clear_bounds = ()  # clear_channel 로 넘어온 (after_id, upto_id) 기록 — 범위 한정 청소 스파이
+
+    clear_keeps = ()  # clear_channel 로 넘어온 keep 판정 함수(없으면 None)
+
+    deleted = ()  # delete_message 로 넘어온 (channel_id, message_id)
+
+    def delete_message(self, channel_id, message_id):
+        self.deleted = [*self.deleted, (channel_id, message_id)]
+
+    def clear_channel(self, channel_id, *, after_id=None, upto_id=None, keep=None):
         self.cleared.append(channel_id)
+        self.clear_keeps = [*self.clear_keeps, keep]
+        self.clear_bounds = [*self.clear_bounds, (after_id, upto_id)]
+        # 범위대로 history 에서 **실제로 지운다** — (after_id, upto_id], 경계 없으면 전체.
+        # keep(본문, 작성자) 가 True 인 메시지는 범위 안이어도 남긴다(purge(check=) 와 같은 뜻).
+        if isinstance(self.history, list):
+            lo = after_id if after_id is not None else -1
+            hi = upto_id if upto_id is not None else float("inf")
+            self.history = [
+                ev
+                for ev in self.history
+                if not lo < (ev.message_id or 0) <= hi or (keep and keep(ev.text, ev.user_id))
+            ]
         return self._clear_count
 
     def _music_result(self, default):
@@ -175,6 +197,18 @@ class FakeAdapter:
     def dequeue_video(self, video_id):
         self.dequeued.append(video_id)
         return self._dequeue
+
+    # SNS 정오 러너용 — history 에 Event 목록(None = 읽기 실패)을 넣어 둔다.
+    history = ()
+    history_calls = ()
+
+    def history_after(self, channel_id, message_id, limit):
+        # 디스코드처럼 message_id **뒤**(snowflake 비교)만, 오래된 순으로, limit 건까지.
+        self.history_calls = [*self.history_calls, (channel_id, message_id, limit)]
+        if self.history is None:
+            return None
+        after = [ev for ev in self.history if (ev.message_id or 0) > message_id]
+        return sorted(after, key=lambda ev: ev.message_id)[:limit]
 
 
 def _btn(
@@ -1172,8 +1206,11 @@ def test_clean_command_sends_confirm_buttons():
     a = FakeAdapter()
     _fire(a, _txt(777, "ㅁ청소"), target_root="root")
     cid, body, buttons = a.sent[0]
-    assert cid == 777 and "삭제" in body
-    assert [b.action for b in buttons] == ["clean:ok", "x"]
+    assert cid == 777 and body == "🧹 메시지를 청소할까요?"  # 한 줄(«되돌릴 수 없습니다» 삭제)
+    assert [(b.label, b.action) for b in buttons] == [
+        ("🧹 청소", "clean:ok"),
+        ("✖ 취소", "clean:x"),
+    ]
     assert a.cleared == []  # 확인 전 — 아직 삭제 안 함
 
 
@@ -1341,7 +1378,7 @@ def test_playlist_gate_allows_music_and_clean(monkeypatch):
     assert a.music == [("play", 777, 777)]
     a2 = FakeAdapter()
     _fire(a2, _txt(777, "ㅁ청소", channel_role=_PL), target_root="root")
-    assert a2.sent and [b.action for b in a2.sent[0][2]] == ["clean:ok", "x"]
+    assert a2.sent and [b.action for b in a2.sent[0][2]] == ["clean:ok", "clean:x"]
 
 
 def test_music_add_url_extracts_and_adds(monkeypatch):
@@ -2768,7 +2805,7 @@ def test_bypass_unauth_playlist_add_passes(monkeypatch):
 def test_bypass_unauth_playlist_clean_confirm_and_ok(tmp_path):
     a = FakeAdapter()
     _fire(a, _txt(999, "ㅁ청소", channel_role=_PL), allowed=_ALLOWED, target_root="root")
-    assert [b.action for b in a.sent[0][2]] == ["clean:ok", "x"]  # 확인 버튼
+    assert [b.action for b in a.sent[0][2]] == ["clean:ok", "clean:x"]  # 확인 버튼
     a2 = FakeAdapter(clear_count=5)
     _fire(
         a2,
@@ -5706,3 +5743,1750 @@ def test_watch_login_decorator_passes_result_through_and_reports(login_env):
 
 def test_login_expired_text_is_fixed_copy():
     assert bridge.LOGIN_EXPIRED_TEXT == "🔐 Claude 로그인 필요"
+
+
+# ---------------------------------------------------------------------------
+# 📥 SNS정보 → 옵시디언 수집함 (docs/기능/SNS정보_수집/01_계획.md)
+# ---------------------------------------------------------------------------
+_SNS_CH = 4242
+_BOT = 1  # 봇 자신(허용목록 밖)
+_KST = bridge._KST
+_NOON = datetime(2026, 10, 10, 12, 0, tzinfo=_KST)
+
+
+def _sf(dt):
+    """datetime → 디스코드 snowflake(그 시각에 올라온 메시지 id)."""
+    return (int(dt.timestamp() * 1000) - bridge._DISCORD_EPOCH_MS) << 22
+
+
+def _sns_msg(text, at, user=777, bump=0):
+    return Event(
+        kind="text",
+        channel_id=_SNS_CH,
+        user_id=user,
+        text=text,
+        message_id=_sf(at) + bump,
+        channel_role="SNS정보",
+    )
+
+
+@pytest.fixture
+def sns(tmp_path, monkeypatch):
+    """수집함 3폴더 + 상태(last_message_id = 어제 정오) + 허용목록을 깐다."""
+    root = tmp_path / "수집함"
+    for sub in ("미판정", "사용/적용예정", "사용/적용완료", "폐기"):
+        (root / sub).mkdir(parents=True)
+    monkeypatch.setattr(bridge, "SNS_INBOX_DIR", root)
+    monkeypatch.setattr(bridge, "sns_allowed", _ALLOWED)
+    bridge._sns_update(last_message_id=_sf(_NOON - timedelta(days=1)))
+    adapter = FakeAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    return adapter, root
+
+
+def _state():
+    return json.loads(bridge.SNS_STATE_FILE.read_text(encoding="utf-8"))
+
+
+# ── 링크 추출 ──
+def test_sns_extract_insta_and_x_canonical_drops_tracking():
+    text = (
+        "봐봐 https://www.instagram.com/reel/DPabc_-1/?igsh=MTZ4 그리고 "
+        "<https://twitter.com/SomeUser/status/18234567890?s=46&t=xyz> 끝"
+    )
+    links = sns_inbox.extract_links(text)
+    assert [(lk.platform, lk.post_id, lk.url) for lk in links] == [
+        ("insta", "DPabc_-1", "https://www.instagram.com/reel/DPabc_-1/"),
+        ("x", "18234567890", "https://x.com/someuser/status/18234567890"),
+    ]
+
+
+def test_sns_extract_reels_and_p_and_tv():
+    assert sns_inbox.extract_links("https://instagram.com/reels/AbC/")[0].url == (
+        "https://www.instagram.com/reel/AbC/"
+    )
+    assert sns_inbox.extract_links("https://instagram.com/tv/Xy9")[0].url == (
+        "https://www.instagram.com/tv/Xy9/"
+    )
+    assert sns_inbox.extract_links("https://x.com/a_b/status/1?x=1")[0].url == (
+        "https://x.com/a_b/status/1"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://instagram.com.evil.com/p/abc/",  # 가짜 도메인(꼬리)
+        "https://evilinstagram.com/p/abc/",
+        "https://evil.com/instagram.com/p/abc/",
+        "https://instagram.com@evil.com/p/abc/",  # userinfo 속임수
+        "https://x.com.evil.com/u/status/1",
+        "https://www.instagram.com/p/../../etc/passwd",  # 경로 문자
+        "https://www.instagram.com/p/..%2F..%2Fx/",
+        "https://x.com/u/status/../../1",
+        "https://www.instagram.com/someuser/",  # 프로필(게시물 아님)
+        "https://x.com/someuser",
+        "https://youtube.com/watch?v=abc",
+        "ftp://instagram.com/p/abc/",
+    ],
+)
+def test_sns_extract_rejects_fake_domains_and_path_chars(url):
+    assert sns_inbox.extract_links(url) == []
+
+
+def test_sns_note_name_only_safe_id():
+    link = sns_inbox.extract_links("https://www.instagram.com/p/Ab_-9/")[0]
+    assert sns_inbox.note_name(link, _NOON) == "20261010_insta_Ab_-9.md"
+
+
+# ── 링크 형태 확장·중복 키(리뷰 반영) ──
+def test_sns_extract_insta_username_prefix_normalizes_to_code():
+    a = sns_inbox.extract_links("https://www.instagram.com/some.user_1/reel/CoDe1/?igsh=x")[0]
+    b = sns_inbox.extract_links("https://www.instagram.com/some.user_1/p/CoDe1/")[0]
+    assert a.url == "https://www.instagram.com/reel/CoDe1/"
+    assert a.key == b.key == ("insta", "CoDe1")
+
+
+def test_sns_extract_insta_share_token_kept_as_original_url():
+    [link] = sns_inbox.extract_links("https://www.instagram.com/share/reel/BAdTok3n/?utm=1")
+    assert (link.platform, link.post_id) == ("insta", "BAdTok3n")
+    assert link.url == "https://www.instagram.com/share/reel/BAdTok3n/"  # 쿼리만 걷음
+    assert link.key == ("insta:share", "BAdTok3n")  # shortcode 와 다른 이름공간
+    assert sns_inbox.extract_links("https://instagram.com/share/AbC")[0].post_id == "AbC"
+    # `/share/reels/<토큰>` 도 토큰 — «아이디=share» 게시물(shortcode)로 둔갑하지 않는다
+    [reels] = sns_inbox.extract_links("https://www.instagram.com/share/reels/BAabc/")
+    assert reels.key == ("insta:share", "BAabc")
+    assert reels.url == "https://www.instagram.com/share/reels/BAabc/"
+    # 모르는 share 형태는 게시물 정규식으로 넘기지 않고 버린다
+    assert sns_inbox.extract_links("https://www.instagram.com/share/x/y/p/ABC/") == []
+
+
+def test_sns_extract_x_media_tail_dropped():
+    for tail in ("/photo/1", "/video/1", "/photo/2/"):
+        [link] = sns_inbox.extract_links(f"https://x.com/dev/status/123{tail}?s=20")
+        assert link.url == "https://x.com/dev/status/123"
+
+
+def test_sns_extract_x_i_web_status_form_parsed_not_dropped():
+    # 사용자명 없이 앱이 공유하는 `/i/web/status/<id>` — 이걸 못 읽으면 ㅁ청소가 원문까지
+    # «링크X»로 지워버린다(회귀 못박기).
+    [link] = sns_inbox.extract_links("https://x.com/i/web/status/1234567890123456789")
+    assert link.url == "https://x.com/i/web/status/1234567890123456789"
+    assert link.key == ("x", "1234567890123456789")
+    # 같은 게시물의 일반 주소와 중복 키가 같아야 한다(두 번 저장되지 않게)
+    assert (
+        link.key == sns_inbox.extract_links("https://x.com/dev/status/1234567890123456789")[0].key
+    )
+    # media 꼬리도 함께 받는다
+    [tail_link] = sns_inbox.extract_links("https://x.com/i/web/status/42/photo/1")
+    assert tail_link.url == "https://x.com/i/web/status/42"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://x.com/u/status/１２３",  # noqa: RUF001 — 전각 숫자(유니코드 \d 가 받는다)
+        "https://x.com/u/status/١٢٣",  # 아랍-인도 숫자
+        "https://www.instagram.com/p/ＡＢＣ/",  # noqa: RUF001 — 전각 영문
+        "https://www.instagram.com/../reel/X1/",  # 사용자명 자리의 `..`
+        "https://www.instagram.com/share/../p/X1/",
+        "https://x.com/u/status/1/photo/1/../../2",
+    ],
+)
+def test_sns_extract_rejects_unicode_digits_and_dot_segments(url):
+    assert sns_inbox.extract_links(url) == []
+
+
+def test_sns_dedup_key_ignores_url_shape():
+    # 인스타: /p·/reel·/reels·/tv·사용자명 — 같은 CODE 면 같은 게시물. X: 사용자명 무관.
+    insta = {
+        sns_inbox.source_key(u)
+        for u in (
+            "https://www.instagram.com/p/Zz9/",
+            "https://instagram.com/reel/Zz9?igsh=1",
+            "https://instagram.com/reels/Zz9/",
+            "https://instagram.com/tv/Zz9/",
+            "https://instagram.com/someone/reel/Zz9/",
+        )
+    }
+    assert insta == {("insta", "Zz9")}
+    assert sns_inbox.source_key("https://x.com/a/status/5") == sns_inbox.source_key(
+        "https://twitter.com/B/status/5/photo/1"
+    )
+    assert sns_inbox.source_key("https://21st.dev/") == ("raw", "https://21st.dev/")
+
+
+# ── 메시지 문구(계획 §2) ──
+def test_sns_card_daily_omits_zero_lines_and_tail():
+    today = _NOON.date()
+    assert sns_inbox.card_text(2, 0, 0, 0, [today], False) == (
+        "📥 SNS 2건 수집함 저장\n➡️ 인스타그램 2건"
+    )
+    assert sns_inbox.card_text(0, 1, 0, 3, [today], False) == (
+        "📥 SNS 1건 수집함 저장\n➡️ X 1건\n⛔ 링크X 3건 Pass"
+    )
+    assert sns_inbox.card_text(1, 2, 4, 0, [today], False) == (
+        "📥 SNS 3건 수집함 저장\n➡️ 인스타그램 1건\n➡️ X 2건\n⛔ 중복 4건 Pass"
+    )
+
+
+def test_sns_card_none_when_nothing_saved():
+    assert sns_inbox.card_text(0, 0, 5, 2, [], True) is None
+
+
+def test_sns_card_catchup_text():
+    today = _NOON.date()
+    dates = [today - timedelta(days=2), today]
+    assert sns_inbox.card_text(2, 1, 1, 0, dates, True) == (
+        "📥 미처리 3건 수집함 저장\n➡️ 10/8 ~ 10/10 공유분\n⛔ 중복 1건 Pass"
+    )
+    # 공유일이 오래됐어도 밀린 실행이 아니면 평소 카드(판정 기준은 지난 실행일)
+    assert sns_inbox.card_text(2, 1, 0, 0, dates, False).startswith("📥 SNS 3건")
+
+
+# ── 정오 러너 ──
+def test_sns_runner_saves_notes_dedups_and_advances(sns):
+    adapter, root = sns
+    # 사용 폴더로 옮겨진 노트(파일명은 바뀜, 출처는 사용자명·추적값이 붙은 원문) → 중복
+    (root / "사용" / "적용예정" / "좋은_팁.md").write_text(
+        "---\n출처: https://www.instagram.com/someone/p/OLD1/?igsh=zz\n상태: 적용예정\n---\n본문",
+        encoding="utf-8",
+    )
+    t = _NOON - timedelta(hours=3)
+    events = [
+        _sns_msg("https://www.instagram.com/reel/NEW1/?igsh=a", t),
+        _sns_msg("https://x.com/dev/status/99?s=20", t, bump=1),
+        _sns_msg("https://instagram.com/reel/OLD1/", t, bump=2),  # 다른 폴더 중복(모양 다름)
+        _sns_msg("다시 https://www.instagram.com/p/NEW1/", t, bump=3),  # 같은 묶음 중복
+        _sns_msg("링크 없음 메모", t, bump=4),
+        _sns_msg("https://google.com/x", t, bump=5),  # 인스타·X 외 링크
+        _sns_msg("https://www.instagram.com/p/HACK/", t, user=999, bump=6),  # 비허용
+        _sns_msg("📥 SNS 1건 수집함 저장", t, user=_BOT, bump=7),  # 봇 카드
+    ]
+    adapter.history = events
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True
+    names = sorted(p.name for p in (root / "미판정").iterdir())
+    assert names == ["20261010_insta_NEW1.md", "20261010_x_99.md"]  # 비허용 HACK·.tmp 없음
+    body = (root / "미판정" / "20261010_insta_NEW1.md").read_text(encoding="utf-8")
+    assert body == (
+        "---\n출처: https://www.instagram.com/reel/NEW1/\n플랫폼: 인스타\n"
+        f"공유시각: 2026-10-10 09:00\n디스코드메시지: {events[0].message_id}\n상태: 미판정\n---\n"
+    )
+    [(ch, text, buttons)] = adapter.sent
+    assert ch == _SNS_CH
+    assert text == (
+        "📥 SNS 2건 수집함 저장\n➡️ 인스타그램 1건\n➡️ X 1건\n⛔ 중복 2건 Pass\n⛔ 링크X 2건 Pass"
+    )
+    assert buttons == [Button("🔍 판정하기", "sns_judge", style="primary")]
+    assert _state()["last_message_id"] == events[-1].message_id  # 봇·비허용 포함 끝까지 전진
+    assert _state()["last_run_date"] == "2026-10-10"
+
+
+def test_sns_runner_share_link_saved_not_counted_as_nolink(sns):
+    adapter, root = sns
+    adapter.history = [_sns_msg("https://www.instagram.com/share/reel/Tok_1/?x=1", _NOON)]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    [note] = (root / "미판정").iterdir()
+    assert note.name == "20261010_insta_Tok_1.md"
+    assert "출처: https://www.instagram.com/share/reel/Tok_1/\n" in note.read_text(encoding="utf-8")
+    assert adapter.sent[0][1] == "📥 SNS 1건 수집함 저장\n➡️ 인스타그램 1건"
+
+
+def test_sns_runner_reads_after_last_id_with_cap(sns):
+    adapter, _root = sns
+    last = _state()["last_message_id"]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert adapter.history_calls == [(_SNS_CH, last, bridge.SNS_HISTORY_MAX)]
+    assert adapter.sent == []  # 0건이면 아무것도 안 보낸다
+
+
+def test_sns_runner_history_cap_advances_to_processed_point(sns, monkeypatch):
+    adapter, root = sns
+    monkeypatch.setattr(bridge, "SNS_HISTORY_MAX", 2)
+    adapter.history = [
+        _sns_msg(f"https://x.com/a/status/{i}", _NOON - timedelta(hours=1), bump=i)
+        for i in range(1, 4)
+    ]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert len(list((root / "미판정").iterdir())) == 2
+    assert _state()["last_message_id"] == adapter.history[1].message_id  # 처리한 데까지
+    adapter.history = adapter.history[2:]  # 다음 실행 = 그 뒤부터
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-11")
+    assert len(list((root / "미판정").iterdir())) == 3
+
+
+def test_sns_runner_nothing_saved_sends_nothing_but_advances(sns):
+    adapter, _root = sns
+    adapter.history = [_sns_msg("잡담", _NOON - timedelta(hours=1))]
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True
+    assert adapter.sent == []
+    assert _state()["last_message_id"] == adapter.history[0].message_id
+    assert _state()["last_run_date"] == "2026-10-10"
+
+
+@pytest.mark.parametrize(
+    ("last_run", "catchup"),
+    [
+        (None, False),  # 첫 실행 — 평소 카드
+        ("2026-10-09", False),  # 어제 돌았다
+        ("2026-10-10", False),
+        ("2026-10-08", True),  # 어제를 놓쳤다
+        ("깨진값", False),
+    ],
+)
+def test_sns_runner_catchup_by_last_run_date(sns, last_run, catchup):
+    adapter, _root = sns
+    # 시작점을 사흘 전으로 — 이틀 전 공유분이 «시작점 뒤» 에 들어오게(Fake 도 after= 를 지킨다)
+    bridge._sns_update(last_run_date=last_run, last_message_id=_sf(_NOON - timedelta(days=3)))
+    adapter.history = [
+        _sns_msg("https://x.com/a/status/1", _NOON - timedelta(days=2)),
+        _sns_msg("https://x.com/a/status/2", _NOON - timedelta(hours=1)),
+    ]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    [(_ch, text, buttons)] = adapter.sent
+    if catchup:
+        assert text == "📥 미처리 2건 수집함 저장\n➡️ 10/8 ~ 10/10 공유분"
+    else:
+        assert text == "📥 SNS 2건 수집함 저장\n➡️ X 2건"
+    assert buttons == [bridge.SNS_JUDGE_BUTTON]
+
+
+def test_sns_runner_first_run_no_backfill(sns):
+    adapter, _root = sns
+    bridge.SNS_STATE_FILE.unlink()
+    adapter.history = [_sns_msg("https://x.com/a/status/1", _NOON)]
+    before = bridge.snowflake_now()
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True
+    assert adapter.history_calls == ()  # 과거를 읽지 않는다
+    assert adapter.sent == []
+    assert _state()["last_message_id"] >= before
+
+
+def test_sns_init_state_keeps_existing(sns):
+    _adapter, _root = sns
+    last = _state()["last_message_id"]
+    assert bridge.sns_init_state() is False
+    assert _state()["last_message_id"] == last
+
+
+def test_sns_runner_save_failure_keeps_last_id_and_notifies(sns, monkeypatch):
+    adapter, root = sns
+    last = _state()["last_message_id"]
+    adapter.history = [_sns_msg("https://x.com/a/status/7", _NOON)]
+
+    def boom(*_a):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(sns_inbox, "write_atomic", boom)
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True  # 25초 재시도 도배 없음
+    assert _state()["last_message_id"] == last  # 전진 안 함 → 다음 실행이 다시 읽는다
+    [(ch, text, _b)] = adapter.sent
+    assert ch == 55
+    assert text.endswith(
+        "⛔ 저장 실패 - 다음 실행 시 재시도\n➡️ 원인 : claude-bridge/logs/bridge.log"
+    )
+    assert not list((root / "미판정").iterdir())
+
+
+def test_sns_runner_state_write_failure_after_notes_takes_fail_path(sns, monkeypatch):
+    adapter, root = sns
+    last = _state()["last_message_id"]
+    adapter.history = [_sns_msg("https://x.com/a/status/7", _NOON)]
+    real = bridge._sns_update
+
+    def failing_update(**changes):
+        if "last_message_id" in changes:
+            raise OSError("disk")
+        real(**changes)
+
+    monkeypatch.setattr(bridge, "_sns_update", failing_update)
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True
+    assert _state()["last_message_id"] == last
+    [(ch, text, _b)] = adapter.sent  # 카드 대신 sns_fail 만
+    assert ch == 55 and "⛔ 저장 실패" in text
+    assert len(list((root / "미판정").iterdir())) == 1  # 노트는 남고, 다음 실행은 «중복» 으로 센다
+
+
+def test_sns_runner_card_send_failure_notifies_bot_status(sns):
+    adapter, _root = sns
+    adapter._send_ids = iter([None, 1])  # 카드 실패 → #봇상태 알림 성공
+    adapter.history = [_sns_msg("https://x.com/a/status/8", _NOON)]
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True
+    assert [ch for ch, _t, _b in adapter.sent] == [_SNS_CH, 55]
+    assert adapter.sent[1][1].endswith("⛔ SNS정보 수집 생성 실패\n→ claude-bridge/logs/bridge.log")
+    assert _state()["last_message_id"] == adapter.history[0].message_id  # 노트는 저장됨
+
+
+def test_sns_giveup_label():
+    assert "⛔ SNS정보 수집 생성 실패" in bridge.digest_giveup_text("sns-inbox")
+
+
+def test_sns_runner_history_failure_retries(sns):
+    adapter, _root = sns
+    last = _state()["last_message_id"]
+    adapter.history = None
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is False
+    assert _state()["last_message_id"] == last
+    assert adapter.sent == []
+
+
+def test_sns_runner_missing_folder_notifies_and_keeps_links(sns, tmp_path, monkeypatch):
+    adapter, _root = sns
+    last = _state()["last_message_id"]
+    monkeypatch.setattr(bridge, "SNS_INBOX_DIR", tmp_path / "없음")
+    adapter.history = [_sns_msg("https://x.com/a/status/1", _NOON)]
+    assert bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10") is True
+    assert adapter.history_calls == ()
+    [(ch, text, _b)] = adapter.sent
+    assert ch == 55
+    assert text.endswith(
+        "⚠️ 수집함 폴더 없음\n➡️ Hachiware/_Obsidian/수집함/미판정\n➡️ 링크 채널 유지"
+    )
+    assert _state()["last_message_id"] == last
+
+
+def test_sns_runner_empty_allowlist_saves_nothing(sns, monkeypatch):
+    adapter, root = sns
+    monkeypatch.setattr(bridge, "sns_allowed", frozenset())
+    adapter.history = [_sns_msg("https://x.com/a/status/1", _NOON)]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert not list((root / "미판정").iterdir())
+
+
+def test_sns_name_collision_gets_suffix_not_skipped(sns):
+    adapter, root = sns
+    note = root / "미판정" / "20261010_x_5.md"
+    note.write_text("손으로 쓴 메모(머리말 없음)", encoding="utf-8")
+    adapter.history = [_sns_msg("https://x.com/a/status/5", _NOON)]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert note.read_text(encoding="utf-8") == "손으로 쓴 메모(머리말 없음)"  # 덮어쓰지 않는다
+    assert "출처: https://x.com/a/status/5" in (root / "미판정" / "20261010_x_5_2.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_sns_case_only_different_shortcodes_both_saved(sns):
+    # NTFS 는 대소문자를 안 가린다 — abc·ABC 는 다른 게시물인데 같은 파일이 되면 안 된다.
+    adapter, root = sns
+    adapter.history = [
+        _sns_msg("https://www.instagram.com/p/abc/", _NOON),
+        _sns_msg("https://www.instagram.com/p/ABC/", _NOON, bump=1),
+    ]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    keys = {sns_inbox.read_source(p) for p in (root / "미판정").iterdir()}
+    assert keys == {("insta", "abc"), ("insta", "ABC")}
+
+
+# ── 배선 ──
+@_needs_real_schedules
+def test_sns_wired_as_runner_and_scheduled_at_noon_daily():
+    assert bridge.DIGEST_RUNNERS["sns-inbox"] == "run_sns_inbox"
+    items = {it["id"]: it for it in load_schedules(bridge.SCHEDULES_FILE)}
+    it = items["sns-inbox"]
+    assert it["at"] == "12:00" and it["channel"] == "SNS정보"
+    assert sorted(it["days"]) == sorted(bridge._WEEKDAYS)
+    assert 12 * 60 + it["grace_min"] < 24 * 60  # «같은 날짜 안» — 창이 자정을 넘지 않는다
+    assert due_notifications([it], _NOON, set()) == [it]
+    assert due_notifications([it], _NOON + timedelta(hours=11, minutes=59), set()) == [it]
+
+
+def test_sns_realtime_messages_are_ignored():
+    a = FakeAdapter()
+    for ev in (
+        _txt(777, "https://www.instagram.com/p/abc/", channel_id=_SNS_CH, channel_role="SNS정보"),
+        _txt(777, "ㅁ도움말", channel_id=_SNS_CH, channel_role="SNS정보"),
+        Event(kind="photo", channel_id=_SNS_CH, user_id=777, photo_ref="u", channel_role="SNS정보"),
+    ):
+        _fire(a, ev)
+    assert a.sent == [] and a.edited == [] and a.fetched == []
+
+
+def test_sns_judge_callback_codec_roundtrip():
+    assert parse_callback("sns_judge") == ("sns_judge", "")
+    assert encode_callback("sns_judge", "") == "sns_judge"
+    assert parse_callback("sns_judge:1") is None
+
+
+# ── 🔍 판정하기 버튼 ──
+_CARD = "📥 SNS 1건 수집함 저장\n➡️ X 1건"
+
+
+def _judge(card_id=500, text=_CARD, role="SNS정보", user=777):
+    return Event(
+        kind="button",
+        channel_id=_SNS_CH,
+        user_id=user,
+        text=text,
+        message_id=card_id,
+        action="sns_judge",
+        callback_id="cb",
+        channel_role=role,
+    )
+
+
+def _pending():
+    return _state().get("pending_cards", {})
+
+
+def test_sns_judge_success_marks_card_and_dedups_second_press(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "launch_judge", lambda: calls.append(1) or True)
+    a = FakeAdapter()
+    _fire(a, _judge())
+    assert a.edited == [(_SNS_CH, 500, f"{_CARD}\n🖥️ 판정 중", None)]  # 버튼 제거
+    assert _pending() == {"500": f"{_CARD}\n🖥️ 판정 중"}
+    _fire(a, _judge())  # 두 번 누름
+    assert calls == [1]
+    assert len(a.edited) == 1 and a.sent == []
+
+
+def test_sns_judge_failure_restores_button_and_allows_retry(monkeypatch):
+    results = iter([False, True])
+    monkeypatch.setattr(bridge, "launch_judge", lambda: next(results))
+    a = FakeAdapter()
+    _fire(a, _judge())
+    assert a.edited[-1] == (_SNS_CH, 500, _CARD, [bridge.SNS_JUDGE_BUTTON])
+    assert a.sent == [(_SNS_CH, "⛔ VS Code 실행 실패", None)]
+    assert _pending() == {}
+    _fire(a, _judge())  # 다시 누르면 다시 실행
+    assert "500" in _pending()
+
+
+def test_sns_judge_failure_keeps_other_pending_cards(monkeypatch):
+    results = iter([True, False])
+    monkeypatch.setattr(bridge, "launch_judge", lambda: next(results))
+    a = FakeAdapter()
+    _fire(a, _judge(card_id=500))
+    _fire(a, _judge(card_id=600))  # 실패 — 600 만 빠진다
+    assert list(_pending()) == ["500"]
+
+
+def test_sns_judge_ignored_outside_sns_channel_and_for_unallowed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "launch_judge", lambda: calls.append(1) or True)
+    a = FakeAdapter()
+    _fire(a, _judge(role=None))
+    _fire(a, _judge(user=999))
+    assert calls == [] and a.edited == []
+
+
+def test_sns_judge_reads_legacy_single_pending_state(monkeypatch):
+    # 옛 형식(pending_card_id 단일값)도 «판정 중» 으로 읽는다 — 두 번 누름 차단·완료 처리 모두.
+    monkeypatch.setattr(bridge, "launch_judge", lambda: pytest.fail("중복 실행"))
+    bridge._sns_update(pending_card_id=500, pending_card_text="옛 카드\n🖥️ 판정 중")
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    _fire(a, _judge(card_id=500))
+    assert a.edited == []
+    bridge.SNS_DONE_FILE.write_text('{"사용": 0, "폐기": 0, "시각": "t"}', encoding="utf-8")
+    bridge.check_sns_judge_done(a)
+    assert a.edited == [(_SNS_CH, 500, "옛 카드\n🎉 판정완료", None)]
+    assert "pending_card_id" not in _state() and _pending() == {}
+
+
+def test_launch_judge_fixed_argv_no_shell(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["kw"] = cmd, kw
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(bridge, "JUDGE_PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+    assert bridge.launch_judge() is True
+    assert seen["cmd"] == [sys.executable, "-m", "core.judge_inbox"]  # venv 없음 → 현재 파이썬
+    assert seen["kw"]["shell"] is False and seen["kw"]["cwd"] == tmp_path
+    assert seen["kw"]["timeout"] == 60
+    assert seen["kw"]["stdout"] is subprocess.DEVNULL  # 파이프면 VS Code 가 물고 있어 멈춘다
+    venv = tmp_path / ".venv" / "Scripts" / "python.exe"
+    venv.parent.mkdir(parents=True)
+    venv.write_text("", encoding="utf-8")
+    bridge.launch_judge()
+    assert seen["cmd"][0] == str(venv)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        subprocess.CompletedProcess([], 3),
+        subprocess.TimeoutExpired("x", 60),
+        FileNotFoundError("no python"),
+    ],
+)
+def test_launch_judge_failure_modes(monkeypatch, tmp_path, outcome):
+    def fake_run(*_a, **_kw):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(bridge, "JUDGE_PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+    assert bridge.launch_judge() is False
+
+
+# ── 완료 신호 ──
+def _write_done(payload, *, bom=False):
+    data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    bridge.SNS_DONE_FILE.write_bytes((b"\xef\xbb\xbf" if bom else b"") + data.encode("utf-8"))
+
+
+def test_sns_done_signal_marks_all_pending_cards_and_removes_file(monkeypatch):
+    monkeypatch.setattr(bridge, "launch_judge", lambda: True)
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    _fire(a, _judge(card_id=500))  # A
+    _fire(a, _judge(card_id=600, text="📥 SNS 2건 수집함 저장"))  # B
+    a.edited.clear()
+    _write_done({"사용": 1, "폐기": 4, "시각": "2026-10-11T12:05:00+09:00"}, bom=True)  # BOM 흡수
+    bridge.check_sns_judge_done(a)
+    assert a.edited == [
+        (_SNS_CH, 500, f"{_CARD}\n🎉 판정완료", None),
+        (_SNS_CH, 600, "📥 SNS 2건 수집함 저장\n🎉 판정완료", None),
+    ]
+    assert not bridge.SNS_DONE_FILE.exists()
+    assert _pending() == {}
+
+
+def test_sns_done_signal_without_pending_cards_just_cleans_file():
+    _write_done({"사용": 0, "폐기": 0, "시각": "t"})
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    bridge.check_sns_judge_done(a)
+    assert a.edited == []
+    assert not bridge.SNS_DONE_FILE.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{not json",
+        {"사용": "1", "폐기": 0, "시각": "t"},
+        {"사용": True, "폐기": 0, "시각": "t"},
+        {"사용": 1, "폐기": -1, "시각": "t"},
+        {"사용": 1, "폐기": 0},
+        {"사용": 1, "폐기": 0, "시각": "x" * 65},  # 시각 길이 상한
+        {"사용": 1, "폐기": 0, "시각": "t", "pad": "x" * 33_000},  # 32KB 초과 — 읽지 않는다
+        [1, 2],
+    ],
+)
+def test_sns_done_signal_bad_schema_ignored_and_kept(payload, caplog):
+    bridge._sns_update(pending_cards={"500": "x\n🖥️ 판정 중"})
+    _write_done(payload)
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        bridge.check_sns_judge_done(a)
+        bridge.check_sns_judge_done(a)  # 같은 파일 — 경고는 1번만
+    assert a.edited == []
+    assert bridge.SNS_DONE_FILE.exists()
+    assert _pending() == {"500": "x\n🖥️ 판정 중"}
+    assert sum("스키마 오류" in r.message for r in caplog.records) == 1
+
+
+def test_sns_done_signal_absent_is_noop():
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    bridge.check_sns_judge_done(a)
+    assert a.edited == []
+
+
+def test_sns_done_signal_unmapped_channel_warns_once_keeps_signal(caplog):
+    # #SNS정보 채널 미매핑 — 신호 파일은 유지해야(채널이 매핑되면 잡혀야) 하지만 25초 틱마다
+    # 같은 warning 을 도배하면 안 된다(같은 파일이면 1번만, 스키마 오류 경고와 같은 방식).
+    bridge._sns_update(pending_cards={"500": "x\n🖥️ 판정 중"})
+    _write_done({"사용": 1, "폐기": 0, "시각": "t"})
+    a = FakeAdapter()  # roles 미지정 — #SNS정보 미매핑
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        bridge.check_sns_judge_done(a)
+        bridge.check_sns_judge_done(a)  # 같은 파일 — 경고는 1번만
+    assert a.edited == []
+    assert bridge.SNS_DONE_FILE.exists()  # 신호는 지우지 않는다
+    assert _pending() == {"500": "x\n🖥️ 판정 중"}
+    assert sum("미매핑" in r.message for r in caplog.records) == 1
+
+
+def test_dispatch_tick_checks_sns_done_signal(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bridge, "dispatch_notifications", lambda ad: calls.append(("notify", ad)))
+    monkeypatch.setattr(bridge, "check_sns_judge_done", lambda ad: calls.append(("sns", ad)))
+
+    class OneTick:
+        def __init__(self):
+            self.n = 0
+
+        def wait(self, _sec):
+            self.n += 1
+            return self.n > 1  # 첫 wait 은 틱, 둘째에 종료
+
+    a = FakeAdapter()
+    bridge._dispatch_loop(a, OneTick())
+    assert calls == [("notify", a), ("sns", a)]
+
+
+def test_dispatch_tick_sns_check_survives_notify_error(monkeypatch):
+    calls = []
+
+    def boom(_ad):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(bridge, "dispatch_notifications", boom)
+    monkeypatch.setattr(bridge, "check_sns_judge_done", lambda ad: calls.append(ad))
+
+    class OneTick:
+        n = 0
+
+        def wait(self, _sec):
+            self.n += 1
+            return self.n > 1
+
+    bridge._dispatch_loop(FakeAdapter(), OneTick())
+    assert len(calls) == 1
+
+
+# ── «😎 판정완료» 카드 (계획 §2 «판정완료 카드»·«카드 나누기» · 판정_절차.md §4) ──
+_21ST = {
+    "판정": "사용",
+    "제목": "21st.dev — React UI 부품 모음",
+    "무엇": "React + Tailwind 컴포넌트 모음 · 설치하면 코드가 레포로 들어온다",
+    "추가": "muhwa-portfolio 에 그대로 맞는 부품",
+    "쓰는법": "① 둘러보기 → ② 프롬프트 복사 → ③ frontend-engineer 에게",
+}
+_LAST30 = {
+    "판정": "사용",
+    "제목": "last30days — 커뮤니티 반응 수집기",
+    "무엇": "최근 30일 커뮤니티 반응을 모아 주는 스킬",
+    "추가": "도구 도입 전 반응 확인",
+    "쓰는법": "① 설치 → ② 주제 입력 → ③ 요약 확인",
+}
+_TERSE = {
+    "판정": "폐기",
+    "제목": "Terse 플러그인",
+    "사유": "이미 있음 (응답 포맷 규칙 + 헌법 자동 주입)",
+}
+_TERSE_ITEM = "**🔴 Terse 플러그인**\n> 이미 있음 (응답 포맷 규칙 + 헌법 자동 주입)"
+
+
+def _use_text(it):
+    """사용 항목 묶음 — 정본 서식(B안: 큰 제목 · 칸 이름 굵게 · 값 인용, 칸 사이 빈 줄 없음)."""
+    return (
+        f"### 🟢 {it['제목']}\n**🧾 내용**\n> {it['무엇']}\n"
+        f"**🗂️ 추가**\n> {it['추가']}\n**🛠 사용법**\n> {it['쓰는법']}"
+    )
+
+
+def _use(i):
+    return dict(_21ST, 제목=f"도구{i}")
+
+
+def _done_with_items(items, a=None):
+    """판정 중 카드 500 + 항목 있는 완료 신호 → check 1회. (어댑터, #SNS정보 새 메시지 목록)."""
+    bridge._sns_update(pending_cards={"500": f"{_CARD}\n🖥️ 판정 중"})
+    _write_done({"사용": 1, "폐기": 1, "시각": "t", "항목": items})
+    a = a or FakeAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    bridge.check_sns_judge_done(a)
+    sent = [t for ch, t, _b in a.sent if ch == _SNS_CH]
+    # 카드마다 끝 빈 줄(보이지 않는 글자) — 디스코드가 연속 메시지를 붙여 그린다
+    assert all(t.endswith(bridge.sns_inbox.CARD_GAP) for t in sent)
+    return a, [t.removesuffix(bridge.sns_inbox.CARD_GAP) for t in sent]
+
+
+def test_judge_cards_spec_example_use2_drop1():
+    _a, cards = _done_with_items([_21ST, _LAST30, _TERSE])
+    assert cards[0] == (
+        "### 😎 판정완료\n총 **3**건\n💾 사용 **2**건\n🗑 폐기 **1**건\n\n"
+        "**🔴 Terse 플러그인**\n> 이미 있음 (응답 포맷 규칙 + 헌법 자동 주입)"
+    )
+    assert cards[1] == (
+        "### 🟢 21st.dev — React UI 부품 모음\n**🧾 내용**\n"
+        "> React + Tailwind 컴포넌트 모음 · 설치하면 코드가 레포로 들어온다\n"
+        "**🗂️ 추가**\n> muhwa-portfolio 에 그대로 맞는 부품\n"
+        "**🛠 사용법**\n> ① 둘러보기 → ② 프롬프트 복사 → ③ frontend-engineer 에게"
+    )
+    assert cards[2] == _use_text(_LAST30)
+    assert len(cards) == 3
+
+
+def test_judge_card_use1_drop1_single_card_is_summary_plus_use_item():
+    a, [card] = _done_with_items([_21ST, _TERSE])
+    summary = "### 😎 판정완료\n총 **2**건\n💾 사용 **1**건\n🗑 폐기 **1**건\n\n" + _TERSE_ITEM
+    assert card == summary + "\n\n" + _use_text(_21ST)  # 폐기 목록 → 사용 항목 순서
+    assert a.edited == [(_SNS_CH, 500, f"{_CARD}\n🎉 판정완료", None)]  # 🎉 처리도 그대로
+    assert a.sent[0][2] is None  # 버튼 없음 · 새 메시지
+    assert not bridge.SNS_DONE_FILE.exists()
+
+
+def test_judge_card_use0_drop2_single_card():
+    other = {"판정": "폐기", "제목": "B", "사유": "무관"}
+    _a, [card] = _done_with_items([_TERSE, other])
+    assert card == (
+        "### 😎 판정완료\n총 **2**건\n🗑 폐기 **2**건\n\n" + _TERSE_ITEM + "\n\n**🔴 B**\n> 무관"
+    )
+
+
+def test_judge_card_use1_only_single_card():
+    _a, [card] = _done_with_items([_21ST])
+    assert card == "### 😎 판정완료\n총 **1**건\n💾 사용 **1**건\n\n" + _use_text(_21ST)
+
+
+def test_judge_cards_use2_without_drop_summary_has_no_trailing_blank():
+    _a, cards = _done_with_items([_use(1), _use(2)])
+    assert cards[0] == "### 😎 판정완료\n총 **2**건\n💾 사용 **2**건"
+    assert cards[1:] == [_use_text(_use(1)), _use_text(_use(2))]
+
+
+def test_judge_cards_use12_more_below_use_line_above_drop_line():
+    _a, cards = _done_with_items([*(_use(i) for i in range(1, 13)), _TERSE])
+    assert cards[0] == (
+        "### 😎 판정완료\n총 **13**건\n💾 사용 **12**건\n⚠️ 외 2건 수집함 확인\n🗑 폐기 **1**건\n\n"
+        + _TERSE_ITEM
+    )
+    assert cards[1:] == [_use_text(_use(i)) for i in range(1, 11)]  # 최대 10장, 신호 순서
+
+
+def test_judge_cards_shape_rules():
+    for items in ([_TERSE], [_21ST], [_21ST, _TERSE], [_use(1), _use(2), _TERSE]):
+        _a, cards = _done_with_items(items)
+        for card in cards:
+            assert "상세 - 수집함" not in card and "➡️" not in card  # foot·옛 접두 없음
+            assert "\n\n\n" not in card and not card.endswith("\n")
+
+
+def test_judge_drop_items_separated_by_one_blank_line():
+    drops = [{"제목": "A", "사유": "a"}, {"제목": "B", "사유": "b"}]
+    [card] = bridge.sns_inbox.judge_cards([], drops, 100_000)
+    assert card.endswith("🗑 폐기 **2**건\n\n**🔴 A**\n> a\n\n**🔴 B**\n> b")
+
+
+# ── 마크다운 escape(외부 유래 제목·칸 값) ──
+@pytest.mark.parametrize(
+    ("raw", "escaped"),
+    [
+        ("**굵게**", "\\*\\*굵게\\*\\*"),
+        ("# 가짜제목", "\\# 가짜제목"),
+        ("> 인용", "\\> 인용"),
+        ("-# 작게", "\\-\\# 작게"),
+        ("- 목록", "\\- 목록"),
+        ("1. 번호", "1\\. 번호"),
+        ("a_b ~c~ |d| `e` \\f", "a\\_b \\~c\\~ \\|d\\| \\`e\\` \\\\f"),
+        # 🔴 `[` escape — 외부 유래 값이 봇 이름으로 클릭 가능한 피싱 링크를 만들지 못하게.
+        # 디스코드는 `\[text](url)` 을 링크로 파싱하지 않으므로 `]`·`(`·`)` 는 건드리지 않는다.
+        ("[무해한 안내](https://phish.example)", "\\[무해한 안내](https://phish.example)"),
+        ("@everyone 21st.dev a-b 1.5", "@everyone 21st.dev a-b 1.5"),  # 대상 밖은 그대로
+    ],
+)
+def test_escape_md(raw, escaped):
+    assert bridge.sns_inbox.escape_md(raw) == escaped
+
+
+def test_judge_card_escapes_titles_and_values():
+    spoof = {"판정": "폐기", "제목": "**굵게** # 가짜", "사유": "-# 작게"}
+    use = {
+        "판정": "사용",
+        "제목": "# 가짜제목",
+        "무엇": "> 인용",
+        "추가": "1. 목록",
+        "쓰는법": "`코드` @everyone",
+    }
+    _a, [card] = _done_with_items([use, spoof])
+    assert "**🔴 \\*\\*굵게\\*\\* \\# 가짜**\n> \\-\\# 작게" in card
+    assert "### 🟢 \\# 가짜제목\n**🧾 내용**\n> \\> 인용\n" in card
+    assert "**🗂️ 추가**\n> 1\\. 목록\n" in card
+    assert card.endswith("> \\`코드\\` @everyone")  # 멘션은 전역 allowed_mentions 가 막는다
+
+
+def test_judge_card_quote_values_stay_on_one_line():
+    # 칸 값의 줄바꿈은 _judge_items 가 접는다 → `> ` 인용이 한 줄로 끝나 가짜 제목 줄이 없다
+    _a, [card] = _done_with_items([dict(_TERSE, 사유="진짜\n# 가짜 제목\n> 가짜 인용")])
+    assert card.endswith("> 진짜 \\# 가짜 제목 \\> 가짜 인용")
+    for line in card.split("\n"):
+        assert not line.startswith(("# ", "> #", "> >"))
+
+
+def test_judge_card_absent_items_is_compatible():
+    bridge._sns_update(pending_cards={"500": "x\n🖥️ 판정 중"})
+    _write_done({"사용": 0, "폐기": 0, "시각": "t"})
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    bridge.check_sns_judge_done(a)
+    assert a.sent == [] and a.edited == [(_SNS_CH, 500, "x\n🎉 판정완료", None)]
+
+
+def test_judge_card_empty_or_non_list_items_sends_nothing():
+    for items in ([], {"판정": "사용"}, "문자열"):
+        _a, cards = _done_with_items(items)
+        assert cards == []
+
+
+def test_judge_card_bad_item_dropped_alone_with_one_warning(caplog):
+    bad = [
+        {"판정": "보류", "제목": "x", "사유": "y"},  # 모르는 판정
+        {"판정": "사용", "제목": "x"},  # 빠진 칸
+        {"판정": "폐기", "제목": 3, "사유": "y"},  # 문자열 아님
+        {"판정": ["사용"], "제목": "x", "사유": "y"},  # 해시 불가 판정
+        "항목이 아님",
+    ]
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        _a, [card] = _done_with_items([_21ST, *bad, _TERSE])
+    assert "총 **2**건" in card
+    assert sum("형식 오류" in r.message for r in caplog.records) == 1
+
+
+def test_judge_card_field_truncated_to_200_with_ellipsis():
+    _a, [card] = _done_with_items([dict(_TERSE, 사유="가" * 250)])
+    assert card.endswith("> " + "가" * 200 + "…") and "가" * 201 not in card
+
+
+def test_judge_card_fields_folded_to_one_line():
+    # 칸 안의 개행으로 카드 구조(가짜 «🗑 폐기» 줄)를 위조하지 못한다
+    _a, [card] = _done_with_items([dict(_TERSE, 사유="진짜\n\n🗑 폐기 99건")])
+    assert "> 진짜 🗑 폐기 99건" in card and card.count("🗑 폐기") == 2  # 건수 1 + 접힌 값 1
+
+
+def test_judge_card_over_limit_trims_drops_from_back():
+    use = [{"제목": "U", "무엇": "w", "추가": "a", "쓰는법": "h"}]
+    drops = [{"제목": f"D{i}", "사유": "가" * 150} for i in range(20)]
+    [card] = bridge.sns_inbox.judge_cards(use, drops, 1800)
+    assert len(card) <= 1800
+    shown = card.count("🔴 D")
+    assert 0 < shown < 20
+    # 줄인 폐기는 폐기 목록 끝 judge_more, 그 뒤에 사용 항목
+    assert f"⚠️ 외 {20 - shown}건 수집함 확인\n\n### 🟢 U\n" in card
+    assert f"🔴 D{shown - 1}**" in card and f"🔴 D{shown}**" not in card  # 뒤에서부터 줄였다
+
+
+def test_judge_card_limit_counts_escaped_length():
+    # escape 로 늘어난 길이로 예산을 판단한다(`*` 200자 → 400자)
+    drops = [{"제목": f"D{i}", "사유": "*" * 200} for i in range(10)]
+    [card] = bridge.sns_inbox.judge_cards([], drops, 1800)
+    assert len(card) <= 1800
+    assert "⚠️ 외 " in card and card.count("🔴 D") < 10
+
+
+def test_judge_cards_each_within_limit():
+    use = [{"제목": "U" * 200, "무엇": "w" * 200, "추가": "a" * 200, "쓰는법": "h" * 200}] * 3
+    drops = [{"제목": f"D{i}", "사유": "가" * 200} for i in range(30)]
+    cards = bridge.sns_inbox.judge_cards(use, drops, 1800)
+    assert len(cards) == 4 and all(len(c) <= 1800 for c in cards)
+    assert "⚠️ 외 " in cards[0]  # 요약 카드의 폐기가 줄었다
+    assert all(len(c) <= 50 for c in bridge.sns_inbox.judge_cards(use, [], 50))  # 방어 자르기
+
+
+def test_judge_card_truncation_does_not_leave_dangling_backslash():
+    # escape 짝(`\*`)이 자르기로 반토막 나면 끝에 홀로 남은 `\` 가 CARD_GAP 과 함께 보인다.
+    use = [{"제목": "가" * 5, "무엇": "*" * 200, "추가": "*" * 200, "쓰는법": "*" * 200}]
+    [card] = bridge.sns_inbox.judge_cards(use, [], 131)
+    assert not card.endswith("\\")
+    tail = len(card) - len(card.rstrip("\\"))
+    assert tail % 2 == 0  # 남은 백슬래시가 있어도 짝수(온전한 escape 쌍)
+
+
+def test_judge_card_wired_limit_keeps_single_discord_message():
+    drops = [dict(_TERSE, 제목=f"D{i}", 사유="가" * 200) for i in range(30)]
+    _a, [card] = _done_with_items([_21ST, *drops])
+    assert len(card) <= bridge._SNS_JUDGE_CARD_LIMIT < 2000  # 일반 메시지 한도(청킹 없이 1통)
+    assert "⚠️ 외 " in card
+
+
+def test_judge_card_mentions_go_through_adapter_send():
+    # 멘션 차단은 디스코드 클라이언트 전역 allowed_mentions=none(test_client_blocks_all_mentions ·
+    # test_send_kwargs_never_reenable_mentions). 코어는 카드를 **adapter.send** 로만 보낸다 —
+    # 마스킹·멘션 차단을 우회하는 경로가 없다.
+    spoof = dict(_TERSE, 제목="@everyone <@123> <@&456> @here")
+    _a, [card] = _done_with_items([spoof])
+    # 본문은 데이터로 남는다(렌더만 막는다) — `>` 는 마크다운 escape 대상이라 `\>` 로 바뀐다
+    assert "@everyone <@123\\> <@&456\\> @here" in card
+
+
+def test_judge_card_send_failure_reports_and_still_cleans(caplog):
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55}, send_ids=[None, 1])
+    with caplog.at_level(logging.INFO, logger="bridge"):
+        _done_with_items([_21ST, _TERSE], a)
+    assert a.edited == [(_SNS_CH, 500, f"{_CARD}\n🎉 판정완료", None)]  # 🎉 는 진행
+    assert a.sent[1][0] == 55 and "⛔ SNS정보 수집 생성 실패" in a.sent[1][1]
+    assert not bridge.SNS_DONE_FILE.exists()  # 다음 틱이 카드를 두 번 보내지 않는다
+    bridge.check_sns_judge_done(a)
+    assert len(a.sent) == 2
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "21st" not in logged and "Terse" not in logged  # 칸 값 원문은 로그에 없다
+
+
+def test_judge_cards_middle_failure_keeps_sending_and_reports_once():
+    # 요약 성공 · 사용1 실패 · 사용2·3 성공 → 나머지는 계속, 실패 안내는 1번
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55}, send_ids=[1, None, 1, 1, 1])
+    _a, cards = _done_with_items([_use(1), _use(2), _use(3)], a)
+    assert len(cards) == 4  # 요약 + 사용 3장 모두 시도
+    notices = [t for ch, t, _b in a.sent if ch == 55]
+    assert len(notices) == 1 and "⛔ SNS정보 수집 생성 실패" in notices[0]
+    assert not bridge.SNS_DONE_FILE.exists()
+
+
+def test_judge_done_signal_size_cap_is_32kb():
+    assert bridge._SNS_DONE_MAX_BYTES == 32 * 1024
+    big = [dict(_TERSE, 제목=f"D{i}") for i in range(200)]  # 4KB 는 넘고 32KB 안
+    payload = json.dumps({"사용": 0, "폐기": 200, "시각": "t", "항목": big}, ensure_ascii=False)
+    assert 4096 < len(payload.encode("utf-8")) < 32 * 1024
+    _a, [card] = _done_with_items(big)
+    assert "🗑 폐기 **200**건" in card
+
+
+# ── #SNS정보 `ㅁ청소` — 청소 확인 시 수집 먼저(링크 유실 방지) ──
+class _OrderAdapter(FakeAdapter):
+    """history_after·clear_channel·send 호출 순서를 기록."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.order = []
+
+    def history_after(self, channel_id, message_id, limit):
+        self.order.append("history")
+        return super().history_after(channel_id, message_id, limit)
+
+    def clear_channel(self, channel_id, **bounds):  # after_id·upto_id·keep 그대로 넘김
+        self.order.append("clear")
+        return super().clear_channel(channel_id, **bounds)
+
+    def send(self, channel_id, text, buttons=None):
+        self.order.append(("send", channel_id))
+        return super().send(channel_id, text, buttons)
+
+
+def _clean_ok():
+    return _btn(777, "clean:ok", channel_id=_SNS_CH, channel_role="SNS정보")
+
+
+def test_sns_clean_command_passes_gate_and_asks_confirmation():
+    a = FakeAdapter()
+    _fire(a, _txt(777, " ㅁ청소 ", channel_id=_SNS_CH, channel_role="SNS정보"))
+    [(ch, _text, buttons)] = a.sent
+    assert ch == _SNS_CH and [b.action for b in buttons] == ["clean:link", "clean:all", "clean:x"]
+
+
+def test_sns_other_commands_and_chat_still_ignored():
+    a = FakeAdapter()
+    for text in ("ㅁ도움말", "ㅁ청소 해줘", "잡담", "ㅁ푸시해줘"):
+        _fire(a, _txt(777, text, channel_id=_SNS_CH, channel_role="SNS정보"))
+    _fire(a, _txt(999, "ㅁ청소", channel_id=_SNS_CH, channel_role="SNS정보"))  # 비허용
+    assert a.sent == [] and a.cleared == []
+
+
+def test_sns_clean_confirm_collects_first_then_clears_then_card(sns):
+    _adapter, root = sns
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    t = _NOON - timedelta(hours=1)
+    a.history = [
+        _sns_msg("https://x.com/a/status/11", t),
+        _sns_msg("ㅁ청소", t, bump=1),  # 명령 — 링크X 로 세지 않는다
+        _sns_msg("🧹 이 채널의 메시지를 전부 삭제할까요?", t, user=_BOT, bump=2),
+    ]
+    newest = a.history[-1].message_id
+    _fire(a, _clean_ok())
+    assert a.order == ["history", "clear", ("send", _SNS_CH)]  # 수집 → 청소 → 카드
+    assert [p.name for p in (root / "미판정").iterdir()] == ["20261010_x_11.md"]
+    assert _state()["last_message_id"] == newest  # 시작점 전진
+    assert "last_run_date" not in _state()  # 정오 «밀린 날» 판정에 손대지 않는다
+    # 수집기가 본 범위만 — (이번 읽기 시작점, 마지막으로 읽은 id]
+    assert a.clear_bounds == [(_sf(_NOON - timedelta(days=1)), newest)]
+    assert a.history == []  # 범위 안 3건은 실제로 지워졌다
+    [(_ch, text, buttons)] = a.sent
+    assert text == "📥 SNS 1건 수집함 저장\n➡️ X 1건"  # 링크X 꼬리 없음(ㅁ명령 제외)
+    assert buttons == [bridge.SNS_JUDGE_BUTTON]
+
+
+def test_sns_clean_confirm_nothing_new_since_start_point_deletes_nothing(sns):
+    # 수집 0건(시작점 이후 메시지 없음) → 수집기가 본 범위가 비었다 = 아무것도 지우지 않는다.
+    # (종전엔 이때 채널 전체를 지웠다 — 상태 파일 유실 뒤 baseline 이 «지금» 으로 다시 심기면
+    #  그 앞 링크가 수집 0건인 채 전멸하는 경로였다.)
+    _adapter, _root = sns
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH})
+    _fire(a, _clean_ok())
+    assert a.order == ["history"] and a.cleared == []
+
+
+def test_sns_clean_never_deletes_before_baseline_after_state_loss(sns):
+    # 상태 파일이 사라져 시작점이 «지금» 으로 다시 심긴 뒤: 그 앞 메시지는 수집기가 본 적이 없으니
+    # 청소 범위의 하한(baseline_id)이 그 앞을 지키고, 그 뒤 공유분만 수집·삭제한다.
+    _adapter, root = sns
+    bridge.SNS_STATE_FILE.unlink()
+    assert bridge.sns_init_state() is True
+    base = _state()["baseline_id"]
+    assert base == _state()["last_message_id"]
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH})
+    new = Event(
+        kind="text",
+        channel_id=_SNS_CH,
+        user_id=777,
+        text="https://x.com/a/status/77",
+        message_id=base + 5,
+        channel_role="SNS정보",
+    )
+    a.history = [new]
+    _fire(a, _clean_ok())
+    assert a.clear_bounds == [(base, base + 5)]  # baseline 이전(옛 링크)은 범위 밖
+    assert [p.name for p in (root / "미판정").iterdir()] != []
+
+
+@pytest.mark.parametrize("failure", ["folder", "save", "history"])
+def test_sns_clean_confirm_does_not_clear_when_collect_fails(sns, monkeypatch, tmp_path, failure):
+    _adapter, _root = sns
+    last = _state()["last_message_id"]
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    a.history = [_sns_msg("https://x.com/a/status/12", _NOON)]
+    if failure == "folder":
+        monkeypatch.setattr(bridge, "SNS_INBOX_DIR", tmp_path / "없음")
+    elif failure == "save":
+
+        def boom(*_a):
+            raise PermissionError("locked")
+
+        monkeypatch.setattr(sns_inbox, "write_atomic", boom)
+    else:
+        a.history = None
+    _fire(a, _clean_ok())
+    assert a.cleared == []  # 링크를 지우지 않는다
+    assert _state()["last_message_id"] == last
+    [(ch, text, _b)] = a.sent  # 실패 안내 1번(#봇상태)
+    assert ch == 55
+    expected = {
+        "folder": "⚠️ 수집함 폴더 없음",
+        "save": "⛔ 저장 실패",
+        "history": "⛔ SNS정보 수집 생성 실패",
+    }[failure]
+    assert expected in text
+
+
+def test_sns_clean_confirm_does_not_clear_on_first_run_init_state(sns):
+    # 회귀 못박기(①): 시작점이 없는 첫 실행 — 아직 한 건도 읽지 않았다. 이대로 지우면
+    # 공유된 링크가 전부 사라지는 불가역 삭제다. "init" 이면 절대 지우지 않는다.
+    _adapter, root = sns
+    bridge.SNS_STATE_FILE.unlink()  # last_message_id 없음 → _collect_sns 가 "init" 반환
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    a.history = [_sns_msg("https://x.com/a/status/99", _NOON)]  # 읽히면 안 된다(백필 없음)
+    _fire(a, _clean_ok())
+    assert a.cleared == []  # 🔴 채널을 통째로 지우지 않는다
+    assert "clear" not in a.order
+    assert list((root / "미판정").iterdir()) == []  # 수집도 하지 않는다(지금부터 시작점)
+    [(ch, text, _b)] = a.sent  # 공통 실패 안내 1번(#봇상태) — 새 문구를 만들지 않는다
+    assert ch == 55
+    assert "⛔ SNS정보 수집 생성 실패" in text
+
+
+def test_sns_clean_skipped_when_history_cap_hit(sns, monkeypatch):
+    # 받은 건수 == 상한 → 뒤가 남았을 수 있다: 수집한 만큼 저장·전진, 청소는 안 함, 안내 1번
+    _adapter, root = sns
+    monkeypatch.setattr(bridge, "SNS_HISTORY_MAX", 2)
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    a.history = [
+        _sns_msg(f"https://x.com/a/status/{i}", _NOON - timedelta(hours=1), bump=i)
+        for i in range(1, 4)
+    ]
+    _fire(a, _clean_ok())
+    assert a.cleared == []
+    assert len(list((root / "미판정").iterdir())) == 2
+    assert _state()["last_message_id"] == a.history[1].message_id
+    notices = [t for ch, t, _b in a.sent if ch == 55]
+    assert len(notices) == 1 and "⛔ SNS정보 수집 생성 실패" in notices[0]
+    cards = [t for ch, t, _b in a.sent if ch == _SNS_CH]  # 저장한 2건은 카드로 알린다
+    assert cards == ["📥 SNS 2건 수집함 저장\n➡️ X 2건"]
+
+
+def test_clean_confirm_other_channels_unchanged():
+    a = _OrderAdapter()
+    _fire(a, _btn(777, "clean:ok", channel_id=321))
+    assert a.order == ["clear"]  # 다른 채널은 수집 없이 바로 청소
+    assert a.clear_bounds == [(None, None)] and a.clear_keeps == [None]  # 전체 삭제 그대로
+
+
+def test_sns_after_clean_history_reads_after_deleted_id(sns):
+    # 청소로 last_message_id 메시지가 지워져도 다음 읽기는 그 id 기준 after= 로 이어진다
+    # (디스코드 after 는 snowflake 비교라 없는 id 도 된다 — Fake 로 «그 id 를 그대로 넘김» 고정).
+    _adapter, root = sns
+    a = _OrderAdapter(roles={"SNS정보": _SNS_CH})
+    a.history = [_sns_msg("https://x.com/a/status/13", _NOON - timedelta(hours=2))]
+    _fire(a, _clean_ok())
+    gone = _state()["last_message_id"]
+    a.history = [_sns_msg("https://x.com/a/status/14", _NOON)]
+    bridge.run_sns_inbox(a, _SNS_CH, "2026-10-10")
+    assert a.history_calls[-1] == (_SNS_CH, gone, bridge.SNS_HISTORY_MAX)
+    assert sorted(p.name for p in (root / "미판정").iterdir()) == [
+        "20261010_x_13.md",
+        "20261010_x_14.md",
+    ]
+
+
+def test_sns_runner_does_not_count_bot_commands_as_nolink(sns):
+    adapter, _root = sns
+    adapter.history = [
+        _sns_msg("https://x.com/a/status/15", _NOON),
+        _sns_msg("ㅁ청소", _NOON, bump=1),
+        _sns_msg("  ㅁ도움말", _NOON, bump=2),
+        _sns_msg("그냥 메모", _NOON, bump=3),  # 이건 링크X
+    ]
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert adapter.sent[0][1] == "📥 SNS 1건 수집함 저장\n➡️ X 1건\n⛔ 링크X 1건 Pass"
+
+
+# ── 점검 반영(2026-10-10): 스레드 · 수집 직렬화 · 오래된 판정 중 카드 · 생 URL · 계약 ──
+def test_sns_spawn_runs_in_daemon_thread_and_logs_exceptions(caplog):
+    done = threading.Event()
+    seen = {}
+
+    def work(x):
+        seen["thread"] = threading.current_thread()
+        seen["busy"] = bridge._busy  # 바쁨 표시 안에서 돈다(자동 재시작이 끊지 않게)
+        seen["x"] = x
+        done.set()
+
+    ORIG_SNS_SPAWN("sns-test", work, 7)
+    assert done.wait(5)
+    assert seen["x"] == 7 and seen["busy"] >= 1
+    assert seen["thread"] is not threading.main_thread() and seen["thread"].daemon
+
+    def boom():
+        raise RuntimeError("x")
+
+    with caplog.at_level(logging.ERROR, logger="bridge"):
+        ORIG_SNS_SPAWN("sns-boom", boom)
+        for _ in range(100):
+            if any("SNS 작업 예외" in r.message for r in caplog.records):
+                break
+            time.sleep(0.02)
+    assert any("SNS 작업 예외 (sns-boom)" in r.getMessage() for r in caplog.records)
+
+
+def test_sns_judge_card_edit_is_immediate_launch_is_spawned(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(bridge, "_sns_spawn", lambda name, fn, *a: spawned.append((name, fn, a)))
+    monkeypatch.setattr(bridge, "launch_judge", lambda: pytest.fail("워커에서 직접 실행"))
+    a = FakeAdapter()
+    _fire(a, _judge())
+    assert a.edited == [(_SNS_CH, 500, f"{_CARD}\n🖥️ 판정 중", None)]  # 버튼 응답은 즉시
+    [(name, fn, _args)] = spawned
+    assert name == "sns-judge" and fn is bridge._launch_judge_for_card
+
+
+def test_sns_clean_confirm_is_spawned(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(bridge, "_sns_spawn", lambda name, fn, *a: spawned.append((name, fn, a)))
+    a = FakeAdapter()
+    _fire(a, _btn(777, "clean:ok", channel_id=_SNS_CH, channel_role="SNS정보"))
+    assert [(n, f) for n, f, _a in spawned] == [("sns-clean", bridge._clean_sns_locked)]
+    assert a.cleared == []  # 워커는 바로 돌아온다
+    assert (
+        bridge._sns_clean_lock.locked()
+    )  # 클릭 때 잡고 스레드가 푼다 — 여기선 스레드가 없으니 푼다
+    bridge._sns_clean_lock.release()
+
+
+def test_sns_concurrent_collects_do_not_double_save(sns):
+    # 정오 러너와 ㅁ청소 수집이 겹쳐도 같은 게시물을 `_2` 로 두 번 저장하지 않는다(락이 전체를 덮음)
+    _adapter, root = sns
+    msg = _sns_msg("https://x.com/a/status/42", _NOON)
+
+    class _Slow(FakeAdapter):
+        def history_after(self, *_a):
+            time.sleep(0.2)  # 두 수집이 같은 시작점에서 읽도록 겹치게 만든다
+            return [msg]
+
+    a = _Slow(roles={"SNS정보": _SNS_CH})
+    threads = [
+        threading.Thread(target=bridge._collect_sns, args=(a, _SNS_CH, None)) for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert [p.name for p in (root / "미판정").iterdir()] == ["20261010_x_42.md"]  # `_2` 없음
+
+
+def test_sns_stale_pending_cards_restored_by_noon_runner(sns):
+    adapter, _root = sns
+    now = time.time()
+    old_id = _sf(datetime.now(_KST) - timedelta(days=3))
+    fresh_id = _sf(datetime.now(_KST) - timedelta(hours=1))
+    bridge._set_pending_cards(
+        {str(old_id): f"{_CARD}\n🖥️ 판정 중", str(fresh_id): "새 카드\n🖥️ 판정 중"},
+        {str(old_id): now - 25 * 3600, str(fresh_id): now - 3600},
+    )
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert adapter.edited == [(_SNS_CH, old_id, _CARD, [bridge.SNS_JUDGE_BUTTON])]  # 원래 본문
+    assert list(_state()["pending_cards"]) == [str(fresh_id)]
+    assert list(_state()["pending_since"]) == [str(fresh_id)]
+
+
+def test_sns_stale_legacy_pending_without_since_uses_card_time(sns):
+    # 옛 상태(누른 시각 기록 없음) — 카드가 올라온 시각(snowflake)으로 판단한다
+    adapter, _root = sns
+    old_id = _sf(datetime.now(_KST) - timedelta(days=2))
+    bridge._sns_update(pending_cards={str(old_id): "옛 카드\n🖥️ 판정 중"})
+    bridge.run_sns_inbox(adapter, _SNS_CH, "2026-10-10")
+    assert adapter.edited == [(_SNS_CH, old_id, "옛 카드", [bridge.SNS_JUDGE_BUTTON])]
+    assert "pending_cards" not in _state()
+
+
+def test_sns_judge_press_records_since_and_restored_card_can_be_pressed_again(sns, monkeypatch):
+    adapter, _root = sns
+    monkeypatch.setattr(bridge, "launch_judge", lambda: True)
+    _fire(adapter, _judge(card_id=500))
+    assert set(_state()["pending_since"]) == {"500"}
+    since = _state()["pending_since"]["500"]
+    bridge._restore_stale_cards(adapter, _SNS_CH, now=since + 24 * 3600 + 1)
+    assert "pending_cards" not in _state()
+    _fire(adapter, _judge(card_id=500))  # 다시 누를 수 있다
+    assert "500" in _state()["pending_cards"]
+
+
+def test_judge_card_raw_urls_do_not_autolink():
+    _a, [card] = _done_with_items([dict(_TERSE, 사유="원문 https://evil.example/x · HTTP://b.c")])
+    assert "https:\u200b//evil.example/x" in card and "HTTP:\u200b//b.c" in card
+    assert "https://" not in card and "HTTP://" not in card
+
+
+def test_button_event_text_is_read_only_by_sns_judge(monkeypatch):
+    # 계약: 버튼 Event.text(누른 카드 본문)는 SNS 판정 처리만 읽는다 — 다른 버튼 경로로 새지 않는다
+    sentinel = "카드본문_SENTINEL_⚠️"
+    monkeypatch.setattr(bridge, "do_push", lambda _root: "push 결과")
+    monkeypatch.setattr(bridge, "resolve_project", lambda name, _t: name)
+    for action, arg in (("push", ""), ("x", ""), ("clean:ok", ""), ("p", "proj"), ("c", "1:0")):
+        a = FakeAdapter()
+        ev = dataclasses.replace(_btn(777, action, arg, channel_id=321), text=sentinel)
+        _fire(a, ev)
+        out = [t for _c, t, _b in a.sent] + [t for _c, _m, t, _b in a.edited]
+        assert all(sentinel not in t for t in out), action
+
+
+def test_judge_done_count_mismatch_warns_once(caplog):
+    bridge._sns_update(pending_cards={"500": "x\n🖥️ 판정 중"})
+    _write_done({"사용": 5, "폐기": 0, "시각": "t", "항목": [_TERSE]})
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        bridge.check_sns_judge_done(FakeAdapter(roles={"SNS정보": _SNS_CH}))
+    warns = [r.getMessage() for r in caplog.records if "≠ 항목" in r.getMessage()]
+    assert warns == ["완료 신호 숫자(사용=5 폐기=0) ≠ 항목(사용=0 폐기=1) — 카드는 항목 기준"]
+
+
+def test_judge_done_count_match_or_no_items_no_warning(caplog):
+    for payload in (
+        {"사용": 0, "폐기": 1, "시각": "t", "항목": [_TERSE]},
+        {"사용": 3, "폐기": 2, "시각": "t"},  # 항목 없음 — 대조하지 않는다
+    ):
+        _write_done(payload)
+        with caplog.at_level(logging.WARNING, logger="bridge"):
+            bridge.check_sns_judge_done(FakeAdapter(roles={"SNS정보": _SNS_CH}))
+    assert not any("≠ 항목" in r.getMessage() for r in caplog.records)
+
+
+# ── debugger 재검증 반영(2026-10-10) ──
+class _Channel(FakeAdapter):
+    """채널 모형 — 올린 메시지가 history 에 쌓이고, 봇이 보낸 카드도 메시지로 남는다."""
+
+    def __init__(self):
+        super().__init__(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+        self.history = []
+        self.links = []  # 허용 사용자가 올린 인스타/X 링크 메시지(불변식 대상)
+        self._seq = 0
+
+    def post(self, text, *, user=777, mid=None):
+        self._seq += 1
+        mid = mid if mid is not None else bridge.snowflake_now() + self._seq
+        ev = Event(
+            kind="text",
+            channel_id=_SNS_CH,
+            user_id=user,
+            text=text,
+            message_id=mid,
+            channel_role="SNS정보",
+        )
+        self.history.append(ev)
+        if "://" in text:  # 링크가 든 메시지 전부(작성자·플랫폼 불문) — 불변식 대상
+            self.links.append(ev)
+        return mid
+
+    def send(self, channel_id, text, buttons=None):
+        rid = super().send(channel_id, text, buttons)
+        if channel_id == _SNS_CH:
+            self.post(text, user=_BOT)  # 봇 카드도 채널 메시지다(다음 청소의 범위에 든다)
+        return rid
+
+
+def _assert_no_uncollected_link_deleted(ch, root):
+    """불변식: 지워진 메시지의 링크는 전부 수집함에 있다(결정 A — 미저장 링크 메시지는 남는다)."""
+    present = {ev.message_id for ev in ch.history}
+    saved = sns_inbox.known_sources(root)
+    for ev in ch.links:
+        if ev.message_id not in present:
+            assert not sns_inbox.has_unsaved_link(ev.text, saved), ev.text
+
+
+@pytest.mark.parametrize("scenario", ["state_loss", "legacy", "cap", "double"])
+def test_sns_clean_never_deletes_uncollected_links(sns, monkeypatch, scenario):
+    _adapter, root = sns
+    ch = _Channel()
+    old = ch.post("https://x.com/a/status/900", mid=_sf(_NOON - timedelta(days=5)))  # 시작점 전
+    assert old < _state()["last_message_id"]
+    if scenario == "state_loss":
+        ch.post("https://x.com/a/status/901")
+        bridge.SNS_STATE_FILE.unlink()  # 브리지가 멈춘 사이 상태 파일 유실 → 재기동
+        bridge.sns_init_state()
+        ch.post("https://www.instagram.com/p/AfterLoss/")
+    elif scenario == "legacy":
+        bridge.SNS_STATE_FILE.write_text(  # 옛 형식 — baseline 없음
+            json.dumps({"last_message_id": _sf(_NOON - timedelta(days=1))}), encoding="utf-8"
+        )
+        ch.post("https://x.com/a/status/902")
+    elif scenario == "cap":
+        monkeypatch.setattr(bridge, "SNS_HISTORY_MAX", 2)
+        for i in range(5):
+            ch.post(f"https://x.com/a/status/91{i}")
+    for _ in range(2):  # 두 번 청소(사이에 새 공유)
+        ch.post("ㅁ청소")
+        _fire(ch, _clean_ok())
+        _assert_no_uncollected_link_deleted(ch, root)
+        ch.post("https://x.com/a/status/999" if scenario == "double" else "메모")
+    assert any(ev.message_id == old for ev in ch.history)  # 시작점 앞 옛 링크는 끝까지 남는다
+
+
+def test_sns_clean_double_press_real_threads_runs_once(sns, monkeypatch):
+    _adapter, _root = sns
+    monkeypatch.setattr(bridge, "_sns_spawn", ORIG_SNS_SPAWN)
+
+    class _SlowCh(_Channel):
+        def history_after(self, channel_id, message_id, limit):
+            time.sleep(0.3)  # 첫 청소가 도는 사이 두 번째 누름이 오게
+            return super().history_after(channel_id, message_id, limit)
+
+    ch = _SlowCh()
+    ch.post("https://x.com/a/status/950")
+    _fire(ch, _clean_ok())
+    _fire(ch, _clean_ok())  # 연타 — 무시돼야 한다
+    for _ in range(200):
+        if not bridge._sns_clean_lock.locked():
+            break
+        time.sleep(0.02)
+    assert not bridge._sns_clean_lock.locked()
+    assert len(ch.cleared) == 1  # 청소는 한 번만 — 첫 청소의 저장 카드가 지워지지 않는다
+    assert any(ev.user_id == _BOT and ev.text.startswith("📥") for ev in ch.history)
+
+
+def test_sns_judge_card_edit_happens_inside_lock(monkeypatch):
+    monkeypatch.setattr(bridge, "launch_judge", lambda: True)
+    held = []
+
+    class _A(FakeAdapter):
+        def edit(self, channel_id, message_id, text, buttons=None):
+            got = []
+            t = threading.Thread(
+                target=lambda: got.append(bridge._sns_lock.acquire(blocking=False))
+            )
+            t.start()
+            t.join()
+            if got[0]:
+                bridge._sns_lock.release()
+            held.append(not got[0])  # 다른 스레드가 못 잡으면 = 이 편집은 락 안
+            super().edit(channel_id, message_id, text, buttons)
+
+    _fire(_A(), _judge())
+    assert held[0] is True
+
+
+def test_sns_done_check_skips_when_lock_busy():
+    bridge._sns_update(pending_cards={"500": "x\n🖥️ 판정 중"})
+    _write_done({"사용": 0, "폐기": 0, "시각": "t"})
+    started, release = threading.Event(), threading.Event()
+
+    def holder():
+        with bridge._sns_lock:
+            started.set()
+            release.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    started.wait(5)
+    a = FakeAdapter(roles={"SNS정보": _SNS_CH})
+    t0 = time.monotonic()
+    bridge.check_sns_judge_done(a)  # 기다리지 않고 바로 돌아온다
+    assert time.monotonic() - t0 < 1
+    assert a.edited == [] and bridge.SNS_DONE_FILE.exists()  # 다음 틱에 다시 본다
+    release.set()
+    t.join()
+    bridge.check_sns_judge_done(a)
+    assert a.edited == [(_SNS_CH, 500, "x\n🎉 판정완료", None)]
+
+
+def test_sns_clean_press_ignored_while_clean_running(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(bridge, "_sns_spawn", lambda *a: spawned.append(a))
+    assert bridge._sns_clean_lock.acquire(blocking=False)  # 청소가 도는 중
+    try:
+        _fire(FakeAdapter(), _clean_ok())
+    finally:
+        bridge._sns_clean_lock.release()
+    assert spawned == []
+
+
+@pytest.mark.parametrize("bad", ["{깨진", "[1, 2]", b"\xff\xfe"])
+def test_sns_update_does_not_overwrite_unreadable_state(bad):
+    raw = bad if isinstance(bad, bytes) else bad.encode("utf-8")
+    bridge.SNS_STATE_FILE.write_bytes(raw)
+    with pytest.raises(OSError):
+        bridge._sns_update(pending_cards={"1": "x"})
+    assert bridge.SNS_STATE_FILE.read_bytes() == raw  # 덮어쓰지 않았다
+    assert bridge.sns_init_state() is False  # 기동 경로는 죽지 않고, 역시 덮어쓰지 않는다
+    assert bridge.SNS_STATE_FILE.read_bytes() == raw
+
+
+def test_sns_update_missing_file_starts_empty():
+    bridge._sns_update(last_message_id=5)
+    assert _state() == {"last_message_id": 5}
+
+
+def test_sns_collect_with_unreadable_state_does_not_clean(sns):
+    _adapter, _root = sns
+    bridge.SNS_STATE_FILE.write_text("{깨진", encoding="utf-8")
+    ch = _Channel()
+    ch.post("https://x.com/a/status/960")
+    _fire(ch, _clean_ok())
+    assert ch.cleared == []  # 시작점을 못 읽으면 지우지 않는다
+    assert bridge.SNS_STATE_FILE.read_text(encoding="utf-8") == "{깨진"
+
+
+@pytest.mark.parametrize("starter", ["sns", "digest"])
+def test_busy_raised_before_thread_start(monkeypatch, starter):
+    seen = {}
+
+    class _T:
+        def __init__(self, target, **_kw):
+            self.target = target
+
+        def start(self):
+            seen["busy_at_start"] = bridge._busy
+            seen["target"] = self.target
+
+    monkeypatch.setattr(bridge.threading, "Thread", _T)
+    monkeypatch.setattr(bridge, "_run_digest", lambda *_a: None)
+    before = bridge._busy
+    if starter == "sns":
+        ORIG_SNS_SPAWN("sns-x", lambda: None)
+    else:
+        bridge._start_digest(FakeAdapter(), 1, "us-digest", "2026-10-10")
+    assert seen["busy_at_start"] == before + 1  # start 전에 이미 바쁨
+    seen["target"]()  # 스레드 본체가 끝나면 내려간다
+    assert bridge._busy == before
+
+
+# ── 결정 A: #SNS정보 청소는 저장 안 된 링크가 든 메시지를 남긴다 ──
+@pytest.mark.parametrize(
+    ("text", "unsaved"),
+    [
+        ("https://x.com/a/status/1", False),  # 저장된 X
+        ("다시 https://x.com/B/status/1/photo/1", False),  # 같은 게시물(키 기준)
+        ("https://www.instagram.com/p/Saved/?igsh=1", False),
+        ("https://youtube.com/watch?v=x", True),  # 대상 밖 링크
+        ("https://www.instagram.com/stories/u/123/", True),  # 스토리
+        ("https://www.threads.net/@u/post/abc", True),
+        ("https://x.com/a/status/2", True),  # 파싱되지만 수집함에 없음
+        ("https://x.com/a/status/1 https://youtu.be/x", True),  # 섞임
+        ("ㅁ청소", False),
+        ("그냥 메모", False),
+        ("📥 SNS 1건 수집함 저장\n➡️ X 1건", False),  # 봇 카드
+        ("원문 https:​//evil.example", False),  # 판정완료 카드의 끊은 URL 은 링크가 아니다
+    ],
+)
+def test_has_unsaved_link(text, unsaved):
+    saved = {("x", "1"), ("insta", "Saved")}
+    assert sns_inbox.has_unsaved_link(text, saved) is unsaved
+
+
+def test_sns_clean_keeps_messages_with_unsaved_links(sns):
+    _adapter, root = sns
+    ch = _Channel()
+    saved_only = ch.post("https://x.com/a/status/970?s=1")
+    youtube = ch.post("https://youtube.com/watch?v=x")
+    stranger = ch.post("https://www.instagram.com/p/Stranger/", user=999)  # 비허용 — 미저장
+    mixed = ch.post("https://x.com/a/status/971 그리고 https://youtu.be/y")
+    story = ch.post("https://www.instagram.com/stories/u/1/")
+    chat = ch.post("그냥 메모")
+    cmd = ch.post("ㅁ청소")
+    bot = ch.post("🧹 수집함에 저장된 메시지를 정리할까요?", user=_BOT)
+    _fire(ch, _clean_ok())
+    left = {ev.message_id for ev in ch.history}
+    assert {youtube, stranger, mixed, story} <= left  # 저장 안 된 링크가 든 메시지는 남는다
+    assert not ({saved_only, chat, cmd, bot} & left)  # 저장된 링크만·명령·잡담·봇 메시지는 지워진다
+    assert sns_inbox.known_sources(root) >= {
+        ("x", "970"),
+        ("x", "971"),
+    }  # 섞인 메시지의 X 는 저장됨
+    _assert_no_uncollected_link_deleted(ch, root)
+
+
+def test_sns_clean_keep_reads_inbox_after_collect(sns):
+    # keep 판정은 **이번 수집 뒤** 의 수집함 기준 — 방금 저장한 링크의 메시지는 지워진다
+    _adapter, _root = sns
+    ch = _Channel()
+    mid = ch.post("https://www.instagram.com/reel/JustNow/")
+    _fire(ch, _clean_ok())
+    assert mid not in {ev.message_id for ev in ch.history}
+
+
+def test_sns_clean_confirm_text_and_three_buttons():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ청소", channel_id=_SNS_CH, channel_role="SNS정보"))
+    _fire(a, _txt(777, "ㅁ청소", channel_id=321))
+    (_c1, sns_text, sns_btns), (_c2, other_text, other_btns) = a.sent
+    assert sns_text == "🧹 메시지를 청소할까요?"  # 개발자 확정 문구 그대로(한 줄)
+    assert sns_btns == [
+        Button("🔗 링크청소", "clean:link", style="primary"),
+        Button("🧹 전체청소", "clean:all", style="danger"),
+        Button("✖ 취소", "clean:x", style="secondary"),
+    ]
+    assert other_text == "🧹 메시지를 청소할까요?"  # 다른 채널 — 한 줄, 버튼 2개
+    assert other_btns == [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "clean:x", "")]
+
+
+def test_clean_action_codec_roundtrip():
+    for action in ("clean:link", "clean:all", "clean:x"):
+        assert parse_callback(action) == (action, "")
+        assert encode_callback(action, "") == action
+
+
+def _clean_btn(action):
+    return _btn(777, action, channel_id=_SNS_CH, channel_role="SNS정보")
+
+
+def test_sns_link_clean_is_existing_behavior_and_old_ok_maps_to_it(sns):
+    for action in ("clean:link", "clean:ok"):  # 이미 떠 있던 옛 확인의 clean:ok = 링크청소
+        _adapter, _root = sns
+        ch = _Channel()
+        yt = ch.post("https://youtube.com/watch?v=k")
+        saved = ch.post(f"https://x.com/a/status/{len(action)}80")
+        _fire(ch, _clean_btn(action))
+        left = {ev.message_id for ev in ch.history}
+        assert yt in left and saved not in left, action  # 범위+keep
+        assert ch.clear_bounds[0][0] is not None and ch.clear_keeps[0] is not None
+
+
+def test_sns_full_clean_collects_first_then_clears_everything(sns):
+    _adapter, root = sns
+    ch = _OrderAdapter(roles={"SNS정보": _SNS_CH, "봇상태": 55})
+    old = Event(
+        kind="text",
+        channel_id=_SNS_CH,
+        user_id=777,
+        text="https://youtube.com/watch?v=old",
+        message_id=_sf(_NOON - timedelta(days=9)),
+        channel_role="SNS정보",
+    )
+    ch.history = [old, _sns_msg("https://x.com/a/status/990", _NOON)]
+    _fire(ch, _clean_btn("clean:all"))
+    assert ch.order == ["history", "clear", ("send", _SNS_CH)]  # 수집 → 전체 삭제 → 저장 카드
+    assert ch.clear_bounds == [(None, None)] and ch.clear_keeps == [None]  # 범위·keep 없음
+    assert ch.history == []  # 저장 대상 아닌 링크·시작점 앞 메시지도 지워진다(개발자 선택)
+    assert [p.name for p in (root / "미판정").iterdir()] == ["20261010_x_990.md"]
+
+
+@pytest.mark.parametrize("failure", ["folder", "history", "cap", "init"])
+def test_sns_full_clean_does_not_delete_when_collect_fails(sns, monkeypatch, tmp_path, failure):
+    _adapter, _root = sns
+    ch = _Channel()
+    ch.post("https://x.com/a/status/991")
+    ch.post("https://x.com/a/status/992")
+    if failure == "folder":
+        monkeypatch.setattr(bridge, "SNS_INBOX_DIR", tmp_path / "없음")
+    elif failure == "history":
+        monkeypatch.setattr(ch, "history_after", lambda *_a: None)
+    elif failure == "cap":
+        monkeypatch.setattr(bridge, "SNS_HISTORY_MAX", 1)
+    else:
+        bridge.SNS_STATE_FILE.unlink()
+    _fire(ch, _clean_btn("clean:all"))
+    assert ch.cleared == []
+
+
+def test_clean_cancel_deletes_confirm_message_silently():
+    for role, cid in (("SNS정보", _SNS_CH), (None, 321)):
+        a = FakeAdapter()
+        _fire(a, _btn(777, "clean:x", message_id=4242, channel_id=cid, channel_role=role))
+        assert a.deleted == [(cid, 4242)]
+        assert a.sent == [] and a.edited == []  # 답장·편집 없음
+
+
+def test_push_cancel_still_says_cancelled():
+    a = FakeAdapter()
+    _fire(a, _btn(777, "x", message_id=55, channel_id=321))
+    assert a.edited == [(321, 55, "취소했습니다", None)] and not a.deleted
+
+
+def test_playlist_bypass_allows_clean_cancel():
+    ev = _btn(999, "clean:x", channel_role="playlist")
+    assert bridge._playlist_bypass(ev) is True
+
+
+# ── 청소·이벤트 처리 중 «바쁨»(자동 재시작이 진행 중인 purge 를 끊지 않게 — 2026-10-10 실측) ──
+class _BusySpy(FakeAdapter):
+    """clear_channel·send 가 불릴 때 «한가함» 판정을 기록한다."""
+
+    def __init__(self, fail=False):
+        super().__init__()
+        self.idle_seen = []
+        self._fail = fail
+
+    def clear_channel(self, channel_id, **kw):
+        self.idle_seen.append(("clear", bridge.is_idle(self)))
+        if self._fail:
+            raise RuntimeError("purge 실패")
+        return super().clear_channel(channel_id, **kw)
+
+    def send(self, channel_id, text, buttons=None):
+        self.idle_seen.append(("send", bridge.is_idle(self)))
+        return super().send(channel_id, text, buttons)
+
+
+def test_other_channel_clean_is_busy_and_restores(monkeypatch):
+    monkeypatch.setattr(bridge, "_sns_spawn", ORIG_SNS_SPAWN)  # 진짜 스레드
+    a = _BusySpy()
+    before = bridge._busy
+    _fire(a, _btn(777, "clean:ok", channel_id=321))
+    for _ in range(200):
+        if a.cleared and bridge._busy == before:
+            break
+        time.sleep(0.01)
+    assert a.idle_seen == [("clear", False)]  # 삭제 도중엔 «한가함» 이 아니다 → 재시작이 기다린다
+    assert bridge._busy == before and bridge.is_idle(a)  # 끝나면 원복
+    assert not bridge._channel_clean_lock(321).locked()
+
+
+def test_other_channel_clean_restores_busy_and_lock_on_exception(monkeypatch):
+    monkeypatch.setattr(bridge, "_sns_spawn", ORIG_SNS_SPAWN)
+    a = _BusySpy(fail=True)
+    before = bridge._busy
+    _fire(a, _btn(777, "clean:ok", channel_id=322))
+    for _ in range(200):
+        if a.idle_seen and bridge._busy == before:
+            break
+        time.sleep(0.01)
+    assert a.idle_seen == [("clear", False)]
+    assert bridge._busy == before  # 예외여도 원복
+    assert not bridge._channel_clean_lock(322).locked()  # 락도 풀려 다시 누를 수 있다
+
+
+def test_other_channel_clean_double_press_ignored_per_channel(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(bridge, "_sns_spawn", lambda _name, _fn, *a: spawned.append(a))
+    a = FakeAdapter()
+    _fire(a, _btn(777, "clean:ok", channel_id=401))
+    _fire(a, _btn(777, "clean:ok", channel_id=401))  # 연타 — 무시
+    _fire(a, _btn(777, "clean:ok", channel_id=402))  # 다른 채널은 따로
+    assert [args[1] for args in spawned] == [401, 402]
+    for cid in (401, 402):
+        bridge._channel_clean_lock(cid).release()
+
+
+def test_handle_event_marks_busy_during_handling():
+    # 워커가 디스코드 호출을 기다리는 동안(예: ㅁ청소 확인 발송) 재시작 판정이 «한가함» 이 아니다
+    a = _BusySpy()
+    before = bridge._busy
+    _fire(a, _txt(777, "ㅁ청소", channel_id=321))
+    assert a.idle_seen == [("send", False)]
+    assert bridge._busy == before
+
+
+def test_handle_event_restores_busy_on_exception(monkeypatch):
+    def boom(*_a, **_kw):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(bridge, "_dispatch_event", boom)
+    before = bridge._busy
+    with pytest.raises(RuntimeError):
+        _fire(FakeAdapter(), _txt(777, "아무거나"))
+    assert bridge._busy == before

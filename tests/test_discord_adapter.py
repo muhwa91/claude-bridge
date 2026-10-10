@@ -311,6 +311,47 @@ def test_on_interaction_playlist_channel_lets_unauth_through():
     assert a2._queue.qsize() == 0
 
 
+def test_on_interaction_sns_judge_carries_card_text_and_role():
+    # 코어가 카드를 «판정 중» 으로 고치려면 누른 카드의 본문이 필요하다(Event.text).
+    a = _adapter()
+    a._channel_map = {300: ("role", "SNS정보")}
+    inter = _interaction(777, "sns_judge", channel_id=300, msg_id=77)
+    inter.message = SimpleNamespace(id=77, content="📥 SNS 1건 수집함 저장")
+    asyncio.run(a._on_interaction(inter))
+    ev = a._queue.get_nowait()
+    assert (ev.action, ev.action_arg, ev.message_id) == ("sns_judge", "", 77)
+    assert ev.text == "📥 SNS 1건 수집함 저장" and ev.channel_role == "SNS정보"
+
+
+def test_history_after_reads_oldest_first_after_id_and_normalizes():
+    a = _adapter()
+    a._channel_map = {300: ("role", "SNS정보")}
+    seen = {}
+
+    async def history(**kw):
+        seen.update(kw)
+        for m in (
+            _msg(777, "https://x.com/a/status/1", channel_id=300, msg_id=11),
+            _msg(1, "봇 카드", channel_id=300, msg_id=12),
+        ):
+            yield m
+
+    channel = SimpleNamespace(history=history)
+    a._client = SimpleNamespace(get_channel=lambda _cid: channel)  # type: ignore[assignment]
+    events = asyncio.run(a._history_coro(300, 10, 1000))
+    # 상한을 discord.py 에 그대로 넘긴다(무제한 limit=None 금지 — 폭주 대비)
+    assert seen["after"].id == 10 and seen["oldest_first"] is True and seen["limit"] == 1000
+    assert [(e.message_id, e.user_id, e.channel_role) for e in events] == [
+        (11, 777, "SNS정보"),
+        (12, 1, "SNS정보"),  # 작성자 필터는 코어 몫 — 어댑터는 그대로 돌려준다
+    ]
+
+
+def test_history_after_failure_is_none():
+    a = _adapter()  # 루프 미준비 → _run 이 None
+    assert a.history_after(300, 10, 1000) is None
+
+
 def test_on_interaction_unknown_custom_id_becomes_empty_action():
     a = _adapter()
     asyncio.run(a._on_interaction(_interaction(777, "bogus")))
@@ -619,9 +660,9 @@ def test_setup_channels_stores_names():
 # ---------------------------------------------------------------------------
 def test_clear_channel_delegates_to_run_and_defaults_zero():
     a = _adapter()
-    a._run = lambda coro: (coro.close(), 7)[1]  # type: ignore[assignment]  # 코루틴 닫고 카운트
+    a._run = lambda coro, **_kw: (coro.close(), 7)[1]  # type: ignore[assignment]  # 닫고 카운트
     assert a.clear_channel(100) == 7
-    a._run = lambda coro: (coro.close(), None)[1]  # type: ignore[assignment]  # 루프 미준비 폴백
+    a._run = lambda coro, **_kw: (coro.close(), None)[1]  # type: ignore[assignment]  # 미준비 폴백
     assert a.clear_channel(100) == 0
 
 
@@ -638,6 +679,92 @@ def test_purge_coro_loops_until_exhausted():
     a._client.get_channel = lambda _cid: _Ch()  # type: ignore[assignment]
     assert asyncio.run(a._purge_coro(100)) == 130
     assert len(calls) == 2 and calls[0] == (100, True)
+
+
+def test_purge_coro_bounded_range_after_and_upto_inclusive():
+    # #SNS정보 청소 = 수집기가 본 범위만: (after_id, upto_id] → purge(after=, before=upto_id+1)
+    a = _adapter()
+    seen = []
+
+    class _Ch:
+        async def purge(self, **kw):
+            seen.append(kw)
+            return [object()] * 3
+
+    a._client.get_channel = lambda _cid: _Ch()  # type: ignore[assignment]
+    assert asyncio.run(a._purge_coro(100, after_id=10, upto_id=20)) == 3
+    [kw] = seen
+    assert kw["after"].id == 10 and kw["before"].id == 21 and kw["limit"] == 100
+    seen.clear()
+    asyncio.run(a._purge_coro(100))  # 경계 없음 = 종전(전체) — before/after 를 넘기지 않는다
+    assert "after" not in seen[0] and "before" not in seen[0]
+
+
+def test_purge_coro_keep_uses_check_and_scans_whole_range():
+    # keep 이 있으면 purge(check=) 한 번 — limit 는 «훑은 수» 라 None(범위로 유계), 반복하지 않는다
+    a = _adapter()
+    seen = []
+    msgs = [
+        SimpleNamespace(content="https://youtu.be/x", author=SimpleNamespace(id=1)),
+        SimpleNamespace(content="메모", author=SimpleNamespace(id=1)),
+        SimpleNamespace(content=None, author=SimpleNamespace(id=2)),
+    ]
+
+    class _Ch:
+        async def purge(self, **kw):
+            seen.append(kw)
+            return [m for m in msgs if kw["check"](m)]
+
+    a._client.get_channel = lambda _cid: _Ch()  # type: ignore[assignment]
+    kept = []
+
+    def keep(text, author):
+        kept.append((text, author))
+        return "://" in text
+
+    assert asyncio.run(a._purge_coro(100, after_id=1, upto_id=9, keep=keep)) == 2
+    [kw] = seen
+    assert kw["limit"] is None and kw["bulk"] is True
+    assert kw["after"].id == 1 and kw["before"].id == 10
+    assert kept == [("https://youtu.be/x", 1), ("메모", 1), ("", 2)]  # 본문 없음 = ""
+
+
+def test_delete_message_deletes_partial_message_and_swallows_failure():
+    a = _adapter()
+    seen = []
+
+    class _Msg:
+        async def delete(self):
+            seen.append("deleted")
+
+    class _Ch:
+        def get_partial_message(self, mid):
+            seen.append(mid)
+            return _Msg()
+
+    a._client.get_channel = lambda _cid: _Ch()  # type: ignore[assignment]
+    asyncio.run(a._delete_message_coro(1, 77))
+    assert seen == [77, "deleted"]
+    a._run = lambda coro, **_kw: (coro.close(), None)[1]  # type: ignore[assignment]
+    assert a.delete_message(1, 77) is None  # 실패·미준비는 로그만(계약)
+
+
+def test_clear_channel_passes_bounds_to_purge():
+    a = _adapter()
+    got = {}
+
+    async def fake_purge(channel_id, **kw):
+        got.update(kw, channel_id=channel_id)
+        return 0
+
+    a._purge_coro = fake_purge  # type: ignore[assignment]
+    timeouts = []
+    a._run = lambda coro, timeout=None: (timeouts.append(timeout), asyncio.run(coro))[1]  # type: ignore[assignment]
+    a.clear_channel(5, after_id=1, upto_id=9)
+    assert got == {"channel_id": 5, "after_id": 1, "upto_id": 9, "keep": None}
+    # 14일 넘은 메시지 개별 삭제가 수 분 걸릴 수 있다 — 청소 전용 긴 타임아웃(바쁨 먼저 안 풀리게)
+    assert timeouts == [discord_adapter._PURGE_TIMEOUT]
+    assert discord_adapter._PURGE_TIMEOUT >= 600
 
 
 def test_purge_coro_partial_failure_returns_deleted_count():
@@ -1297,6 +1424,13 @@ def test_client_blocks_all_mentions():
     assert (am.everyone, am.users, am.roles, am.replied_user) == (False, False, False, False)
 
 
+def test_send_kwargs_never_reenable_mentions():
+    # SNS 판정완료 카드처럼 외부 유래 문자열(@everyone·<@id>·<@&role>)이 실린 본문도 전송 kwargs 가
+    # allowed_mentions 를 덮지 않아 클라이언트 전역 none 이 그대로 적용된다.
+    for payload in ("@everyone <@123> <@&456> @here", discord.Embed(description="@everyone")):
+        assert "allowed_mentions" not in discord_adapter._send_kwargs(payload, None)
+
+
 def test_find_title_folds_spaces_and_case():
     # 큐 매칭 = 공백접기+casefold(adapter.fold_title) 부분 포함. ⚠️ 정규화만 remove_video 와
     # 공유하고 선택 규칙은 다르다(삭제=정확일치 우선, 재생=부분 첫 곡 — 계약 §1 동결분).
@@ -1754,7 +1888,9 @@ def test_scheduler_special_role_channels():
         ("마이크론", "role", "미국주식"),
         # `개발자료` 는 2026-08-15 제거 — 이 단언이 **되살아나는 것을 막는 자물쇠**다
         # (목록에 다시 들어가면 재기동이 채널을 자동생성한다).
+        ("SNS정보", "role", "SNS정보"),  # 사람이 링크를 공유 — 읽기전용 아님(아래 단언)
     ]
+    assert "SNS정보" not in discord_adapter._READONLY_TAGS
     # ⚠️ 이 순서는 **최초 생성 순서**만 정한다(새 채널은 카테고리 맨 아래에 붙는다).
     # **이미 있는 채널의 position 은 코드가 안 건드린다** — 목록을 재배열해도 라이브는 안 움직인다.
     # `edit(position=…)` 은 `_reorder_projects`(프로젝트)·`_order_categories`(카테고리)뿐이다.

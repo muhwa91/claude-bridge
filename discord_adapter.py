@@ -11,8 +11,6 @@ import 하므로 discord.py 미설치 환경에서도 순수 함수 경로(단�
 (계약: 본체 stdlib 전용).
 
 보안 경계(§2.4):
-- fetch_file 은 디스코드 CDN 도메인 화이트리스트(cdn.discordapp.com/media.discordapp.net)·확장자·
-  10MB·경로 트래버설 차단(basename 만)을 적용.
 - custom_id 는 신뢰 경계 밖 — parse_callback 정확 매칭만(임의 실행 금지).
 - 봇 토큰은 어댑터 인스턴스에만 보관, 전송 직전 mask_secrets 로 방어심층 마스킹.
 """
@@ -28,8 +26,6 @@ import random
 import re
 import threading
 import time
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Coroutine, Iterator
 from datetime import datetime
 from pathlib import Path
@@ -39,32 +35,20 @@ import discord  # 유일한 discord.py import 지점.
 import imageio_ffmpeg  # 번들 ffmpeg 실행파일 경로(FFmpegPCMAudio executable).
 import yt_dlp  # 재생목록·스트림 URL 추출(플랫폼 격리 — 이 파일에만).
 
-# 콜백 코덱(parse_callback/encode_callback)·청킹·다운로드 가드는 플랫폼 무관 정본(§1.3·§2.4)이라
-# 공유 base(adapter)에서 재사용한다 — adapter 는 stdlib 전용이라 여기서 import 해도 추가 런타임
-# 의존이 생기지 않는다(순수 문자열/상수 재사용, 보안 로직 단일 소스 유지).
+# 콜백 코덱(parse_callback)·청킹은 플랫폼 무관 정본(§1.3)이라 공유 base(adapter)에서 재사용한다 —
+# adapter 는 stdlib 전용이라 여기서 import 해도 추가 런타임 의존이 생기지 않는다.
 from adapter import (
-    _NOREDIRECT_OPENER,
-    MAX_PHOTO_BYTES,
-    PHOTO_EXTS,
     Button,
     Event,
     chunk_text,
-    encode_callback,
     fold_title,
     mask_secrets,
     parse_callback,
 )
 
-# 코어 회신 헤더 상수(§4.1 색 판정 단일 소스) + 프로젝트 한글 라벨(채널명 표시용). 어댑터→코어
-# 방향 import 지만 discord.py 를 코어로 끌어들이지 않는다(bridge 는 stdlib 전용·discord_adapter 를
-# top-level import 안 함 — 순환 없음). PROJECT_LABELS 는 채널 표시명, channel_map 값은 폴더명 원문.
+# 코어의 순수 문구 함수. 어댑터→코어 방향 import 지만 discord.py 를 코어로 끌어들이지 않는다
+# (bridge 는 stdlib 전용·discord_adapter 를 top-level import 안 함 — 순환 없음).
 from bridge import (
-    HEADER_CHOICE,
-    HEADER_DONE,
-    HEADER_FAIL,
-    HEADER_NOTE,
-    PROJECT_LABELS,
-    STATUS_LEADERS,
     display_title,
     escape_reply,
     notice_stamp,
@@ -85,8 +69,6 @@ _HISTORY_TIMEOUT = 120  # 채널 히스토리(여러 페이지 왕복)는 REST 1
 # 채널 청소(purge) — 14일 넘은 메시지는 1건씩 DELETE 라 rate limit 대기까지 수 분이 걸린다.
 # 이보다 짧으면 코어가 먼저 «끝» 으로 보고 «바쁨» 을 풀어, 자동 재시작이 진행 중인 삭제를 끊는다.
 _PURGE_TIMEOUT = 600
-# fetch_file 다운로드 도메인 고정(§2.4 — 임의 URL 다운로드=SSRF 차단).
-_DISCORD_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 # ffmpeg stderr 수집 파일(코어 LOG_DIR 과 같은 자리·같은 규칙 — `logs/*.log` 는 gitignore).
 # 코어 상수를 import 하지 않는다: bridge 를 import 하면 순환이 된다(bridge → discord_adapter).
 FFMPEG_LOG_FILE = Path(__file__).resolve().parent / "logs" / "ffmpeg.log"
@@ -113,39 +95,27 @@ def reconnect_notice_texts(since: float, now: float) -> list[str]:
     ]
 
 
-# ── 상태색 매핑(§4.1 — 어댑터가 text 헤더로 판정, 계약 무변경) ──────────────────
-# ⚠️ 동기화 주의(§4 주의점 1): 색 판정은 코어(bridge)의 회신/진행 헤더에 묶여 있다.
-#   · 완료/실패/확인 3종은 위 HEADER_* import 로 문자열을 자동 추종(헤더 텍스트가 바뀌어도 무영향).
-#   · 진행 선두 이모지도 코어 STATUS_LEADERS import(단일 소스) — 코어 변경 자동 추종.
-_COLOR_DONE = 0x3ECF85  # 초록 — 처리완료
-_COLOR_FAIL = 0xF0565B  # 빨강 — 처리실패
-_COLOR_INFO = 0x5865F2  # 블러플 — 추가 확인사항 / push 승인 대기
-_COLOR_WAIT = 0xEEBB4D  # 노랑 — 진행 중
-_EMBED_TITLE_LIMIT = 256  # discord Embed title 한도
-_EMBED_DESC_LIMIT = 4096  # discord Embed description 한도(§4.1 — 초과분은 후속 plain 청크)
-
 # ── ①(채널 자동생성 §4.4) — 서버 구조 ───────────────────────────────────────
-# 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag). 프로젝트 카테고리는 setup 시
-# 폴더명으로 채운다. 텍스트 채널명 = 라벨의 공백·하이픈 제거 붙여쓰기(디스코드 ASCII 소문자화).
+# 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag).
+# 텍스트 채널명 = 라벨의 공백·하이픈 제거 붙여쓰기(디스코드 ASCII 소문자화).
+# 프로젝트(`_Project/*`)마다 채널을 만들던 동기화는 폐지했다 — 새 프로젝트가 생겨도 채널을 만들지
+# 않는다. 옛 프로젝트 채널은 서버에 남아 있어도 코어가 무시한다(channel_map 의 kind="project").
 # 재사용=channelID(맵) 1차·_canon 2차, 리네임 판단=**정확 이름 비교**(_canon collapse 함정 회피).
 # 봇 서버 닉네임(on_ready 마다 멱등 고정 — 강퇴/재초대 시 수동 닉이 풀려서). 여기만 바꾸면 끝.
 _BOT_NICKNAME = "치이카와 봇"
 # 카테고리 표시명(이모지·공백·대문자 자유). 기존 카테고리는 코어명(_cat_core: 이모지·기호·공백 제거)
 # 으로 탐색 후 이모지형으로 rename(중복 생성 방지·멱등). 음성 카테고리는 이전 이름 '음성'도 별칭.
-_CAT_PROJECT = "📁 프로젝트"
 _CAT_SCHED = "🗓️ 스케쥴러"
 _CAT_SYSTEM = "⚙️ 시스템"
 _CAT_VOICE = "🎵 PlayList"
-# 위치 순서(0..3): 프로젝트 아래 스케쥴러, 시스템 아래 PlayList.
+# 위치 순서(0..2): 스케쥴러 아래 시스템, 시스템 아래 PlayList.
 _CAT_ORDER = [
-    _CAT_PROJECT,
     _CAT_SCHED,
     _CAT_SYSTEM,
     _CAT_VOICE,
 ]
 # 카테고리별 코어 별칭(기존 탐색) — 대부분 코어명 1개, 음성은 이전 이름 '음성' 포함.
 _CAT_ALIASES: dict[str, list[str]] = {
-    _CAT_PROJECT: ["프로젝트"],
     _CAT_SCHED: ["스케쥴러"],
     _CAT_SYSTEM: ["시스템"],
     _CAT_VOICE: ["PlayList", "음성"],
@@ -154,8 +124,8 @@ _VOICE_NAME = "PlayList"  # 음성 채널(재생 기능은 후속 — 자리만)
 _DEFAULT_GENERAL = ("일반", "general")  # 디스코드 기본 텍스트/음성 채널명(로컬라이즈 포함)
 # 디스코드 기본 빈 카테고리 — 비어있고 봇이 만든 게 아닐 때만 삭제(#5).
 _DEFAULT_CATEGORIES = ("채팅 채널", "Text Channels", "음성 채널", "Voice Channels")
-# ponytail: 빈이름 targeting 폐기 — 디스코드가 U+3164·U+2800 둘 다 400 거부(라이브 실측). 두 채널
-# (프로젝트 텍스트·PlayList 음성)은 정상 표시명을 갖고 일반 리네임 경로를 탄다.
+# ponytail: 빈이름 targeting 폐기 — 디스코드가 U+3164·U+2800 둘 다 400 거부(라이브 실측). PlayList
+# 음성 채널은 정상 표시명을 갖고 일반 리네임 경로를 탄다.
 _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
     # ⚠️ **표시명과 tag 가 일부러 다르다 — 맞추려고 tag 를 고치지 마라.** 채널 탐색은
     # ①`channel_map.json` 의 `(kind, tag)` → ②이름 canon 순인데, tag 를 바꾸면 1·2차 모두
@@ -167,7 +137,7 @@ _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
         ("마이크론", "role", "미국주식"),
         # ⚠️ `개발자료` 는 제거했다(채널·드라이브 폴더 둘 다 삭제).
         # **순서는 «디스코드 채널 삭제 → 이 목록에서 제거»** 다. 반대로 하면 재기동 한 번에
-        # 고아 채널이 남고, 그 채널에 온 메시지는 미매핑이라 **채널명이 프로젝트명으로 해석된다**.
+        # 고아 채널이 남고, 그 채널은 미매핑(역할 없음)이라 ㅁ명령이 그대로 먹힌다.
         # **이 목록에서 지우는 것이 삭제의 일부다** — 남겨두면 다음 재기동의 채널 자동생성이
         # 조용히 되살린다(지운 사람은 지웠다고 믿는데 이틀 뒤 다시 있다).
         # 사람이 링크를 공유하는 채널 — _READONLY_TAGS 에 넣지 않는다. 실시간 메시지는 코어가
@@ -181,15 +151,6 @@ _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
 # 사람이 글을 못 쓰는 채널(tag 기준 — 표시명 `#마이크론`). **봇이 카드를 밀어넣기만 하고
 # 왕복이 없는 곳만** 넣는다(사용자: "매일 보는 용도로만 사용").
 _READONLY_TAGS = frozenset({"미국주식"})
-# 프로젝트 채널 내부 정본 순서(폴더명). 목록에 없는 프로젝트는 뒤로. h_* 를 맨 위(개발자 확정).
-_PROJECT_ORDER = [
-    "pdf_restyler",
-    "H_security_sheet",
-    "trading_info",
-    "etf_info",
-    "chiikawa_office",
-    "claude_bridge",
-]
 
 
 def _canon(name: str) -> str:
@@ -205,12 +166,6 @@ def _cat_core(name: str) -> str:
 def _desired_name(display: str) -> str:
     """텍스트 채널 저장명(붙여쓰기): 공백·하이픈 제거 + ASCII 소문자화(디스코드 저장형과 일치)."""
     return display.replace(" ", "").replace("-", "").lower()
-
-
-def _project_order(names: list[str]) -> list[str]:
-    """프로젝트 폴더명을 _PROJECT_ORDER 정본 순서로. 목록에 없는 건 뒤(안정 정렬)."""
-    idx = {n: i for i, n in enumerate(_PROJECT_ORDER)}
-    return sorted(names, key=lambda n: idx.get(n, len(_PROJECT_ORDER)))
 
 
 def load_channel_map(path: Path) -> dict[int, tuple[str, str]]:
@@ -247,93 +202,27 @@ def _style(style: str) -> Any:
     }.get(style, discord.ButtonStyle.secondary)
 
 
-def _status_color(text: str) -> int | None:
-    """text 헤더로 상태색 판정(§4.1). 매칭 안 되면 None(=plain 마크다운 경로, 기존 무변경).
-
-    완료/실패/확인 헤더는 접두 일치, 진행은 선두 이모지. 목록·도움말·짧은 회신은 어디에도
-    안 걸려 None → plain(디스코드에서 마크다운 렌더).
-    """
-    for head, col in (
-        (HEADER_DONE, _COLOR_DONE),
-        (HEADER_FAIL, _COLOR_FAIL),
-        (HEADER_NOTE, _COLOR_INFO),
-        (HEADER_CHOICE, _COLOR_INFO),  # 선택 질문 = '입력 대기'(push 승인과 같은 블러플)
-    ):
-        if text.startswith(head):
-            return col
-    if text[:1] in STATUS_LEADERS:
-        return _COLOR_WAIT
-    return None
-
-
-def _build_embed(text: str, color: int) -> tuple[Any, str]:
-    """상태 텍스트 → (discord.Embed, desc 4096 초과 오버플로 str). 헤더=첫 줄, 본문=나머지(§4.1).
-
-    title = 첫 줄에서 대괄호 껍질을 벗긴 상태 요약, desc = 본문. desc 4096 초과분은 반환해
-    호출측이 후속 plain 청크로 흘려보낸다(§2.2 오버플로 재사용). author 라인은 없다(봇 계정명이
-    이미 상단에 뜨므로 중복 — 제거). 3열 필드·footer 소요시간은 범위 밖(주의점10).
-    """
-    first, _, rest = text.partition("\n")
-    title = first.strip().lstrip("[").rstrip("]").strip()
-    body = rest.strip()
-    embed = discord.Embed(
-        color=color,
-        title=title[:_EMBED_TITLE_LIMIT] or None,
-        description=body[:_EMBED_DESC_LIMIT] or None,
-    )
-    return embed, body[_EMBED_DESC_LIMIT:]
-
-
-def _send_kwargs(payload: Any, view: Any) -> dict[str, Any]:
-    """발송 파트(plain str | discord.Embed) → channel.send kwargs. 버튼은 view 로 부착."""
-    kwargs: dict[str, Any] = (
-        {"embed": payload} if isinstance(payload, discord.Embed) else {"content": payload}
-    )
+def _send_kwargs(text: str, view: Any) -> dict[str, Any]:
+    """발송 텍스트 → channel.send kwargs. 버튼은 view 로 부착."""
+    kwargs: dict[str, Any] = {"content": text}
     if view is not None:
         kwargs["view"] = view
     return kwargs
 
 
 def render_view(buttons: list[Button]) -> Any:
-    """list[Button] → discord.ui.View. custom_id=encode_callback(§1.3), 스타일 매핑, ≤100자.
+    """list[Button] → discord.ui.View. custom_id=액션(§1.3), 스타일 매핑, ≤100자.
 
     클릭은 클라이언트 레벨 on_interaction 이 custom_id 로 라우팅한다(뷰 자체 콜백 미사용) —
-    비영속 custom_id(메시지 id·프로젝트명 포함)라 persistent view 등록 없이 전역 이벤트로 받는다.
+    persistent view 등록 없이 전역 이벤트로 받는다.
     timeout=None: 뷰가 만료돼도 on_interaction 은 계속 발화하므로 렌더 목적상 무기한 유지해도 무해.
     """
     view = discord.ui.View(timeout=None)
     for b in buttons:
         # custom_id 는 char 기준 100자 캡(우리 값은 항상 그 안). 초과 시 잘리면 parse_callback 이
         # 거르므로(오작동 대신 무시) 안전(char 기준 100자 캡).
-        cid = encode_callback(b.action, b.arg)[:_CUSTOM_ID_LIMIT]
+        cid = b.action[:_CUSTOM_ID_LIMIT]
         view.add_item(discord.ui.Button(label=b.label, style=_style(b.style), custom_id=cid))
-    return view
-
-
-def _is_vertical_list(buttons: list[Button] | None) -> bool:
-    """버튼 묶음을 세로 1열 V2(LayoutView) 로 렌더할까 — 프로젝트 목록(p:)·선택지(c:) 전용.
-
-    둘 다 항목 수가 가변(프로젝트 7+·선택지 N+직접입력)이라 classic View 5행 한도를 넘을 수 있어
-    세로 V2 로 편다. push/취소/오라클 등 고정 소수 버튼은 현행 가로(classic) 유지(계약 무변경).
-    """
-    return buttons is not None and len(buttons) > 0 and all(b.action in {"p", "c"} for b in buttons)
-
-
-def render_project_view(header: str, buttons: list[Button]) -> Any:
-    """프로젝트 목록 → Components V2 LayoutView(세로 1열). 헤더는 TextDisplay 로 흡수(content 불가).
-
-    각 프로젝트를 ActionRow 1개(버튼 1개)로 쌓아 폰에서 한 줄에 하나씩 보이게 한다(실측 요구).
-    classic View 5행 한도를 피하려 V2 를 쓴다(2.7.1 실측 동작). ponytail: V2 컴포넌트 40개 상한
-    이라 헤더+2N ≤ 40 → 프로젝트 ~19개까지. 그 이상이면 페이징 필요(현재 7개 안팎이라 여유).
-    """
-    view = discord.ui.LayoutView(timeout=None)
-    if header:
-        view.add_item(discord.ui.TextDisplay(header))
-    for b in buttons:
-        cid = encode_callback(b.action, b.arg)[:_CUSTOM_ID_LIMIT]
-        row = discord.ui.ActionRow()
-        row.add_item(discord.ui.Button(label=b.label, style=_style(b.style), custom_id=cid))
-        view.add_item(row)
     return view
 
 
@@ -353,7 +242,7 @@ def _find_title(entries: list[dict[str, Any]], query: str) -> int | None:
 
 
 class DiscordAdapter:
-    """디스코드 Gateway/REST 를 Adapter 계약(poll·send·edit·ack·fetch_file·close)으로 감싼다.
+    """디스코드 Gateway/REST 를 Adapter 계약(poll·send·edit·ack·close)으로 감싼다.
 
     생성 시 봇토큰 + secrets(마스킹 대상) + allowed(선-필터용)를 주입받는다. 봇 스레드는 최초
     poll() 호출 때 기동한다(생성만으로는 접속하지 않음 — 단위 테스트에서 순수 메서드 검증 가능).
@@ -397,17 +286,12 @@ class DiscordAdapter:
         # F1: on_ready 는 재접속마다 재발화 → 첫 셋업 중 겹치면 둘 다 옛 맵으로 시작해 중복 생성.
         # 이 락으로 _ensure_channels 를 직렬화(둘째는 첫째의 channel_map 커밋 후 진입 → 기존 발견).
         self._setup_lock = asyncio.Lock()
-        # ①(채널 자동생성): channelID→(kind,tag) 매핑(영속). setup_channels 로 프로젝트명 주입,
-        # on_ready 에서 _ensure_channels 가 생성·재사용·매핑한다. 파일 없으면 메모리만(테스트).
+        # ①(채널 자동생성): channelID→(kind,tag) 매핑(영속). on_ready 에서 _ensure_channels 가
+        # 생성·재사용·매핑한다. 파일 없으면 메모리만(테스트).
         self._channel_map_file = channel_map_file
         self._channel_map: dict[int, tuple[str, str]] = (
             load_channel_map(channel_map_file) if channel_map_file else {}
         )
-        self._project_names: list[str] = []
-        # 세로 목록으로 발송한 V2 메시지 id — Discord 는 IS_COMPONENTS_V2 flag 를 생성 시 고정해
-        # edit 로 classic 전환을 막는다. 그래서 이 id 들은 edit 도 V2 로 유지한다(선택지 갱신·제거).
-        # ponytail: 세션당 선택지/목록 수만큼 정수가 쌓이나(개인 봇·재시작 소멸) 무해 — 커지면 정리.
-        self._v2_messages: set[int] = set()
         # ── 음악 재생('ㅁ노래') 상태(디스코드 음성 capability, 이 어댑터에만) ──────────────
         # 재생목록 URL 은 고정(.env MUSIC_PLAYLIST_URL). ffmpeg 는 imageio_ffmpeg 번들 실행파일.
         # 재생은 단일 길드·단일 음성연결이라 굵은 인스턴스 상태로 충분(봇 1대·동시 재생 1건).
@@ -444,21 +328,10 @@ class DiscordAdapter:
         v = self._voice
         return v is not None and bool(v.is_connected())
 
-    def setup_channels(self, project_names: list[str]) -> None:
-        """①: 프로젝트 채널 목록을 주입(on_ready 의 _ensure_channels 가 사용). 생성은 접속 후."""
-        self._project_names = list(project_names)
-
     def role_channel(self, role: str) -> int | None:
         """특수 채널 역할("봇상태"|…) → channelID(channel_map 역조회). 없으면 None."""
         for cid, (kind, tag) in self._channel_map.items():
             if kind == "role" and tag == role:
-                return cid
-        return None
-
-    def project_channel(self, project: str) -> int | None:
-        """프로젝트 폴더명 → 프로젝트 채널 channelID(channel_map 역조회). 없으면 None."""
-        for cid, (kind, tag) in self._channel_map.items():
-            if kind == "project" and tag == project:
                 return cid
         return None
 
@@ -955,9 +828,12 @@ class DiscordAdapter:
         """첫 길드(치이카와)에 카테고리·채널을 멱등 구성. §4.4 + 라벨/음성/정렬/기본채널정리.
 
         재사용 = **1차 channelID(기존 channel_map)** → 2차 _canon. 리네임 판단은 **정확 이름 비교**
-        (_canon collapse 함정 회피 — `주식-모니터링`↔`주식모니터링`을 다르게 봄). 프로젝트 채널명은
-        라벨 붙여쓰기(_desired_name), channel_map 값은 폴더명 원문(라우팅 불변). 라벨 없으면 폴더명.
+        (_canon collapse 함정 회피 — `주식-모니터링`↔`주식모니터링`을 다르게 봄).
         재기동해도 중복 생성·리네임 없음(정확 일치면 skip). 권한/실패는 로그+계속. name 로그.
+
+        프로젝트 채널은 만들지도 정렬하지도 않는다. 다만 옛 맵의 `project` 항목은 새 맵에 그대로
+        옮겨 적는다 — 그래야 서버에 남은 옛 프로젝트 채널의 메시지를 코어가 계속 «프로젝트
+        채널» 로 알아보고 무시한다(맵에서 빠지면 미매핑 채널이 된다).
         """
         guild = self._client.guilds[0] if self._client.guilds else None
         if guild is None:
@@ -971,20 +847,16 @@ class DiscordAdapter:
             except discord.DiscordException as e:
                 log.warning("카테고리 확보 실패 %r(%s) — 계속", display, type(e).__name__)
                 cats[display] = None
-        # 프로젝트 채널: 표시=라벨(붙여쓰기), tag=폴더명(라우팅). #4 순서=_PROJECT_ORDER 정본.
-        proj_chans = [
-            (PROJECT_LABELS.get(n, n), "project", n) for n in _project_order(self._project_names)
-        ]
         plan: list[tuple[str, list[tuple[str, str, str]]]] = [
-            (_CAT_PROJECT, proj_chans),
             (_CAT_SCHED, _SPECIAL[_CAT_SCHED]),
             (_CAT_SYSTEM, _SPECIAL[_CAT_SYSTEM]),
         ]
         old_by_keytag = {(k, t): cid for cid, (k, t) in self._channel_map.items()}
         by_id = {c.id: c for c in guild.channels}
         by_canon = {_canon(c.name): c for c in guild.text_channels}
-        new_map: dict[int, tuple[str, str]] = {}
-        project_chs: list[Any] = []  # #4 내부 정렬 대상(순서대로)
+        new_map: dict[int, tuple[str, str]] = {
+            cid: entry for cid, entry in self._channel_map.items() if entry[0] == "project"
+        }
         for cat_name, chans in plan:
             category = cats.get(cat_name)
             for display, kind, tag in chans:
@@ -1006,8 +878,6 @@ class DiscordAdapter:
                         continue
                 # 매핑 먼저(리네임 실패해도 라우팅 유지) → 정확 이름 비교로 best-effort 리네임.
                 new_map[ch.id] = (kind, tag)
-                if kind == "project":
-                    project_chs.append(ch)
                 await self._rename_if_needed(ch, target)
                 if tag in _READONLY_TAGS:
                     # **여기서 예외가 새면 채널 자동생성 전체가 중단**되므로(실측: 매핑이 통째로
@@ -1019,7 +889,6 @@ class DiscordAdapter:
                     except discord.DiscordException as e:
                         log.warning("읽기전용 설정 실패 %r(%s) — 계속", display, type(e).__name__)
         await self._ensure_voice(guild, new_map, cats.get(_CAT_VOICE), old_by_keytag, by_id)
-        await self._reorder_projects(project_chs)  # #4 프로젝트 채널 내부 순서
         await self._order_categories(guild)  # #3 카테고리 순서
         await self._delete_default_general(guild, new_map)  # 기본 #일반 텍스트 삭제
         await self._delete_empty_default_categories(guild)  # #5 빈 기본 카테고리 삭제
@@ -1153,24 +1022,6 @@ class DiscordAdapter:
                 st = getattr(e, "status", "?")
                 log.warning("음성 리네임 실패 %r(status=%s) — 기존명 보존", old, st)
 
-    async def _reorder_projects(self, project_chs: list[Any]) -> None:
-        """#4 프로젝트 카테고리 내부 순서 = _PROJECT_ORDER 정본(project_chs 가 이미 그 순서).
-
-        현재 position 정렬 순서가 목표와 같으면 skip(멱등). 다르면 순서대로 edit(position=i).
-        ponytail: position 은 길드 전역 상대값이라 절대치는 라이브에서 조정될 수 있다 — 순서만 보장
-        (같은 카테고리 내 상대순). 반복 기동 시 이미 정렬돼 skip.
-        """
-        if not project_chs:
-            return
-        current = sorted(project_chs, key=lambda c: c.position)
-        if [c.id for c in current] == [c.id for c in project_chs]:
-            return  # 이미 순서 맞음
-        for i, ch in enumerate(project_chs):
-            try:
-                await ch.edit(position=i)
-            except discord.DiscordException as e:
-                log.warning("프로젝트 채널 정렬 실패 %r(%s) — 계속", ch.name, type(e).__name__)
-
     async def _order_categories(self, guild: Any) -> None:
         """봇 카테고리를 _CAT_ORDER 순서로 재정렬(멱등·코어명 매칭). 실패는 로그+계속."""
         for pos, display in enumerate(_CAT_ORDER):
@@ -1281,7 +1132,7 @@ class DiscordAdapter:
         return self._channel_map.get(channel_id) == ("role", "playlist")
 
     async def _on_message(self, message: discord.Message) -> None:
-        """텍스트/사진 메시지 → 정규화 Event 큐 적재. 자기 메시지·비허용은 드롭."""
+        """텍스트 메시지 → 정규화 Event 큐 적재. 자기 메시지·비허용은 드롭."""
         me = self._client.user
         if me is not None and message.author.id == me.id:
             return  # 자기 메시지 무시(에코 루프 방지)
@@ -1294,33 +1145,13 @@ class DiscordAdapter:
         self._queue.put(self._message_event(message))
 
     def _message_event(self, message: discord.Message) -> Event:
-        """discord.Message → Event(§1.4). 이미지 첨부가 있으면 photo, 아니면 text."""
+        """discord.Message → Event(§1.4). 첨부는 보지 않고 본문만 text 로 정규화한다."""
         channel = message.channel
-        # 채널→라우팅: channel_map(channelID) 우선 — 프로젝트 채널=폴더명 원문, 특수 채널=역할.
-        # 매핑 없으면(자동생성 실패·미매핑) 폴백=채널명을 프로젝트 후보로(DM 은 name 없음 → None).
+        # 채널→라우팅: channel_map(channelID) — 옛 프로젝트 채널=project(폴더명 원문), 특수 채널=
+        # 역할. 매핑 없으면(자동생성 실패·DM) 둘 다 None.
         entry = self._channel_map.get(channel.id)
-        if entry is not None:
-            kind, tag = entry
-            project = tag if kind == "project" else None
-            channel_role = tag if kind == "role" else None
-        else:
-            project = getattr(channel, "name", None)
-            channel_role = None
-        image = next(
-            (a for a in message.attachments if Path(a.filename or "").suffix.lower() in PHOTO_EXTS),
-            None,
-        )
-        if image is not None:
-            return Event(
-                kind="photo",
-                channel_id=channel.id,
-                user_id=message.author.id,
-                text=message.content or "",
-                message_id=message.id,
-                photo_ref=image.url,
-                project=project,
-                channel_role=channel_role,
-            )
+        project = entry[1] if entry is not None and entry[0] == "project" else None
+        channel_role = entry[1] if entry is not None and entry[0] == "role" else None
         return Event(
             kind="text",
             channel_id=channel.id,
@@ -1341,7 +1172,7 @@ class DiscordAdapter:
             return  # 컴포넌트 외(슬래시 명령 등)는 0단계 미사용
         ch_id = interaction.channel_id or 0
         # 선-필터: 비인가는 드롭(defer 도 안 함). 단 플레이리스트 채널 버튼은 통과 — 코어가
-        # clean:ok/x/clean:x(ㅁ청소 확인·취소)만 우회 허용(_playlist_bypass), 그 외는 코어가 무시.
+        # clean:ok/clean:x(ㅁ청소 확인·취소)만 우회 허용(_playlist_bypass), 그 외는 코어가 무시.
         if interaction.user.id not in self._allowed and not self._is_playlist_channel(ch_id):
             return
         try:
@@ -1411,19 +1242,10 @@ class DiscordAdapter:
             yield item
 
     # ── 송신(§2.1) ────────────────────────────────────────────────────────────
-    def _render_parts(self, text: str) -> list[Any]:
-        """마스킹 후 발송 파트 리스트(§4.1). 상태 헤더 매칭 → [Embed, 오버플로 plain 청크…],
-        아니면 기존대로 plain 청크. 파트는 str(plain 콘텐츠) 또는 discord.Embed.
-        """
+    def _render_parts(self, text: str) -> list[str]:
+        """마스킹 후 발송 파트 리스트 — 디스코드 한도로 자른 plain 청크."""
         masked = mask_secrets(text, self.secrets)
-        color = _status_color(masked)
-        if color is None:
-            return [chunk or "(빈 응답)" for chunk in chunk_text(masked, self.limit)]
-        embed, overflow = _build_embed(masked, color)
-        parts: list[Any] = [embed]
-        if overflow:
-            parts += [chunk or "(빈 응답)" for chunk in chunk_text(overflow, self.limit)]
-        return parts
+        return [chunk or "(빈 응답)" for chunk in chunk_text(masked, self.limit)]
 
     def _emit(
         self,
@@ -1431,7 +1253,7 @@ class DiscordAdapter:
         buttons: list[Button] | None,
         coro: Callable[[Any, Any], Coroutine[Any, Any, Any]],
     ) -> int | None:
-        """마스킹·상태판정·청킹·버튼(마지막 파트만) 공통 발송 루프. coro(part, view)→id. 첫 id 반환.
+        """마스킹·청킹·버튼(마지막 파트만) 공통 발송 루프. coro(part, view)→id. 첫 id 반환.
 
         send 가 대상 해석 코루틴을 주입해 발송 규칙(§2.1)을 단일 소스로 공유한다.
         """
@@ -1451,20 +1273,7 @@ class DiscordAdapter:
         text: str,
         buttons: list[Button] | None = None,
     ) -> int | None:
-        """마스킹 후 청크 분할 전송. 버튼은 마지막 청크에만. 첫 청크 message_id 반환(실패 None).
-
-        예외: 세로 목록(전부 p:/c: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
-        V2 flag 는 메시지 생성 시 고정(edit 로 classic 전환 불가)이라, 그 id 를 _v2_messages 에
-        기록해 이후 edit 도 V2 로 유지한다(선택지 갱신·버튼 제거 편집이 400 나지 않게).
-        """
-        if _is_vertical_list(buttons):
-            assert buttons is not None  # _is_vertical_list 가 보장(mypy 좁히기)
-            view = render_project_view(mask_secrets(text, self.secrets), buttons)
-            mid = self._run(self._send_view_coro(channel_id, view))
-            mid = mid if isinstance(mid, int) else None
-            if mid is not None:
-                self._v2_messages.add(mid)
-            return mid
+        """마스킹 후 청크 분할 전송. 버튼은 마지막 청크에만. 첫 청크 message_id 반환(실패 None)."""
         return self._emit(text, buttons, lambda body, view: self._send_coro(channel_id, body, view))
 
     def edit(
@@ -1474,19 +1283,10 @@ class DiscordAdapter:
         text: str,
         buttons: list[Button] | None = None,
     ) -> None:
-        """진행 메시지 in-place 갱신. 오버플로(§2.2): 첫 파트 편집 + 나머지 후속 발행, 버튼 말미.
+        """메시지 in-place 갱신. 오버플로(§2.2): 첫 파트 편집 + 나머지 후속 발행, 버튼 말미.
 
-        상태 헤더면 첫 파트가 Embed 라 진행(노랑)→완료(초록)/실패(빨강) 전이가 같은 message_id
-        편집으로 색만 바뀐다(§4.0 상태 전이=같은 메시지 편집).
-
-        예외: send 가 V2(세로 목록)로 만든 메시지는 flag 가 고정이라 classic 으로 못 돌린다 →
-        같은 세로 V2 로 편집한다(버튼 갱신·제거·만료 문구 모두 TextDisplay 흡수). buttons 없으면
-        빈 목록으로 렌더해 버튼만 사라진다(텍스트는 유지).
+        buttons 가 None 이면 기존 버튼이 제거된다(SNS 카드의 «판정 중» 전환).
         """
-        if message_id in self._v2_messages:
-            view = render_project_view(mask_secrets(text, self.secrets), buttons or [])
-            self._run(self._edit_view_coro(channel_id, message_id, view))
-            return
         parts = self._render_parts(text)
         last = len(parts) - 1
         head_view = render_view(buttons) if buttons is not None and last == 0 else None
@@ -1499,38 +1299,6 @@ class DiscordAdapter:
         """이미 defer 됨(§2.3) → 응답할 것 없음. callback_id 소비(맵 정리)만 한다. 멱등."""
         if callback_id:
             self._interactions.pop(callback_id, None)
-
-    def fetch_file(self, photo_ref: str, dest_dir: Path) -> Path:
-        """attachment.url 다운로드 — 디스코드 CDN 도메인·확장자·크기·트래버설 잠금(§2.4 계승).
-
-        저장명은 URL 경로의 basename 만(쿼리·경로 성분 제거 → 트래버설 차단). 위반은 ValueError.
-        """
-        parsed = urllib.parse.urlparse(photo_ref)
-        if parsed.scheme != "https" or parsed.hostname not in _DISCORD_CDN_HOSTS:
-            raise ValueError(f"허용되지 않은 다운로드 도메인: {parsed.hostname!r}")
-        name = Path(urllib.parse.unquote(parsed.path)).name  # basename 만 — 경로/쿼리 제거
-        if not name or name in (".", ".."):
-            raise ValueError("잘못된 파일명")
-        ext = Path(name).suffix.lower()
-        if ext not in PHOTO_EXTS:
-            raise ValueError(f"허용되지 않은 확장자: {ext!r}")
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / name
-        # ⚠️ 함정 재발 방지: 디스코드 CDN(Cloudflare)은 urllib 기본 UA(Python-urllib/*)를 403 차단
-        # (작업일지 함정 "REST 직접 호출 시 User-Agent 필수"와 동일 — 라이브 실측 403→200 확인).
-        req = urllib.request.Request(  # https + CDN 화이트리스트 통과분만(SSRF 차단)
-            photo_ref, headers={"User-Agent": "Mozilla/5.0"}
-        )
-        # M-3: 리다이렉트 차단 opener — CDN 이 3xx 로 내부주소를 가리켜도 추종 안 함(SSRF 차단).
-        with _NOREDIRECT_OPENER.open(req, timeout=30) as resp:  # 스킴·호스트 검증됨
-            clen = resp.headers.get("Content-Length")
-            if clen is not None and clen.isdigit() and int(clen) > MAX_PHOTO_BYTES:
-                raise ValueError("사진이 크기 상한(10MB)을 초과합니다.")
-            payload = resp.read(MAX_PHOTO_BYTES + 1)  # 상한+1 만 읽어 초과 즉시 판정(메모리 보호)
-        if len(payload) > MAX_PHOTO_BYTES:
-            raise ValueError("사진이 크기 상한(10MB)을 초과합니다.")
-        dest.write_bytes(payload)
-        return dest
 
     def delete_message(self, channel_id: int, message_id: int) -> None:
         """메시지 1건 삭제. 실패(이미 지워짐·권한)는 _run 이 로그만 남기고 삼킨다(계약)."""
@@ -1608,39 +1376,19 @@ class DiscordAdapter:
             )
             return None
 
-    async def _send_coro(self, channel_id: int, payload: Any, view: Any) -> int | None:
+    async def _send_coro(self, channel_id: int, payload: str, view: Any) -> int | None:
         channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
             channel_id
         )
-        msg = await channel.send(**_send_kwargs(payload, view))  # payload=plain str 또는 Embed
+        msg = await channel.send(**_send_kwargs(payload, view))
         return int(msg.id)
 
-    async def _send_view_coro(self, channel_id: int, view: Any) -> int | None:
-        """V2 LayoutView 전용 발송(content 없음 — 헤더는 view 의 TextDisplay 에 흡수됨)."""
+    async def _edit_coro(self, channel_id: int, message_id: int, payload: str, view: Any) -> None:
         channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
             channel_id
         )
-        msg = await channel.send(view=view)
-        return int(msg.id)
-
-    async def _edit_view_coro(self, channel_id: int, message_id: int, view: Any) -> None:
-        """V2 LayoutView 전용 편집(content/embed 없음 — V2 는 content 를 못 실어 view 만 교체)."""
-        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
-            channel_id
-        )
-        await channel.get_partial_message(message_id).edit(view=view)
-
-    async def _edit_coro(self, channel_id: int, message_id: int, payload: Any, view: Any) -> None:
-        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
-            channel_id
-        )
-        # 반대 필드를 명시적 None 으로 지워 plain↔Embed 전이가 잔여물 없이 치환되게 한다
-        # (content=None → 텍스트 제거, embed=None → 임베드 제거, view=None → 컴포넌트 제거).
-        if isinstance(payload, discord.Embed):
-            content, embed = None, payload
-        else:
-            content, embed = payload, None
-        await channel.get_partial_message(message_id).edit(content=content, embed=embed, view=view)
+        # view=None → 컴포넌트(버튼) 제거.
+        await channel.get_partial_message(message_id).edit(content=payload, view=view)
 
     async def _purge_coro(
         self,

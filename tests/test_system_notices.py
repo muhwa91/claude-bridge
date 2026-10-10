@@ -141,8 +141,6 @@ def _login_hook_from_main(monkeypatch):
     monkeypatch.setattr(bridge, "acquire_lock", lambda _p: True)
     monkeypatch.setattr(bridge, "load_schedules", lambda _p: [])
     monkeypatch.setattr(bridge, "load_notify_state", lambda *_a: set())
-    monkeypatch.setattr(bridge, "load_channel_sessions", lambda _p: {})
-    monkeypatch.setattr(bridge, "list_projects", lambda _r: [])
     monkeypatch.setattr(bridge, "set_login_alert", fake_set)
     monkeypatch.setattr(bridge, "youtube", SimpleNamespace(), raising=False)
     with pytest.raises(_StopMain):
@@ -252,33 +250,26 @@ def test_login_alert_through_watch_login_with_realistic_error_text(login_hook):
 @pytest.fixture
 def sched_env(monkeypatch):
     bridge.notify_fired.clear()
-    fa = FakeAdapter(secrets=[], roles={"봇상태": 999}, projects={"trading-info": 111})
+    fa = FakeAdapter(secrets=[], roles={"봇상태": 999})
     monkeypatch.setattr(bridge, "save_notify_state", lambda _p, f: fa.saves.append(set(f)))
     yield fa
     bridge.notify_fired.clear()
 
 
-def test_scheduled_alert_goes_to_project_channel_as_one_plain_line_once_per_day(
+def test_scheduled_alert_goes_to_status_channel_as_one_plain_line_once_per_day(
     sched_env, monkeypatch
 ):
     _freeze_now(monkeypatch, _WED_0910)  # at 09:00 창(30분) 안
+    # `project` 키는 읽지 않는다(프로젝트 채널 폐지) — channel 도 없으니 #봇상태(999) 로 간다.
     items = [_item(id="a", project="trading-info", label="제목", note="내용")]
     bridge.dispatch_notifications(sched_env, items)
     bridge.dispatch_notifications(sched_env, items)  # 같은 날 두 번째 틱
     _freeze_now(monkeypatch, _WED_0910.replace(minute=20))  # 같은 날, 창 안의 더 늦은 틱
     bridge.dispatch_notifications(sched_env, items)
     assert sched_env.sent == [
-        (111, "[2026-07-15 AM 09:10] ⏰ <스케쥴> 제목\n→ 내용", None)
+        (999, "[2026-07-15 AM 09:10] ⏰ <스케쥴> 제목\n→ 내용", None)
     ]  # 채널 1곳·텍스트 한 줄·버튼 없음(두 번째·세 번째 틱은 fired 로 막힘)
     assert sched_env.sent[0][1].count("\n→ ") == 1  # 두 줄(제목 / → 내용)
-
-
-def test_scheduled_alert_unmapped_project_falls_back_to_status_channel(sched_env, monkeypatch):
-    _freeze_now(monkeypatch, _WED_0910)
-    bridge.dispatch_notifications(
-        sched_env, [_item(id="a", project="없는프로젝트", label="제목", note="내용")]
-    )
-    assert sched_env.sent == [(999, "[2026-07-15 AM 09:10] ⏰ <스케쥴> 제목\n→ 내용", None)]
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +318,6 @@ def test_unmapped_status_channel_digest_giveup_is_log_only(sched_env, monkeypatc
 def test_unmapped_status_channel_scheduled_alert_skipped_without_raise(sched_env, monkeypatch):
     _freeze_now(monkeypatch, _WED_0910)
     sched_env._roles = {}
-    sched_env._projects = {}
     bridge.dispatch_notifications(sched_env, [_item(id="a", project="x")])  # 폴백처도 없음
     assert sched_env.sent == []
 
@@ -338,7 +328,7 @@ def test_unmapped_status_channel_scheduled_alert_skipped_without_raise(sched_env
 @pytest.mark.parametrize(
     "custom_id", ["nb:ok:x", "nb:later:x", "nb:done:x", "nb:handoff:x", "nb:confirm:x", "nb:"]
 )
-def test_old_verification_card_click_is_acked_and_ignored_end_to_end(custom_id, tmp_path):
+def test_old_verification_card_click_is_acked_and_ignored_end_to_end(custom_id):
     from types import SimpleNamespace
 
     async def defer():
@@ -359,16 +349,8 @@ def test_old_verification_card_click_is_acked_and_ignored_end_to_end(custom_id, 
     assert isinstance(ev, Event) and ev.kind == "button" and ev.action == ""  # 화이트리스트 밖
 
     fa = FakeAdapter()
-    bridge.handle_event(
-        fa,
-        ev,
-        allowed=_ALLOWED,
-        claude_exe="claude-not-run",
-        repo_root=tmp_path,
-        target_root=str(tmp_path),
-        timeout=1,
-    )
-    assert fa.sent == [] and fa.edited == [] and fa.runs == []
+    bridge.handle_event(fa, ev, allowed=_ALLOWED)
+    assert fa.sent == [] and fa.edited == []
     assert len(fa.acked) == 1  # 로딩 스피너만 끈다
 
 

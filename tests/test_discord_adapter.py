@@ -1,7 +1,7 @@
 """DiscordAdapter 계약 테스트(§5.2 — 디스코드 특화 단위).
 
 이벤트루프 실구동(Gateway 접속)은 라이브 검증(0e) 몫이라 여기선 제외하고, 루프 없이 단위 검증
-가능한 것만 다룬다: render_view(custom_id·스타일), fetch_file 보안(§2.4 CDN·확장자·크기·트래버설),
+가능한 것만 다룬다: render_view(custom_id·스타일),
 _message_event/_on_message 정규화·필터, _on_interaction defer 선행·custom_id 파싱·비허용 드롭,
 send/edit 청킹·마스킹·버튼 말미(코루틴 경계는 _run 스텁), ack 멱등·맵 소비, close 안전성.
 
@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-import urllib.error
 from types import SimpleNamespace
 
 import pytest
@@ -23,13 +22,6 @@ discord = pytest.importorskip("discord")  # 미설치면 이 파일 전체 스�
 import bridge  # noqa: E402
 import discord_adapter  # noqa: E402  (importorskip 뒤에 와야 함)
 from adapter import Button, Event  # noqa: E402
-from bridge import (  # noqa: E402
-    HEADER_DONE,
-    HEADER_FAIL,
-    HEADER_NOTE,
-    project_buttons,
-    push_buttons,
-)
 from discord_adapter import DiscordAdapter, render_view  # noqa: E402
 
 _ALLOWED = frozenset({777})
@@ -41,142 +33,29 @@ def _adapter(secrets=None, limit=discord_adapter.DISCORD_LIMIT):
 
 
 # ---------------------------------------------------------------------------
-# render_view: Button → discord.ui.View (custom_id=encode_callback, 스타일 매핑, ≤100자)
+# render_view: Button → discord.ui.View (custom_id=액션, 스타일 매핑, ≤100자)
 # ---------------------------------------------------------------------------
 def test_render_view_custom_id_and_style():
     view = render_view(
-        [Button("✅ Push", "push", style="primary"), Button("❌ 취소", "x", style="danger")]
+        [
+            Button("🧹 청소", "clean:ok", style="primary"),
+            Button("✖ 취소", "clean:x", style="danger"),
+            Button("🔍 판정하기", "sns_judge"),
+        ]
     )
     items = view.children
-    assert [it.custom_id for it in items] == ["push", "x"]
+    assert [it.custom_id for it in items] == ["clean:ok", "clean:x", "sns_judge"]
     assert items[0].style == discord.ButtonStyle.primary
     assert items[1].style == discord.ButtonStyle.danger
-
-
-def test_render_view_default_style_is_secondary():
-    view = render_view([Button("데모", "p", "trading_info")])
-    it = view.children[0]
-    assert it.custom_id == "p:trading_info"  # encode_callback 직렬화
-    assert it.style == discord.ButtonStyle.secondary
-    assert it.label == "데모"
-
-
-def test_render_view_choice_custom_ids():
-    from bridge import choice_buttons
-
-    v2 = render_view(choice_buttons(55, [("유지", "keep"), ("교체", "swap")]))
-    assert [c.custom_id for c in v2.children] == ["c:55:0", "c:55:1", "c:55:other"]
+    assert items[2].style == discord.ButtonStyle.secondary  # default → 회색
+    assert items[2].label == "🔍 판정하기"
 
 
 def test_render_view_custom_id_within_discord_100_char_limit():
-    # §1.3: DC custom_id ≤100자. id·name≤64 라 인코드 결과가 한도 안(캡은 오작동 없이 무시로 안전).
-    from adapter import encode_callback
-
-    for action, arg in (
-        ("push", ""),
-        ("x", ""),
-        ("p", "x" * 64),
-        ("c", "999999:12"),
-    ):
-        assert len(encode_callback(action, arg)) <= discord_adapter._CUSTOM_ID_LIMIT
-
-
-# ---------------------------------------------------------------------------
-# fetch_file: §2.4 보안 계승(CDN 도메인·확장자·크기·트래버설)
-# ---------------------------------------------------------------------------
-class _FakeResp:
-    def __init__(self, data=b"", headers=None):
-        self._data = data
-        self.headers = headers or {}
-
-    def read(self, n=-1):
-        return self._data if n is None or n < 0 else self._data[:n]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_a):
-        return False
-
-
-def _patch_urlopen(monkeypatch, resp):
-    # fetch_file 은 리다이렉트 차단 opener(_NOREDIRECT_OPENER.open)를 쓴다(M-3) — 그걸 패치.
-    monkeypatch.setattr(discord_adapter._NOREDIRECT_OPENER, "open", lambda *_a, **_k: resp)
-
-
-_CDN = "https://cdn.discordapp.com/attachments/1/2/photo.png?ex=abc&is=def&hm=deadbeef"
-
-
-def test_fetch_file_happy_writes_basename(monkeypatch, tmp_path):
-    _patch_urlopen(monkeypatch, _FakeResp(b"\x89PNGdata"))
-    dest = _adapter().fetch_file(_CDN, tmp_path)
-    assert dest.name == "photo.png"  # 쿼리스트링 제거된 basename
-    assert dest.parent == tmp_path
-    assert dest.read_bytes() == b"\x89PNGdata"
-
-
-def test_fetch_file_sends_user_agent(monkeypatch, tmp_path):
-    # 함정 회귀 방지: 디스코드 CDN(Cloudflare)은 기본 UA(Python-urllib/*)를 403 차단(2026-07-22
-    # 라이브 실측). Request 에 User-Agent 가 실려야 다운로드가 된다.
-    seen = []
-    _patch_urlopen(monkeypatch, _FakeResp(b"x"))  # 기본 패치 후 open 을 가로채 Request 캡처로 교체
-    monkeypatch.setattr(
-        discord_adapter._NOREDIRECT_OPENER,
-        "open",
-        lambda req, **_k: seen.append(req) or _FakeResp(b"x"),
-    )
-    _adapter().fetch_file(_CDN, tmp_path)
-    assert seen and seen[0].get_header("User-agent")  # urllib 은 헤더 키를 이 형태로 정규화
-
-
-def test_fetch_file_rejects_non_cdn_domain(monkeypatch, tmp_path):
-    _patch_urlopen(monkeypatch, _FakeResp(b"x"))
-    with pytest.raises(ValueError, match="도메인"):
-        _adapter().fetch_file("https://evil.example.com/attachments/1/2/photo.png", tmp_path)
-
-
-def test_fetch_file_rejects_http_scheme(monkeypatch, tmp_path):
-    _patch_urlopen(monkeypatch, _FakeResp(b"x"))
-    with pytest.raises(ValueError, match="도메인"):
-        _adapter().fetch_file("http://cdn.discordapp.com/a/b/photo.png", tmp_path)
-
-
-def test_fetch_file_rejects_bad_extension(monkeypatch, tmp_path):
-    _patch_urlopen(monkeypatch, _FakeResp(b"x"))
-    with pytest.raises(ValueError, match="확장자"):
-        _adapter().fetch_file("https://cdn.discordapp.com/a/b/evil.gif", tmp_path)
-
-
-def test_fetch_file_traversal_stays_basename(monkeypatch, tmp_path):
-    _patch_urlopen(monkeypatch, _FakeResp(b"x"))
-    # 경로에 ../ 가 있어도 basename 만 저장 → dest 밖으로 못 나감.
-    dest = _adapter().fetch_file("https://media.discordapp.net/a/../../etc/evil.jpg", tmp_path)
-    assert dest.name == "evil.jpg"
-    assert dest.parent == tmp_path
-
-
-def test_fetch_file_rejects_oversize_body(monkeypatch, tmp_path):
-    monkeypatch.setattr(discord_adapter, "MAX_PHOTO_BYTES", 4)
-    _patch_urlopen(monkeypatch, _FakeResp(b"toolongbody"))
-    with pytest.raises(ValueError, match=r"10MB|상한"):
-        _adapter().fetch_file(_CDN, tmp_path)
-
-
-def test_fetch_file_rejects_oversize_content_length(monkeypatch, tmp_path):
-    monkeypatch.setattr(discord_adapter, "MAX_PHOTO_BYTES", 4)
-    _patch_urlopen(monkeypatch, _FakeResp(b"ok", headers={"Content-Length": "999"}))
-    with pytest.raises(ValueError, match=r"10MB|상한"):
-        _adapter().fetch_file(_CDN, tmp_path)
-
-
-def test_fetch_file_rejects_redirect(monkeypatch, tmp_path):
-    # M-3: CDN 이 3xx 로 내부주소(169.254.169.254)를 가리켜도 opener 가 추종 대신 HTTPError → 거부.
-    def raise_302(*_a, **_k):
-        raise urllib.error.HTTPError(_CDN, 302, "redirect blocked", {}, None)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(discord_adapter._NOREDIRECT_OPENER, "open", raise_302)
-    with pytest.raises(urllib.error.HTTPError):
-        _adapter().fetch_file(_CDN, tmp_path)
+    # §1.3: DC custom_id ≤100자. 우리 액션은 전부 짧아 한도 안이고, 넘으면 잘려 parse_callback 이
+    # 거르므로(오작동 대신 무시) 안전하다.
+    for action in ("clean:ok", "clean:link", "clean:all", "clean:x", "sns_judge"):
+        assert len(render_view([Button("L", action)]).children[0].custom_id) <= 100
 
 
 # ---------------------------------------------------------------------------
@@ -202,19 +81,11 @@ def _msg(
 
 
 def test_message_event_text_normalization():
-    ev = _adapter()._message_event(_msg(777, "etf_info 확인해줘"))
+    ev = _adapter()._message_event(_msg(777, "ㅁ노래"))
     assert ev.kind == "text"
     assert ev.channel_id == 100 and ev.user_id == 777
-    assert ev.text == "etf_info 확인해줘" and ev.message_id == 5
-    assert ev.project == "trading_info"  # 채널명 = 프로젝트 후보(0단계 매핑)
-
-
-def test_message_event_photo_picks_image_attachment():
-    att = SimpleNamespace(filename="toss.PNG", url=_CDN)
-    ev = _adapter()._message_event(_msg(777, "MU", atts=[att]))
-    assert ev.kind == "photo"
-    assert ev.photo_ref == _CDN
-    assert ev.text == "MU"
+    assert ev.text == "ㅁ노래" and ev.message_id == 5
+    assert ev.project is None and ev.channel_role is None  # 미매핑 채널
 
 
 def test_message_event_dm_channel_project_none():
@@ -273,7 +144,7 @@ def _interaction(user_id, custom_id, *, msg_id=42, channel_id=100, order=None):
 def test_on_interaction_defers_before_enqueue():
     a = _adapter()
     order = []
-    inter = _interaction(777, "push", order=order)
+    inter = _interaction(777, "clean:ok", order=order)
 
     class _RecordQueue:
         def put(self, ev):
@@ -285,17 +156,19 @@ def test_on_interaction_defers_before_enqueue():
     assert order[0] == "defer"
     assert order[1][0] == "put"
     ev = order[1][1]
-    assert ev.kind == "button" and ev.action == "push" and ev.callback_id == "9001"
+    assert ev.kind == "button" and ev.action == "clean:ok" and ev.callback_id == "9001"
     assert ev.channel_id == 100 and ev.message_id == 42 and ev.user_id == 777
     # interaction 이 ack 용으로 맵에 등록됨
     assert a._interactions["9001"] is inter
 
 
-def test_on_interaction_parses_choice_custom_id():
-    a = _adapter()
-    asyncio.run(a._on_interaction(_interaction(777, "c:42:1")))
-    ev = a._queue.get_nowait()
-    assert ev.action == "c" and ev.action_arg == "42:1"
+def test_on_interaction_retired_custom_ids_become_empty_action():
+    # 삭제된 옛 버튼(push·x·p:*·c:*)은 화이트리스트 밖 → action="" (코어가 ack 후 무시).
+    for custom_id in ("push", "x", "p:etf_info", "c:42:1", "c:42:other"):
+        a = _adapter()
+        asyncio.run(a._on_interaction(_interaction(777, custom_id)))
+        ev = a._queue.get_nowait()
+        assert ev.action == "" and ev.action_arg == "", custom_id
 
 
 def test_on_interaction_playlist_channel_lets_unauth_through():
@@ -527,79 +400,11 @@ def test_run_without_loop_returns_none_and_closes_coro():
 # ---------------------------------------------------------------------------
 
 
-def test_status_color_matches_headers_and_leaders():
-    sc = discord_adapter._status_color
-    assert sc(f"{HEADER_DONE}\n\n끝") == discord_adapter._COLOR_DONE  # 초록
-    assert sc(f"{HEADER_FAIL}\n\n실패") == discord_adapter._COLOR_FAIL  # 빨강
-    assert sc(f"{HEADER_NOTE}\n\n확인") == discord_adapter._COLOR_INFO  # 블러플
-    assert sc("🔄 작업 중") == discord_adapter._COLOR_WAIT  # 모든 진행 헤더 단일 문구 → 노랑
-    assert sc("⏰ 개장 알림\n등락률 확인") is None  # ⏰ 는 상태 헤더가 아니다(plain)
-
-
-def test_status_color_plain_returns_none():
-    # 목록·도움말·짧은 회신은 매칭 안 됨 → plain(기존 무변경).
-    assert discord_adapter._status_color("대상 프로젝트 3") is None
-    assert discord_adapter._status_color("**사용법**\n...") is None
-    assert discord_adapter._status_color("취소했습니다.") is None
-
-
-def test_build_embed_title_strips_brackets_desc_is_body():
-    embed, overflow = discord_adapter._build_embed(
-        f"{HEADER_DONE}\n\nREADME 를 고쳤습니다.", discord_adapter._COLOR_DONE
-    )
-    assert embed.title == "✅처리완료"  # 대괄호 껍질 제거
-    assert embed.description == "README 를 고쳤습니다."
-    assert embed.color.value == discord_adapter._COLOR_DONE
-    assert embed.author.name is None  # author 라인 제거(봇 계정명 중복)
-    assert overflow == ""
-
-
-def test_build_embed_overflow_beyond_4096():
-    body = "x" * 5000
-    embed, overflow = discord_adapter._build_embed(f"{HEADER_DONE}\n\n{body}", 0x1)
-    assert len(embed.description) == 4096
-    assert overflow == "x" * (5000 - 4096)
-
-
-def test_send_status_header_renders_embed():
-    a = _adapter()
-    calls = _stub_calls(a, [111])
-    a.send(100, f"{HEADER_DONE}\n\n완료 본문")
-    payload = calls[0][2]  # ("send", cid, payload, view)
-    assert isinstance(payload, discord.Embed)
-    assert payload.color.value == discord_adapter._COLOR_DONE
-
-
 def test_send_plain_stays_content_str():
     a = _adapter()
     calls = _stub_calls(a, [1])
     a.send(100, "대상 프로젝트 2")
     assert calls[0][2] == "대상 프로젝트 2"  # plain 그대로(str)
-
-
-def test_edit_progress_to_done_transitions_embed_same_message():
-    a = _adapter()
-    calls = _stub_calls(a, [None])
-    a.edit(100, 42, f"{HEADER_DONE}\n\n결과")
-    # ("edit", cid, mid, payload, view)
-    assert calls[0][0] == "edit" and calls[0][2] == 42
-    assert isinstance(calls[0][3], discord.Embed)
-    assert calls[0][3].color.value == discord_adapter._COLOR_DONE
-
-
-def test_embed_overflow_sends_followup_plain_chunk():
-    a = _adapter()  # 기본 limit=2000 — 오버플로(104자)는 단일 후속 청크
-    calls = _stub_calls(a, [111, None])
-    a.send(100, f"{HEADER_DONE}\n\n" + "y" * 4200)  # desc 4096(고정) + 104 오버플로
-    assert len(calls) == 2
-    assert isinstance(calls[0][2], discord.Embed)  # 첫 파트 = 임베드
-    assert isinstance(calls[1][2], str) and calls[1][2] == "y" * 104  # 오버플로 = 후속 plain
-
-
-def test_render_view_success_and_secondary_styles():
-    view = render_view(push_buttons())
-    assert view.children[0].style == discord.ButtonStyle.success  # Push
-    assert view.children[1].style == discord.ButtonStyle.secondary  # 취소
 
 
 def test_wait_ready_reflects_on_ready_event():
@@ -639,20 +444,6 @@ def test_role_channel_reverse_lookup():
     assert a.role_channel("간단처리") == 10
     assert a.role_channel("봇상태") == 30
     assert a.role_channel("없는역할") is None
-
-
-def test_project_channel_reverse_lookup():
-    a = _adapter()
-    a._channel_map = {10: ("role", "데이터분석"), 20: ("project", "etf_info")}
-    assert a.project_channel("etf_info") == 20  # 히트
-    assert a.project_channel("데이터분석") is None  # role 태그는 매칭 안 됨
-    assert a.project_channel("없는프로젝트") is None  # 미스
-
-
-def test_setup_channels_stores_names():
-    a = _adapter()
-    a.setup_channels(["a", "b"])
-    assert a._project_names == ["a", "b"]
 
 
 # ---------------------------------------------------------------------------
@@ -1470,10 +1261,20 @@ def test_message_event_channel_map_project_and_role():
     assert ev_r.channel_role == "데이터분석" and ev_r.project is None
 
 
-def test_message_event_unmapped_falls_back_to_channel_name():
+def test_message_event_unmapped_channel_has_no_project_or_role():
+    # 채널명을 프로젝트 후보로 쓰던 폴백은 프로젝트 원격 작업과 함께 삭제됐다.
     a = _adapter()  # channel_map 비어있음
     ev = a._message_event(_msg(777, "hi", channel_id=100, channel_name="trading_info"))
-    assert ev.project == "trading_info" and ev.channel_role is None
+    assert ev.project is None and ev.channel_role is None
+
+
+def test_message_event_image_attachment_is_still_a_text_event():
+    # 사진 + 지시(photo 이벤트)는 삭제됐다 — 첨부가 있어도 본문만 text 로 정규화한다.
+    a = _adapter()
+    m = _msg(777, "캡션", channel_id=100)
+    m.attachments = [SimpleNamespace(filename="a.png", url="https://cdn.discordapp.com/a.png")]
+    ev = a._message_event(m)
+    assert ev.kind == "text" and ev.text == "캡션"
 
 
 class _FakeOverwrite:
@@ -1619,50 +1420,80 @@ class _FakeGuild:
 def test_ensure_channels_creates_categories_channels_and_persists(tmp_path):
     cm = tmp_path / "channel_map.json"
     a = DiscordAdapter("tok", [], _ALLOWED, channel_map_file=cm)
-    a.setup_channels(["etf_info", "trading_info"])
     guild = _FakeGuild()
     a._client = SimpleNamespace(guilds=[guild])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())
     tags = set(a._channel_map.values())
     assert ("role", "봇상태") in tags
     assert ("role", "알림") not in tags  # 검증 카드 기능 삭제(2026-10-08) — 더는 만들지 않는다
-    assert {("project", "etf_info"), ("project", "trading_info")} <= tags
     assert a.role_channel("봇상태") is not None and a.role_channel("알림") is None
     assert cm.exists()  # 영속
     assert discord_adapter.load_channel_map(cm) == a._channel_map
 
 
-def test_ensure_channels_reuses_existing_by_canon():
-    # 재사용 = channelID + _canon(언더스코어/하이픈 무시) — h-security-sheet 로 저장돼도 매칭.
+def test_ensure_channels_creates_no_project_channels(tmp_path):
+    """새 `_Project/*` 폴더가 생겨도 채널을 만들지 않는다(동기화 로직 삭제).
+
+    어댑터는 프로젝트 목록을 받는 입구(`setup_channels`)가 아예 없고, 만드는 채널은 역할 채널
+    (미국주식·SNS정보·봇상태)과 PlayList 음성뿐이다. 레포의 `_Project` 폴더가 몇 개든 같다.
+    """
+    projects = tmp_path / "_Project"
+    for name in ("etf_info", "trading_info", "brand_new_project"):
+        (projects / name).mkdir(parents=True)
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["H_security_sheet"])
-    existing = _FakeChannel(777, "h-security-sheet")
-    guild = _FakeGuild(text_channels=[existing])
+    assert not hasattr(a, "setup_channels") and not hasattr(a, "project_channel")
+    guild = _FakeGuild()
     a._client = SimpleNamespace(guilds=[guild])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())
-    assert a._channel_map[777] == ("project", "H_security_sheet")  # 기존 채널ID 재사용
-    assert not any(discord_adapter._canon(n) == "hsecuritysheet" for n, _ in guild.created)
+    assert {n for n, _ in guild.created} == {"마이크론", "sns정보", "알림"}
+    assert guild.voice_created == ["PlayList"]
+    assert {kind for kind, _tag in a._channel_map.values()} == {"role"}
+    assert not any("프로젝트" in c.name for c in guild.categories)
 
 
-def test_concurrent_on_ready_no_duplicate(monkeypatch):
+def test_ensure_channels_keeps_old_project_entries_untouched(tmp_path):
+    """옛 프로젝트 채널은 만들지도·고치지도·지우지도 않지만 맵에는 그대로 남긴다.
+
+    맵에서 빠지면 그 채널이 미매핑(역할 없음)이 되어 코어가 «프로젝트 채널 → 무시» 로 알아보지
+    못한다. 서버의 채널 삭제는 사람 몫이고, 그때까지 맵 항목은 읽기만 한다.
+    """
+    cm = tmp_path / "channel_map.json"
+    old = _FakeChannel(500, "주식모니터링", position=3)
+    cm.write_text('{"500": ["project", "trading_info"]}', encoding="utf-8")
+    a = DiscordAdapter("tok", [], _ALLOWED, channel_map_file=cm)
+    guild = _guild_for(a, text_channels=[old])
+    asyncio.run(a._ensure_channels())
+    assert a._channel_map[500] == ("project", "trading_info")
+    assert old.renames == [] and old.deleted is False and old.position == 3
+    assert "trading_info" not in {n for n, _ in guild.created}
+    assert discord_adapter.load_channel_map(cm)[500] == ("project", "trading_info")
+    ev = a._message_event(_msg(777, "고쳐줘", channel_id=500))
+    assert ev.project == "trading_info" and ev.channel_role is None
+
+
+def test_loading_old_channel_map_with_project_entries_does_not_crash(tmp_path):
+    cm = tmp_path / "channel_map.json"
+    cm.write_text('{"1": ["project", "etf_info"], "2": ["role", "봇상태"]}', encoding="utf-8")
+    a = DiscordAdapter("tok", [], _ALLOWED, channel_map_file=cm)
+    assert a.role_channel("봇상태") == 2 and a._channel_map[1] == ("project", "etf_info")
+
+
+def test_concurrent_on_ready_no_duplicate():
     # F1: 첫 셋업 중 reconnect 로 on_ready 2회 겹쳐도 _setup_lock 이 직렬화 → 중복 생성 없음.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["etf_info"])
     guild = _guild_for(a)
 
     async def two_on_ready():
         await asyncio.gather(a._ensure_channels(), a._ensure_channels())
 
     asyncio.run(two_on_ready())
-    # 카테고리 4개(프로젝트·스케쥴러·시스템·PlayList) — 간단처리·데이터분석·질문 제거.
-    assert len(guild.categories) == 4
-    assert [n for n, _ in guild.created].count("etf_info") == 1
+    # 카테고리 3개(스케쥴러·시스템·PlayList) — 프로젝트 카테고리는 만들지 않는다.
+    assert len(guild.categories) == 3
+    assert [n for n, _ in guild.created].count("마이크론") == 1
 
 
 def test_ensure_channels_no_guild_skips(tmp_path):
     a = DiscordAdapter("tok", [], _ALLOWED, channel_map_file=tmp_path / "cm.json")
-    a.setup_channels(["etf_info"])
     a._client = SimpleNamespace(guilds=[])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())  # 길드 없음 → 스킵(예외 없이)
     assert a._channel_map == {}
@@ -1713,11 +1544,9 @@ def test_ensure_nickname_swallows_permission_error():
     asyncio.run(a._ensure_nickname())  # Forbidden 등 → 삼키고 계속(예외 전파 없음)
 
 
-def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch):
+def test_ensure_channels_channel_create_failure_skips_but_maps_rest():
     # "실패는 로그+계속"(§4.4) 회귀 잠금: 한 채널 생성이 디스코드 예외로 실패해도 전체 setup 이
     # 중단되지 않고 나머지 채널은 정상 매핑된다(권한 오류 1건이 전체 라우팅을 지우지 않게).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
-
     class _RejectingGuild(_FakeGuild):
         async def create_text_channel(self, name, **kwargs):
             if name == "마이크론":  # 특정 채널만 생성 거부(권한 없음 모사)
@@ -1725,14 +1554,13 @@ def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch)
             return await super().create_text_channel(name, **kwargs)
 
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["etf_info"])
     guild = _RejectingGuild()
     a._client = SimpleNamespace(guilds=[guild])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())  # 예외로 안 죽음
     tags = set(a._channel_map.values())
     assert ("role", "미국주식") not in tags  # 실패한 채널은 미매핑(스킵)
-    # 프로젝트·다른 특수채널은 정상 매핑(부분 실패가 전체를 무너뜨리지 않음)
-    assert {("role", "봇상태"), ("project", "etf_info")} <= tags
+    # 다른 특수채널은 정상 매핑(부분 실패가 전체를 무너뜨리지 않음)
+    assert {("role", "봇상태"), ("role", "SNS정보")} <= tags
 
 
 # ---------------------------------------------------------------------------
@@ -1746,50 +1574,9 @@ def _guild_for(a, **kw):
     return guild
 
 
-def test_project_channel_renamed_to_label_via_map(monkeypatch):
-    # 기존 폴더명 채널(맵에 등록) → 라벨 붙여쓰기로 리네임. 매핑값은 폴더명 원문 불변, 재생성 없음.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {"trading_info": "주식 모니터링"})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["trading_info"])
-    a._channel_map = {500: ("project", "trading_info")}  # 라이브가 만든 폴더명 채널
-    ch = _FakeChannel(500, "trading_info")
-    guild = _guild_for(a, text_channels=[ch])
-    asyncio.run(a._ensure_channels())
-    assert ch.renames == ["주식모니터링"]  # 공백 제거 붙여쓰기명으로 리네임
-    assert a._channel_map[500] == ("project", "trading_info")  # 매핑=폴더명 불변(라우팅)
-    # 재생성 X — 정확명 비교(부분일치 '주식' 금지: 미국주식 무관)
-    assert not any(n in ("주식모니터링", "trading_info") for n, _ in guild.created)
-
-
-def test_label_rename_idempotent_second_run(monkeypatch):
-    # 이미 붙여쓰기명이면 재기동해도 리네임 안 함(정확 일치 skip — 진짜 멱등).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {"trading_info": "주식 모니터링"})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["trading_info"])
-    a._channel_map = {500: ("project", "trading_info")}
-    ch = _FakeChannel(500, "주식모니터링")  # 이미 붙여쓰기 저장형
-    _guild_for(a, text_channels=[ch])
-    asyncio.run(a._ensure_channels())
-    assert ch.renames == []  # 정확 일치 → skip
-
-
-def test_hyphen_form_force_renamed_to_joined(monkeypatch):
-    # ⚠️ 멱등 함정 회귀: 하이픈형 '주식-모니터링'은 canon 은 같아도 정확 이름이 달라 강제 리네임.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {"trading_info": "주식 모니터링"})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["trading_info"])
-    a._channel_map = {500: ("project", "trading_info")}
-    ch = _FakeChannel(500, "주식-모니터링")  # 구 하이픈형(canon 동일)
-    _guild_for(a, text_channels=[ch])
-    asyncio.run(a._ensure_channels())
-    assert ch.renames == ["주식모니터링"]  # canon 같아도 정확 비교로 리네임 실행
-
-
-def test_special_channel_names_are_joined(monkeypatch):
+def test_special_channel_names_are_joined():
     # 특수 채널명 붙여쓰기(하이픈 없음): 표시명 알림(tag 봇상태) 등. (빈이름 폐기 — 정상명).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     created = {n for n, _ in guild.created}
@@ -1797,11 +1584,9 @@ def test_special_channel_names_are_joined(monkeypatch):
     assert not any("-" in n for n in created)  # 하이픈 없음
 
 
-def test_rename_rejected_keeps_mapping(monkeypatch):
+def test_rename_rejected_keeps_mapping():
     # 디스코드가 리네임 거부(400 등) → 기존명 보존하되 channel_map 매핑은 유지(라우팅 안 깨짐).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     simple = _FakeChannel(700, "구이름", reject_rename=True)  # 목표명과 달라 리네임 시도됨
     a._channel_map = {700: ("role", "봇상태")}
     _guild_for(a, text_channels=[simple])
@@ -1810,21 +1595,8 @@ def test_rename_rejected_keeps_mapping(monkeypatch):
     assert a._channel_map[700] == ("role", "봇상태")  # 매핑 유지(라우팅 OK)
 
 
-def test_label_fallback_to_folder_when_no_label(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_voice_playlist_renames_default_general():
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["etf_info"])
-    guild = _guild_for(a)
-    asyncio.run(a._ensure_channels())
-    # 라벨 없음 → 폴더명으로 생성(매핑 tag=폴더)
-    assert ("project", "etf_info") in set(a._channel_map.values())
-    assert any(n == "etf_info" for n, _ in guild.created)
-
-
-def test_voice_playlist_renames_default_general(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     default_voice = _FakeChannel(900, "일반")
     guild = _guild_for(a, voice_channels=[default_voice])
     asyncio.run(a._ensure_channels())
@@ -1833,21 +1605,17 @@ def test_voice_playlist_renames_default_general(monkeypatch):
     assert a._channel_map[900] == ("role", "playlist")
 
 
-def test_voice_playlist_created_when_no_default(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_voice_playlist_created_when_no_default():
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     assert guild.voice_created == ["PlayList"]
     assert ("role", "playlist") in set(a._channel_map.values())
 
 
-def test_voice_playlist_idempotent_when_named(monkeypatch):
+def test_voice_playlist_idempotent_when_named():
     # 이미 'PlayList' 이면 재기동해도 리네임 안 함(정확 일치 skip, 실패 재시도 없음).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     existing = _FakeChannel(901, "PlayList")
     a._channel_map = {901: ("role", "playlist")}
     guild = _guild_for(a, voice_channels=[existing])
@@ -1855,26 +1623,25 @@ def test_voice_playlist_idempotent_when_named(monkeypatch):
     assert guild.voice_created == [] and existing.renames == []
 
 
-def test_categories_ordered(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_categories_ordered():
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["etf_info"])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     order = {discord_adapter._cat_core(c.name): c.position for c in guild.categories}
-    # 간단처리·데이터분석은 2026-08-16 제거 — 순서가 앞으로 당겨졌다.
-    assert order["프로젝트"] == 0
-    assert order["스케쥴러"] == 1  # 🗓️ 스케쥴러 (프로젝트 아래·시스템 위)
-    assert order["시스템"] == 2
-    assert order["playlist"] == 3  # 🎵 PlayList (시스템 아래)
+    assert order["스케쥴러"] == 0  # 🗓️ 스케쥴러 (시스템 위)
+    assert order["시스템"] == 1
+    assert order["playlist"] == 2  # 🎵 PlayList (시스템 아래)
 
 
-def test_scheduler_category_in_order_between_data_and_system():
-    # 🗓️ 스케쥴러 = _CAT_ORDER index 1(프로젝트 아래·시스템 위).
-    order = discord_adapter._CAT_ORDER
-    assert order.index(discord_adapter._CAT_SCHED) == 1
-    assert order[2] == discord_adapter._CAT_SYSTEM
+def test_scheduler_category_in_order_before_system():
+    # 🗓️ 스케쥴러 = _CAT_ORDER index 0(시스템 위). 📁 프로젝트 카테고리는 더 이상 만들지 않는다.
+    assert discord_adapter._CAT_ORDER == [
+        discord_adapter._CAT_SCHED,
+        discord_adapter._CAT_SYSTEM,
+        discord_adapter._CAT_VOICE,
+    ]
     assert discord_adapter._CAT_ALIASES[discord_adapter._CAT_SCHED] == ["스케쥴러"]
+    assert not hasattr(discord_adapter, "_CAT_PROJECT")
 
 
 def test_scheduler_special_role_channels():
@@ -1903,11 +1670,9 @@ def test_scheduler_special_role_channels():
     assert "미국주식" in discord_adapter._READONLY_TAGS
 
 
-def test_scheduler_channels_created_and_mapped(monkeypatch):
+def test_scheduler_channels_created_and_mapped():
     # 새 카테고리 🗓️ 스케쥴러 아래에 마이크론 role 채널 생성 + channel_map 매핑.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     tags = set(a._channel_map.values())
@@ -1919,11 +1684,9 @@ def test_scheduler_channels_created_and_mapped(monkeypatch):
     assert any(discord_adapter._cat_core(c.name) == "스케쥴러" for c in guild.categories)
 
 
-def test_existing_us_channel_is_renamed_not_recreated(monkeypatch):
+def test_existing_us_channel_is_renamed_not_recreated():
     """표시명 변경은 **기존 채널 rename** 이어야 한다 — 새로 만들면 히스토리·권한이 사라진다."""
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     old = _FakeChannel(777, "미국주식", overwrites={"@everyone": False, "bot": True})
     a._channel_map = {777: ("role", "미국주식")}
     guild = _guild_for(a, text_channels=[old])
@@ -1933,11 +1696,9 @@ def test_existing_us_channel_is_renamed_not_recreated(monkeypatch):
     assert a._channel_map[777] == ("role", "미국주식")  # tag 는 그대로 → 라우팅 유지
 
 
-def test_us_channel_is_readonly_for_people_but_writable_by_bot(monkeypatch):
+def test_us_channel_is_readonly_for_people_but_writable_by_bot():
     # #마이크론 은 읽기 전용(사용자: "매일 보는 용도로만"). **봇까지 잠그면 카드가 못 나간다.**
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     ch = next(c for c in guild.text_channels if c.name == "마이크론")
@@ -1947,11 +1708,9 @@ def test_us_channel_is_readonly_for_people_but_writable_by_bot(monkeypatch):
     assert others and all(c.perm_calls == [] for c in others)  # 다른 채널은 안 건드린다
 
 
-def test_us_channel_readonly_is_idempotent(monkeypatch):
+def test_us_channel_readonly_is_idempotent():
     # 이미 적용돼 있으면 아무것도 하지 않는다(재기동마다 감사 로그를 남기지 않게).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     ch = _FakeChannel(777, "미국주식", overwrites={"@everyone": False, "bot": True})
     a._channel_map = {777: ("role", "미국주식")}
     _guild_for(a, text_channels=[ch])
@@ -2122,70 +1881,46 @@ def test_ensure_readonly_skips_when_guild_role_info_is_missing(missing, caplog):
     assert "길드 역할 정보 없음" in caplog.text
 
 
-def test_categories_created_with_emoji(monkeypatch):
+def test_categories_created_with_emoji():
     # #1: 카테고리 헤더에 이모지 표시명으로 생성.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     names = {c.name for c in guild.categories}
-    assert {"📁 프로젝트", "⚙️ 시스템", "🎵 PlayList"} <= names
+    assert names == {"🗓️ 스케쥴러", "⚙️ 시스템", "🎵 PlayList"}  # 📁 프로젝트는 만들지 않는다
 
 
-def test_existing_category_renamed_to_emoji_idempotent(monkeypatch):
-    # 기존 '간단처리'(이모지 없음) → '🗂️ 간단처리' 로 rename. 재기동 시 이미 이모지형이면 skip.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_existing_category_renamed_to_emoji_idempotent():
+    # 기존 '스케쥴러'(이모지 없음) → '🗓️ 스케쥴러' 로 rename. 재기동 시 이미 이모지형이면 skip.
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
-    plain = _FakeCategory("프로젝트")
+    plain = _FakeCategory("스케쥴러")
     already = _FakeCategory("⚙️ 시스템")  # 이미 이모지형
     _guild_for(a, categories=[plain, already])
     asyncio.run(a._ensure_channels())
-    assert plain.renames == ["📁 프로젝트"]  # 코어명 매칭 → 이모지 rename
+    assert plain.renames == ["🗓️ 스케쥴러"]  # 코어명 매칭 → 이모지 rename
     assert already.renames == []  # 정확 일치 → skip(멱등)
 
 
-def test_voice_category_renamed_from_old_name(monkeypatch):
+def test_voice_category_renamed_from_old_name():
     # 음성 카테고리 이전 이름 '음성' → '🎵 PlayList' 로 이관(별칭 매칭).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     old_voice = _FakeCategory("음성")
     _guild_for(a, categories=[old_voice])
     asyncio.run(a._ensure_channels())
     assert old_voice.renames == ["🎵 PlayList"]
 
 
-def test_project_order_h_channels_first(monkeypatch):
-    # #2: pdf_restyler·H_security_sheet 를 맨 위. 정본 순서로 재정렬.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_default_general_text_deleted():
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["trading_info", "pdf_restyler"])  # 입력 순서 무관
-    trading = _FakeChannel(10, "trading_info", position=0)
-    pdf = _FakeChannel(20, "pdf_restyler", position=1)
-    a._channel_map = {10: ("project", "trading_info"), 20: ("project", "pdf_restyler")}
-    _guild_for(a, text_channels=[trading, pdf])
-    asyncio.run(a._ensure_channels())
-    # 정본: pdf_restyler(0) → trading_info(1)
-    assert pdf.position == 0 and trading.position == 1
-
-
-def test_default_general_text_deleted(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     general = _FakeChannel(950, "일반")  # 기본 텍스트(맵에 없음 = 봇 생성 아님)
     _guild_for(a, text_channels=[general])
     asyncio.run(a._ensure_channels())
     assert general.deleted is True
 
 
-def test_default_general_kept_if_bot_channel(monkeypatch):
+def test_default_general_kept_if_bot_channel():
     # 안전장치: 이름이 '일반'이어도 봇이 만든(new_map 등록) 채널이면 삭제 안 함.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {"weird": "일반"})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["weird"])
     a._channel_map = {950: ("project", "weird")}
     botch = _FakeChannel(950, "일반")  # 봇이 라벨 '일반'으로 만든 채널(맵에 있음)
     _guild_for(a, text_channels=[botch])
@@ -2193,40 +1928,9 @@ def test_default_general_kept_if_bot_channel(monkeypatch):
     assert botch.deleted is False
 
 
-def test_project_channels_ordered_by_labels_json(monkeypatch):
-    # #4: 프로젝트 채널 내부 순서 = project_labels.json 순(위치 뒤섞인 기존 채널 재정렬).
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {"trading_info": "A", "etf_info": "B"})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["etf_info", "trading_info"])  # list_projects 알파벳순(정본 아님)
-    # 기존 채널이 역순 position(etf=0, trading=1) — 재정렬 필요
-    etf = _FakeChannel(10, "b", position=0)
-    trading = _FakeChannel(20, "a", position=1)
-    a._channel_map = {10: ("project", "etf_info"), 20: ("project", "trading_info")}
-    _guild_for(a, text_channels=[etf, trading])
-    asyncio.run(a._ensure_channels())
-    # labels.json 순 = trading_info→etf_info → position 재설정(trading=0, etf=1)
-    assert trading.position == 0 and etf.position == 1
-
-
-def test_project_order_idempotent_when_already_sorted(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {"trading_info": "A", "etf_info": "B"})
-    a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels(["etf_info", "trading_info"])
-    trading = _FakeChannel(20, "a", position=0)  # 이미 정렬됨
-    etf = _FakeChannel(10, "b", position=1)
-    a._channel_map = {10: ("project", "etf_info"), 20: ("project", "trading_info")}
-    _guild_for(a, text_channels=[trading, etf])
-    asyncio.run(a._ensure_channels())
-    assert trading.renames == [] and etf.renames == []  # 이름도 이미 맞음
-    # position edit 없이 순서 그대로(멱등)
-    assert trading.position == 0 and etf.position == 1
-
-
-def test_empty_default_categories_deleted(monkeypatch):
+def test_empty_default_categories_deleted():
     # #5: 비어있는 기본 카테고리(채팅 채널/음성 채널)만 삭제 — 이중 가드.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     empty_text = _FakeCategory("채팅 채널", channels=[])
     empty_voice = _FakeCategory("Voice Channels", channels=[])
     _guild_for(a, categories=[empty_text, empty_voice])
@@ -2234,10 +1938,8 @@ def test_empty_default_categories_deleted(monkeypatch):
     assert empty_text.deleted is True and empty_voice.deleted is True
 
 
-def test_nonempty_default_category_kept(monkeypatch):
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_nonempty_default_category_kept():
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     survivor = _FakeChannel(1, "잡담")
     nonempty = _FakeCategory("채팅 채널", channels=[survivor])
     _guild_for(a, categories=[nonempty])
@@ -2245,11 +1947,9 @@ def test_nonempty_default_category_kept(monkeypatch):
     assert nonempty.deleted is False  # 안 비었으면 보존
 
 
-def test_bot_category_not_deleted_even_if_empty(monkeypatch):
-    # 봇 카테고리(프로젝트 등)는 기본 이름 목록에 없어 삭제 대상 아님.
-    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+def test_bot_category_not_deleted_even_if_empty():
+    # 봇 카테고리(스케쥴러 등)는 기본 이름 목록에 없어 삭제 대상 아님.
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a.setup_channels([])
     guild = _guild_for(a)
     asyncio.run(a._ensure_channels())
     assert all(not c.deleted for c in guild.categories)  # 봇 카테고리 보존
@@ -2269,124 +1969,10 @@ def _all_buttons(view):
     return out
 
 
-def test_render_project_view_is_vertical_one_per_row():
-    names = ["a", "b", "c", "d", "e", "f", "g"]  # 7개 — classic View 5행 한도 초과
-    view = discord_adapter.render_project_view("대상 프로젝트 7", project_buttons(names))
-    rows = [it for it in view.children if isinstance(it, discord.ui.ActionRow)]
-    assert len(rows) == 7  # 세로 1열: 프로젝트당 ActionRow 1개
-    assert all(len(r.children) == 1 for r in rows)  # 행마다 버튼 1개
-    btns = _all_buttons(view)
-    assert [b.custom_id for b in btns] == [f"p:{n}" for n in names]
-    assert all(b.style == discord.ButtonStyle.primary for b in btns)  # 다크 대비 블러플
-
-
-def test_render_project_view_empty_header_buttons_only():
-    # /projects 는 헤더 텍스트 없음(빈 header) → TextDisplay 생략, 버튼만.
-    view = discord_adapter.render_project_view("", project_buttons(["a", "b"]))
-    assert not any(isinstance(it, discord.ui.TextDisplay) for it in view.children)
-    assert len(_all_buttons(view)) == 2
-
-
-def test_render_project_view_nonempty_header_keeps_textdisplay():
-    # 못 찾음 등 의미 있는 안내는 TextDisplay 로 유지(버튼 + 사유).
-    view = discord_adapter.render_project_view(
-        "'x' 프로젝트를 찾지 못했습니다", project_buttons(["a"])
-    )
-    assert any(isinstance(it, discord.ui.TextDisplay) for it in view.children)
-
-
-def test_is_vertical_list_detects_p_and_c():
-    from bridge import choice_buttons
-
-    assert discord_adapter._is_vertical_list(project_buttons(["a", "b"]))  # p:
-    assert discord_adapter._is_vertical_list(choice_buttons(55, [("유지", "keep")]))  # c:
-    assert not discord_adapter._is_vertical_list(push_buttons())  # push/x → 가로 유지
-    assert not discord_adapter._is_vertical_list([])
-    assert not discord_adapter._is_vertical_list(None)
-
-
-def test_send_project_list_routes_to_v2_view_coro():
-    a = _adapter()
-    calls = []
-    a._send_view_coro = lambda cid, view: ("v2", cid, view)  # type: ignore[assignment]
-    a._send_coro = lambda cid, body, view: ("classic", cid, body, view)  # type: ignore[assignment]
-
-    def fake_run(coro):
-        calls.append(coro)
-        return 321
-
-    a._run = fake_run  # type: ignore[assignment]
-    mid = a.send(100, "대상 프로젝트 2", project_buttons(["a", "b"]))
-    assert mid == 321
-    assert calls[0][0] == "v2"  # 클래식 _emit 경로 아님
-    view = calls[0][2]
-    assert isinstance(view, discord.ui.LayoutView)
-
-
-def test_send_non_project_buttons_still_classic():
-    a = _adapter()
-    calls = _stub_calls(a, [111])
-    a.send(100, HEADER_NOTE + "\n\npush?", push_buttons())  # p: 아님 → classic View 경로
-    assert calls[0][0] == "send"  # _send_coro(classic) 사용
-
-
-def test_send_choice_buttons_routes_to_v2_and_tracks_id():
-    from bridge import choice_buttons
-
-    a = _adapter()
-    calls = []
-    a._send_view_coro = lambda cid, view: ("v2", cid, view)  # type: ignore[assignment]
-    a._send_coro = lambda cid, body, view: ("classic", cid, body, view)  # type: ignore[assignment]
-
-    def fake_run(coro):
-        calls.append(coro)
-        return 900
-
-    a._run = fake_run  # type: ignore[assignment]
-    mid = a.send(100, "↳ 택일 하세요:", choice_buttons(0, [("유지", "keep"), ("교체", "swap")]))
-    assert mid == 900
-    assert calls[0][0] == "v2"  # 선택지(c:)도 세로 V2 경로
-    assert isinstance(calls[0][2], discord.ui.LayoutView)
-    assert 900 in a._v2_messages  # 이후 edit 이 V2 로 유지되도록 id 기록
-
-
-def test_edit_tracked_v2_message_routes_to_v2_view_coro():
-    from bridge import choice_buttons
-
-    a = _adapter()
-    a._v2_messages.add(900)  # send 가 V2 로 만든 선택지 메시지라고 가정
-    calls = []
-    a._edit_view_coro = lambda cid, mid, view: ("v2edit", cid, mid, view)  # type: ignore[assignment]
-    a._edit_coro = lambda cid, mid, body, view: ("classicedit", cid, mid, body, view)  # type: ignore[assignment]
-    a._run = lambda coro: calls.append(coro)  # type: ignore[assignment]
-    # 실제 id 로 버튼 갱신(V2→V2)
-    a.edit(100, 900, "↳ 택일 하세요:", choice_buttons(900, [("유지", "keep")]))
-    assert calls[0][0] == "v2edit"
-    assert isinstance(calls[0][3], discord.ui.LayoutView)
-    # 버튼 제거(선택 확정) — buttons=None 도 V2 유지(TextDisplay 만, 400 방지)
-    calls.clear()
-    a.edit(100, 900, "선택: 유지")
-    assert calls[0][0] == "v2edit"
-    assert isinstance(calls[0][3], discord.ui.LayoutView)
-
-
-def test_edit_untracked_message_stays_classic():
-    a = _adapter()
-    calls = _stub_calls(a, [None])
-    a.edit(100, 42, "짧음")  # _v2_messages 에 없음 → classic 경로
-    assert calls[0][0] == "edit"  # _edit_coro(classic)
-
-
 # ---------------------------------------------------------------------------
 # 무회귀 골든 — 일상 회신의 렌더 결과를 문자 단위로 고정한다. 여기가 깨지면 폰에서 받는
 # 회신(진행·완료·실패·확인·예약알림·목록·선택지)이 전부 바뀐 것이다.
 # ---------------------------------------------------------------------------
-def _stub_all(adapter, ids):
-    """_stub_calls + V2(LayoutView) 코루틴까지 — 목록·선택지가 실코루틴을 만들지 않게."""
-    calls = _stub_calls(adapter, ids)
-    adapter._send_view_coro = lambda cid, view: ("sendv", cid, view)  # type: ignore[assignment]
-    adapter._edit_view_coro = lambda cid, mid, view: ("editv", cid, mid, view)  # type: ignore[assignment]
-    return calls
 
 
 def _payload(call):
@@ -2403,126 +1989,6 @@ def _cids(call):
 
 
 _BASE = 15645517, 4116357, 15750747, 5793266  # 노랑·초록·빨강·블러플(값까지 고정)
-
-
-def _kinds():
-    from bridge import HEADER_CHOICE, choice_buttons
-
-    wait, done, fail, info = _BASE
-    return [
-        (
-            "🔄 작업 중\n\n프로젝트: x",
-            push_buttons(),
-            (
-                "E",
-                {
-                    "flags": 0,
-                    "color": wait,
-                    "type": "rich",
-                    "description": "프로젝트: x",
-                    "title": "🔄 작업 중",
-                },
-            ),
-            ["push", "x"],
-        ),
-        (
-            f"{HEADER_DONE}\n\n다 됐습니다 SECRET",
-            None,
-            (
-                "E",
-                {
-                    "flags": 0,
-                    "color": done,
-                    "type": "rich",
-                    "description": "다 됐습니다 ***",
-                    "title": "✅처리완료",
-                },
-            ),
-            None,
-        ),
-        (
-            f"{HEADER_FAIL}\n\n오류",
-            None,
-            (
-                "E",
-                {
-                    "flags": 0,
-                    "color": fail,
-                    "type": "rich",
-                    "description": "오류",
-                    "title": "❌처리실패",
-                },
-            ),
-            None,
-        ),
-        (
-            f"{HEADER_NOTE}\n\n뭐 할까요",
-            None,
-            (
-                "E",
-                {
-                    "flags": 0,
-                    "color": info,
-                    "type": "rich",
-                    "description": "뭐 할까요",
-                    "title": "📌추가 확인사항",
-                },
-            ),
-            None,
-        ),
-        ("⏰ 알림\n\n장 열림", None, ("P", "⏰ 알림\n\n장 열림"), None),
-        (
-            f"{HEADER_CHOICE}\n\n고르세요",
-            None,
-            (
-                "E",
-                {
-                    "flags": 0,
-                    "color": info,
-                    "type": "rich",
-                    "description": "고르세요",
-                    "title": "❓선택",
-                },
-            ),
-            None,
-        ),
-        ("대상 프로젝트 3", None, ("P", "대상 프로젝트 3"), None),
-        ("", None, ("P", "(빈 응답)"), None),
-        (
-            "대상 프로젝트",
-            project_buttons(["a", "b"]),
-            ("V2", ["TextDisplay", "ActionRow", "ActionRow"]),
-            None,
-        ),
-        (
-            "골라",
-            choice_buttons(55, [("유지", "k"), ("교체", "s")]),
-            ("V2", ["TextDisplay", "ActionRow", "ActionRow", "ActionRow"]),
-            None,
-        ),
-    ]
-
-
-@pytest.mark.parametrize(("text", "buttons", "expect", "cids"), _kinds())
-def test_send_payload_kinds_baseline(text, buttons, expect, cids):
-    a = _adapter(secrets=["SECRET"])
-    calls = _stub_all(a, [1, 2])
-    a.send(100, text, buttons)
-    assert len(calls) == 1 and _payload(calls[0]) == expect
-    if expect[0] != "V2":
-        assert _cids(calls[0]) == cids
-
-
-@pytest.mark.parametrize(("text", "buttons", "expect", "_cid"), _kinds())
-def test_edit_payload_kinds_baseline(text, buttons, expect, _cid):
-    a = _adapter(secrets=["SECRET"])
-    calls = _stub_all(a, [None, None])
-    a.edit(100, 42, text, buttons)
-    got = _payload(calls[0])
-    if expect[0] == "V2":  # 목록·선택지는 send 가 V2 로 만들었을 때만 V2 편집(미추적 → classic)
-        assert got[0] in ("P", "E")
-    else:
-        assert got == expect
 
 
 # ---------------------------------------------------------------------------

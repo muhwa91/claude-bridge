@@ -15,7 +15,8 @@ import bridge  # sys.path 주입 뒤에만 임포트 가능
 # 경로 상수 하나만 옛 경로에 남았는데 테스트 1,362건이 전부 통과했다. 쓰는 테스트가
 # 하나같이 monkeypatch 해서 실경로를 아무도 안 봤기 때문).
 LIVE_PATHS = {
-    "PROJECT_LABELS": bridge.REPO_ROOT / "_System" / "Core" / "project_labels.json",
+    "JUDGE_PROJECT_DIR": bridge.JUDGE_PROJECT_DIR,  # launch_judge 의 cwd — 없으면 판정 입구 실패
+    "SNS_INBOX_DIR": bridge.SNS_INBOX_DIR,  # 옵시디언 수집함 — 없으면 노트가 엉뚱한 곳에 쌓인다
 }
 
 # 위 경로는 **모노레포 안에서만** 실물이 있다. 공개 미러(`muhwa91/claude-bridge`)는 이 프로젝트

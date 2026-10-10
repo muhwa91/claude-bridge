@@ -13,7 +13,6 @@ from __future__ import annotations
 import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol
 
 
@@ -22,9 +21,9 @@ class Button:
     """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
-    # 정규화 액션: push|x|p|c|clean:ok|clean:link|clean:all|clean:x|sns_judge.
+    # 정규화 액션: clean:ok|clean:link|clean:all|clean:x|sns_judge.
     action: str
-    arg: str = ""  # 액션 인자(프로젝트명·item_id·"mid:idx"·idx 등)
+    arg: str = ""  # 액션 인자(현재 쓰는 액션은 모두 인자 없음)
     # 어댑터가 플랫폼 색으로 매핑(§4.7 델타1): success=승인(초록)/primary=실행(블루)/
     # danger=파괴 전용(빨강)/secondary=그 외(회색). "default"는 secondary 동의어(하위호환).
     style: str = "default"  # "default"|"secondary"|"primary"|"success"|"danger"
@@ -34,30 +33,31 @@ class Button:
 class Event:
     """플랫폼 이벤트를 정규화한 코어 입력."""
 
-    kind: str  # "text"|"photo"|"button"|"command"
+    kind: str  # "text"|"button"
     channel_id: int  # 격리·라우팅 키 (channel.id)
     user_id: int  # 인가 키 (author.id) — 허용목록 대조
-    text: str = ""  # 본문 or 사진 캡션
+    text: str = ""  # 본문
     message_id: int | None = None  # 편집 대상
     action: str = ""  # 버튼 정규화 액션(kind=="button")
     action_arg: str = ""  # 버튼 인자
     callback_id: str | None = None  # ack 핸들 (interaction 토큰)
-    photo_ref: str | None = None  # 파일 핸들 (attachment.url)
-    project: str | None = None  # 어댑터가 채널→프로젝트(channel_map)를 미리 채움. 미매핑(DM)은 None
-    # ①(채널 자동생성): 특수 채널 역할 태그("간단처리"|"데이터분석"|"봇상태"). 어댑터가
-    # channel_map 으로 채운다. 프로젝트 채널은 project, 특수 채널은 이 필드로 라우팅. 미매핑은 None.
+    # 옛 프로젝트 채널(channel_map 의 kind="project")이면 그 폴더명 — 코어는 이 채널의 메시지를
+    # 무시한다(프로젝트 원격 작업 폐지). 새 채널은 만들지 않아 옛 맵 항목에서만 채워진다.
+    project: str | None = None
+    # 특수 채널 역할 태그("미국주식"|"SNS정보"|"봇상태"|"playlist"). 어댑터가 channel_map 으로
+    # 채운다. 미매핑은 None.
     channel_role: str | None = None
 
 
 class Adapter(Protocol):
     """플랫폼 어댑터 계약(동결). 코어는 이 인터페이스만 호출한다.
 
-    계약 메서드(poll·send·edit·ack·fetch_file·close·setup_channels·role_channel·project_channel·
-    clear_channel·play_music·stop_music·skip_music)와 2 dataclass 는 플랫폼 교체 seam 이라 불변
+    계약 메서드(poll·send·edit·ack·close·role_channel·clear_channel·play_music·stop_music·
+    skip_music)와 2 dataclass 는 플랫폼 교체 seam 이라 불변
     (과설계 금지, §5.1). play/stop/skip_music 은 음성재생 capability(디스코드 전용). 현재 구현은
     디스코드 1개지만, 계약을 이 인터페이스로 고정해 다른 플랫폼으로 교체 가능한 구조를 유지한다.
-    `secrets`: 마스킹 대상(봇토큰·내부경로). 생성 시 주입·보관(§2.1) — 코어의 L-1 진행 마스킹이
-    잘라내기 전에 참조하므로 계약면에 노출한다(공유 속성 1개).
+    `secrets`: 마스킹 대상(봇토큰·내부경로). 생성 시 주입·보관(§2.1) — 코어가 잘라내기 전에
+    참조하므로 계약면에 노출한다(공유 속성 1개).
     """
 
     secrets: list[str]
@@ -89,34 +89,15 @@ class Adapter(Protocol):
         """버튼 탭 응답(이미 defer 됨 — callback_id 소비). callback_id=None 이면 no-op."""
         ...
 
-    def fetch_file(self, photo_ref: str, dest_dir: Path) -> Path:
-        """파일 다운로드(도메인·크기·확장자·트래버설 잠금). 위반·실패는 예외 전파."""
-        ...
-
     def close(self) -> None:
         """연결 정리(디스코드 Gateway 종료). 중복 호출 무해."""
-        ...
-
-    def setup_channels(self, project_names: list[str]) -> None:
-        """①(채널 자동생성): 봇 기동 시 1회 카테고리·채널 구성(있으면 재사용).
-
-        project_names = 프로젝트 카테고리 채널 목록(코어 list_projects). 특수 채널(간단처리·데이터
-        분석·봇상태) 구조는 어댑터가 안다. channelID→역할/폴더 매핑을 영속(channel_map.json).
-        """
         ...
 
     def role_channel(self, role: str) -> int | None:
         """특수 채널 역할("봇상태"|…) → channelID(channel_map 역조회). 없으면 None.
 
-        DM 폐기로 시스템 소식(기동·재연결·로그인 만료 등)이 이 채널로 간다. 매핑이 없으면
+        시스템 소식(기동·재연결·로그인 만료 등)이 이 채널로 간다. 매핑이 없으면
         (자동생성 실패) None 을 반환하고 코어가 해당 발송을 스킵/폴백한다.
-        """
-        ...
-
-    def project_channel(self, project: str) -> int | None:
-        """프로젝트 폴더명 → 그 프로젝트 채널 channelID(channel_map 역조회). 없으면 None.
-
-        프로젝트 알림의 발송 채널 라우팅에 쓴다(없으면 #봇상태 폴백).
         """
         ...
 
@@ -248,53 +229,23 @@ def chunk_text(text: str, limit: int) -> list[str]:
 
 # 인자 없는 버튼 액션(custom_id = 액션 그대로). sns_judge 는 «누른 그 카드» 가 대상이라
 # 인자가 필요 없다 — 카드 id 는 Event.message_id 로 온다.
-_BARE_ACTIONS = ("push", "x", "clean:ok", "clean:link", "clean:all", "clean:x", "sns_judge")
+_BARE_ACTIONS = ("clean:ok", "clean:link", "clean:all", "clean:x", "sns_judge")
 
 
 def parse_callback(data: str) -> tuple[str, str] | None:
     """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
 
-    `push`/`x`/`clean:ok`/`sns_judge` → (그대로, ""), `p:<name>` → ("p", name),
-    정확 매칭만 — 화이트리스트 밖(삭제된 옛 `nb:*` 버튼 포함)은 None 이라 코어가 ack 후 무시한다.
+    `clean:*`/`sns_judge` → (그대로, ""). 정확 매칭만 — 화이트리스트 밖(삭제된 옛 `nb:*`·
+    `push`·`p:*`·`c:*` 버튼 포함)은 None 이라 코어가 ack 후 무시한다.
     """
     if data in _BARE_ACTIONS:
         return (data, "")
-    if data.startswith("p:") and len(data) > 2:
-        return ("p", data[2:])
-    if data.startswith("c:"):
-        # c:<msg_id>:<idx|other> — msg_id 정수, 선택은 정수 인덱스 또는 'other'.
-        # L-3: isascii() 병행으로 전각·위첨자 등 유니코드 숫자(int() 통과)를 차단.
-        parts = data.split(":")
-        mid_ok = len(parts) == 3 and parts[1].isascii() and parts[1].isdigit()
-        sel_ok = mid_ok and (parts[2] == "other" or (parts[2].isascii() and parts[2].isdigit()))
-        if sel_ok:
-            return ("c", f"{parts[1]}:{parts[2]}")
-        return None
     return None
 
 
-def encode_callback(action: str, arg: str) -> str:
-    """정규화 (action, arg) → callback_data 문자열(parse_callback 의 역함수).
-
-    코어 Button.action/arg 를 어댑터 전송 문자열로 직렬화. 디코드(parse_callback)의 역.
-    """
-    if action in _BARE_ACTIONS:
-        return action
-    # 콜론-join 액션(§1.3): arg(프로젝트명·"mid:idx")를 그대로 이어붙인다.
-    if action in ("p", "c"):
-        return f"{action}:{arg}"
-    return action  # 방출측이 유효 액션만 넘기므로 폴백은 그대로
-
-
-# ── 사진 다운로드 공유 상수·리다이렉트 차단 opener(어댑터 fetch_file 이 재사용) ──
-MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10MB 상한
-PHOTO_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
-
-
-# M-3: 리다이렉트 차단 opener. 화이트리스트 CDN 이 3xx 로 내부주소(오라클 메타데이터
-# 169.254.169.254 등)를 가리켜도 추종하지 않는다 — redirect_request→None 이면 urllib 이 그 3xx 를
-# HTTPError 로 승격해(추종 안 함) 내부주소 재요청을 원천 차단한다. 사진 다운로드(fetch_file)만 이
-# opener 를 쓴다 — 고정호스트 REST 는 무관.
+# 리다이렉트 차단 opener — 고정 호스트 GET(kworb·유튜브 API)이 3xx 로 내부주소(오라클 메타데이터
+# 169.254.169.254 등)를 가리켜도 추종하지 않는다. redirect_request→None 이면 urllib 이 그 3xx 를
+# HTTPError 로 승격해(추종 안 함) 내부주소 재요청을 원천 차단한다.
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
         # 3xx 를 추종하지 않음 → urllib 이 HTTPError 로 승격(내부주소 재요청 원천 차단).

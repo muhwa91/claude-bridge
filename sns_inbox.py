@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SNS정보 수집 — `#SNS정보` 에 공유된 인스타·X 링크를 옵시디언 수집함 노트로 만든다(순수 부분).
+"""SNS정보 수집 — `#SNS정보` 의 인스타·X·GitHub 링크를 옵시디언 수집함 노트로 만든다(순수 부분).
 
 설계 정본은 `docs/기능/SNS정보_수집/01_계획.md` 다. 이 모듈은 **디스코드·어댑터 의존 0**·stdlib 전용
 이고, 채널 히스토리 읽기·카드 전송·상태 파일·버튼은 bridge 가 한다(us_digest 와 같은 경계).
@@ -19,11 +19,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-# 인스타·X 만(계획 §1). 호스트는 정확 일치 — 서브도메인 꼬리(`.evil.com`)를 정규식에 맡기지 않는다.
+# 인스타·X·GitHub 만(계획 §1). 호스트는 정확 일치 — 서브도메인 꼬리(`.evil.com`)를 막는다.
 _INSTA_HOSTS = frozenset({"instagram.com", "www.instagram.com", "m.instagram.com"})
 _X_HOSTS = frozenset(
     {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
 )
+_GH_HOSTS = frozenset({"github.com", "www.github.com"})
 _URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
 # 🔴 숫자는 `\d` 가 아니라 `[0-9]` — `\d` 는 유니코드 숫자(전각·아랍 숫자)도 받는다.
 # 문자 클래스는 전부 ASCII 로 명시해 파일명에 들어가는 id 가 `[A-Za-z0-9_-]` 밖으로 못 나간다.
@@ -38,12 +39,43 @@ _X_PATH_RE = re.compile(
     r"(?:/(?:photo|video)/[0-9]{1,2})?/?"
 )
 
-PLATFORM_LABEL = {"insta": "인스타", "x": "X"}
+# GitHub: 저장소 `/<owner>/<repo>` 만 — 뒤의 `/tree/…`·`/issues/1` 등은 저장소 주소로 정규화한다.
+# owner 는 영숫자·하이픈(GitHub 규칙 — `_` 없음)이라 id `<owner>_<repo>` 의 첫 `_` 가 경계다.
+_GH_PATH_RE = re.compile(r"/([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})(?:/.*)?")
+# 저장소가 아닌 GitHub 페이지(`/topics/ai`·`/orgs/x/repositories` 등) — owner 자리에 오는 예약어.
+_GH_RESERVED = frozenset(
+    {
+        "orgs",
+        "topics",
+        "trending",
+        "collections",
+        "features",
+        "settings",
+        "marketplace",
+        "sponsors",
+        "explore",
+        "search",
+        "notifications",
+        "apps",
+        "users",
+        "login",
+        "about",
+        "pricing",
+        "enterprise",
+        "site",
+        "security",
+        "events",
+        "readme",
+        "customer-stories",
+    }
+)
+
+PLATFORM_LABEL = {"insta": "인스타", "x": "X", "gh": "GitHub"}
 
 
 @dataclass(frozen=True)
 class Link:
-    platform: str  # "insta" | "x"
+    platform: str  # "insta" | "x" | "gh"
     post_id: str  # 파일명에 쓰는 id — [A-Za-z0-9_-] 만(정규식이 보장)
     url: str  # 정규 URL(쿼리스트링·조각 제거)
     kind: str = ""  # 중복 키 구분 — 인스타 공유 토큰은 "share"(shortcode 와 다른 이름공간)
@@ -55,7 +87,7 @@ class Link:
 
 
 def parse_link(raw: str) -> Link | None:
-    """URL 하나 → 정규 Link. 인스타·X 게시물 주소가 아니면 None(순수)."""
+    """URL 하나 → 정규 Link. 인스타·X 게시물·GitHub 저장소 주소가 아니면 None(순수)."""
     try:
         parts = urllib.parse.urlsplit(raw)
     except ValueError:
@@ -88,11 +120,21 @@ def parse_link(raw: str) -> Link | None:
             return Link("x", status, f"https://x.com/i/web/status/{status}")
         user, status = m.group(2).lower(), m.group(3)
         return Link("x", status, f"https://x.com/{user}/status/{status}")
+    if host in _GH_HOSTS:
+        m = _GH_PATH_RE.fullmatch(path)
+        if m is None or m.group(1).lower() in _GH_RESERVED:
+            return None
+        owner, repo = m.group(1).lower(), m.group(2).lower().removesuffix(".git")
+        if not repo:
+            return None
+        # ponytail: `.` 은 파일명 id 에 못 들어가 `-` 로 바꾼다 — `a.b`·`a-b` 두 저장소가 같은 키로
+        # 겹칠 수 있지만(드묾) 그때는 «중복» 으로 빠질 뿐 잘못 저장되지 않는다.
+        return Link("gh", f"{owner}_{repo.replace('.', '-')}", f"https://github.com/{owner}/{repo}")
     return None
 
 
 def extract_links(text: str) -> list[Link]:
-    """메시지 본문 → 인스타·X 정규 Link 목록(등장 순서, 메시지 안 중복 제거)."""
+    """메시지 본문 → 인스타·X·GitHub 정규 Link 목록(등장 순서, 메시지 안 중복 제거)."""
     out: dict[tuple[str, str], Link] = {}
     for raw in _URL_RE.findall(text):
         link = parse_link(raw.rstrip(".,!?"))
@@ -102,7 +144,7 @@ def extract_links(text: str) -> list[Link]:
 
 
 def source_key(value: str) -> tuple[str, str]:
-    """머리말 `출처` 값 → 중복 키. 인스타·X 면 (플랫폼, id), 아니면 ("raw", 원문)."""
+    """머리말 `출처` 값 → 중복 키. 인스타·X·GitHub 면 (플랫폼, id), 아니면 ("raw", 원문)."""
     value = value.strip().strip("\"'")
     link = parse_link(value)
     return link.key if link is not None else ("raw", value)
@@ -135,7 +177,7 @@ def known_sources(root: Path) -> set[tuple[str, str]]:
 def has_unsaved_link(text: str, saved: set[tuple[str, str]]) -> bool:
     """본문에 수집함에 **없는** 링크가 하나라도 있나 — #SNS정보 청소가 이 메시지를 남길지(순수).
 
-    인스타·X 가 아닌 링크(스토리·유튜브·threads 등)는 저장 대상이 아니라 늘 «없음» 이다. 인스타·X 는
+    대상 밖 링크(스토리·유튜브·threads 등)는 저장 대상이 아니라 늘 «없음» 이다. 인스타·X·GitHub 은
     중복 키(플랫폼, id)가 saved 에 있어야 «있음». 링크가 없는 메시지(명령·잡담·봇 카드)는 False.
     """
     for raw in _URL_RE.findall(text):
@@ -145,8 +187,16 @@ def has_unsaved_link(text: str, saved: set[tuple[str, str]]) -> bool:
     return False
 
 
+def only_judged_links(text: str, judged: set[tuple[str, str]]) -> bool:
+    """링크가 1개 이상이고 **전부** 판정이 끝났나(사용·폐기) — 판정완료 자동 삭제 대상(순수).
+
+    링크 없는 메시지(명령·잡담·봇 카드)·대상 밖 링크·미판정 링크가 하나라도 있으면 False(남긴다).
+    """
+    return bool(_URL_RE.search(text)) and not has_unsaved_link(text, judged)
+
+
 def note_name(link: Link, shared: datetime) -> str:
-    """`<yyyymmdd>_<insta|x>_<id>.md` — id 는 정규식이 [A-Za-z0-9_-] 로 잠근 값뿐."""
+    """`<yyyymmdd>_<insta|x|gh>_<id>.md` — id 는 정규식이 [A-Za-z0-9_-] 로 잠근 값뿐."""
     return f"{shared:%Y%m%d}_{link.platform}_{link.post_id}.md"
 
 
@@ -232,6 +282,14 @@ def _esc(item: dict[str, str]) -> dict[str, str]:
     return {k: escape_md(v) for k, v in item.items()}
 
 
+JUDGE_APPLY = "\n**⚙️ 적용**\n> {적용}"  # 선택 칸 — 있을 때만 사용 카드 끝에 덧붙임
+
+
+def _use_card(item: dict[str, str]) -> str:
+    e = _esc(item)
+    return JUDGE_USE_ITEM.format(**e) + (JUDGE_APPLY.format(**e) if "적용" in e else "")
+
+
 def _head_card(use: list[dict[str, str]], drop: list[dict[str, str]], drop_shown: int) -> str:
     """한 장 카드(사용 0~1건) 또는 요약 카드(사용 2건+). 묶음 사이 빈 줄 하나, 0건은 뺀다."""
     counts = [JUDGE_HEAD, JUDGE_TOTAL.format(N=len(use) + len(drop))]
@@ -246,7 +304,7 @@ def _head_card(use: list[dict[str, str]], drop: list[dict[str, str]], drop_shown
     if len(drop) > drop_shown:  # 길이 초과로 줄인 폐기 — 폐기 목록 끝에 judge_more
         blocks.append(JUDGE_MORE.format(M=len(drop) - drop_shown))
     if len(use) == 1:  # 한 장 카드 — 사용 항목은 폐기 목록 뒤
-        blocks.append(JUDGE_USE_ITEM.format(**_esc(use[0])))
+        blocks.append(_use_card(use[0]))
     return "\n\n".join(blocks)
 
 
@@ -281,9 +339,7 @@ def judge_cards(use: list[dict[str, str]], drop: list[dict[str, str]], limit: in
         head = _head_card(use, drop, drop_shown)
     cards = [_cut(head, limit)]  # 사용 1건 카드가 폐기를 다 빼고도 넘치면 마지막 방어로 자른다
     if len(use) >= 2:
-        cards += [
-            _cut(JUDGE_USE_ITEM.format(**_esc(it)), limit) for it in use[:JUDGE_USE_CARDS_MAX]
-        ]
+        cards += [_cut(_use_card(it), limit) for it in use[:JUDGE_USE_CARDS_MAX]]
     return cards
 
 
@@ -294,6 +350,7 @@ def _md(d: date) -> str:
 def card_text(
     insta: int,
     x: int,
+    gh: int,
     dup: int,
     nolink: int,
     dates: list[date],
@@ -304,7 +361,7 @@ def card_text(
     catchup = 지난 실행일이 어제보다 이르다(그 사이 실행을 놓쳤다) → sns_catchup(범위 = 저장분의
     공유일), 아니면 sns_daily. 두 경우 모두 sns_skipped 꼬리를 단다(0건인 줄은 뺀다).
     """
-    saved = insta + x
+    saved = insta + x + gh
     if saved == 0:
         return None
     if catchup and dates:
@@ -316,6 +373,8 @@ def card_text(
             lines.append(f"➡️ 인스타그램 {insta}건")
         if x:
             lines.append(f"➡️ X {x}건")
+        if gh:
+            lines.append(f"➡️ GitHub {gh}건")
     if dup:
         lines.append(f"⛔ 중복 {dup}건 Pass")
     if nolink:

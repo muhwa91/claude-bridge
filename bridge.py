@@ -2072,8 +2072,9 @@ def _restore_stale_cards(adapter: Adapter, channel_id: int, now: float | None = 
     log.info("SNS 오래된 «판정 중» 카드 %d장 되돌림", len(stale))
 
 
-def _save_sns_notes(events: list[Event]) -> tuple[int, int, int, int, list[date]]:
-    """허용 사용자 메시지의 인스타·X 링크를 미판정 노트로 쓴다 → (인스타, X, 중복, 링크X, 공유일들).
+def _save_sns_notes(events: list[Event]) -> tuple[int, int, int, int, int, list[date]]:
+    """허용 사용자 메시지의 인스타·X·GitHub 링크를 미판정 노트로 쓴다
+    → (인스타, X, GitHub, 중복, 링크X, 공유일들).
 
     중복은 (플랫폼, 게시물 id) 로 본다 — 수집함 전 노트의 `출처` + 이번 묶음. 이름이 겹치는데
     키가 다르면(대소문자만 다른 shortcode 가 NTFS 에서 한 파일이 되는 경우) `_2` 를 붙여 저장한다.
@@ -2081,7 +2082,7 @@ def _save_sns_notes(events: list[Event]) -> tuple[int, int, int, int, list[date]
     """
     inbox = SNS_INBOX_DIR / "미판정"
     seen = sns_inbox.known_sources(SNS_INBOX_DIR)
-    counts = {"insta": 0, "x": 0}
+    counts = {"insta": 0, "x": 0, "gh": 0}
     dup = nolink = 0
     dates: list[date] = []
     for ev in events:
@@ -2103,10 +2104,11 @@ def _save_sns_notes(events: list[Event]) -> tuple[int, int, int, int, list[date]
             seen.add(link.key)  # 같은 묶음 안 중복도 한 번만
             counts[link.platform] += 1
             dates.append(shared.date())
-    return counts["insta"], counts["x"], dup, nolink, dates
+    return counts["insta"], counts["x"], counts["gh"], dup, nolink, dates
 
 
-_SnsCounts = tuple[int, int, int, int, list[date]]  # (인스타, X, 중복, 링크X, 공유일들)
+# (인스타, X, GitHub, 중복, 링크X, 공유일들)
+_SnsCounts = tuple[int, int, int, int, int, list[date]]
 
 
 def _collect_sns(adapter: Adapter, channel_id: int, run_date: str | None) -> tuple[str, _SnsCounts]:
@@ -2120,7 +2122,7 @@ def _collect_sns(adapter: Adapter, channel_id: int, run_date: str | None) -> tup
     run_date 가 있으면 last_run_date 도 기록한다(정오 러너만 — 청소는 «밀린 날» 판정에 손대지 않음).
     실패면 시작점이 그대로라 다음 실행이 같은 메시지를 다시 읽는다. 한 번에 SNS_HISTORY_MAX 건까지.
     """
-    empty: _SnsCounts = (0, 0, 0, 0, [])
+    empty: _SnsCounts = (0, 0, 0, 0, 0, [])
     if not (SNS_INBOX_DIR / "미판정").is_dir():
         log.warning("SNS 수집함 폴더 없음 — 저장 건너뜀(링크는 채널에 남는다)")
         post_system_notice(adapter, f"{notice_stamp()} {sns_inbox.NO_FOLDER_TEXT}")
@@ -2157,7 +2159,7 @@ def _collect_sns(adapter: Adapter, channel_id: int, run_date: str | None) -> tup
             log.exception("SNS 저장 실패 — last_message_id 유지(다음 실행 재시도)")
             post_system_notice(adapter, f"{notice_stamp()} {sns_inbox.FAIL_TEXT}")
             return "fail", empty
-    log.info("SNS 수집 인스타=%d X=%d 중복=%d 링크X=%d", *counts[:4])
+    log.info("SNS 수집 인스타=%d X=%d GitHub=%d 중복=%d 링크X=%d", *counts[:5])
     return ("more" if more else "ok"), counts
 
 
@@ -2389,6 +2391,7 @@ def check_sns_judge_done(adapter: Adapter) -> None:
     타이머 틱(_dispatch_loop)마다 부른다. 스키마가 틀리거나 32KB 를 넘으면 파일을 남기고 경고만
     (파일이 바뀔 때마다 1번) — 사람이 고치거나 세션이 다시 쓰면 잡힌다.
     `항목` 이 있으면 «😎 판정완료» 카드를 새 메시지로 보낸다(없으면 🎉 만 — 호환).
+    끝나면 판정이 끝난 링크 메시지를 지운다(_clean_judged_locked).
     """
     global _sns_done_warned, _sns_channel_warned
     try:
@@ -2459,6 +2462,42 @@ def check_sns_judge_done(adapter: Adapter) -> None:
     if failed:
         log.warning("판정완료 카드 %d/%d장 게시 실패", failed, len(summary))
         post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+    # 판정이 끝난 링크 메시지는 자동으로 지운다 — 삭제가 수 분 걸릴 수 있어 스레드로(타이머 보호).
+    # 청소 중이면 건너뛴다 — 다음 판정완료나 🔗 링크청소가 같은 메시지를 지운다.
+    sns_ch = adapter.role_channel(SNS_ROLE)  # 대기 카드·항목이 없어도(channel=None) 지운다
+    if sns_ch is not None and _sns_clean_lock.acquire(blocking=False):
+        _sns_spawn("sns-judged-clean", _clean_judged_locked, adapter, sns_ch)
+
+
+def _clean_judged_locked(adapter: Adapter, channel_id: int) -> None:
+    """판정완료 자동 청소 — 링크가 전부 사용·폐기로 옮겨진 메시지만, 수집기가 본 범위에서 지운다.
+
+    미판정에 남은 링크(원문 못 읽음)·대상 밖 링크·잡담·카드는 남긴다. 클릭 때 잡은 락을 반드시 푼다.
+    """
+    try:
+        with _sns_lock:
+            state = _load_sns_state()
+        base, upto = state.get("baseline_id"), state.get("last_message_id")
+        if not isinstance(base, int) or not isinstance(upto, int) or upto <= base:
+            return
+        try:
+            judged = sns_inbox.known_sources(SNS_INBOX_DIR / "사용") | sns_inbox.known_sources(
+                SNS_INBOX_DIR / "폐기"
+            )
+        except OSError:
+            log.exception("SNS 판정완료 청소 건너뜀 — 수집함 출처를 못 읽음")
+            return
+        if not judged:
+            return
+        n = adapter.clear_channel(
+            channel_id,
+            after_id=base,
+            upto_id=upto,
+            keep=lambda text, _author: not sns_inbox.only_judged_links(text, judged),
+        )
+        log.info("SNS 판정완료 링크 메시지 %d건 삭제", n)
+    finally:
+        _sns_clean_lock.release()
 
 
 def _judge_items(raw: object) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -2479,14 +2518,20 @@ def _judge_items(raw: object) -> tuple[list[dict[str, str]], list[dict[str, str]
         if fields is None or not all(isinstance(item.get(f), str) for f in fields):
             bad += 1
             continue
+        # 선택 칸 `적용` — 사용 항목만, 문자열일 때만(아니면 그 칸만 버림). 비면 없는 것과 같다.
+        names = fields + (
+            ("적용",) if verdict == "사용" and isinstance(item.get("적용"), str) else ()
+        )
         clean = {}
-        for f in fields:
+        for f in names:
             value = strip_control_line(item[f])
             if len(value) > _SNS_FIELD_MAXLEN:
                 value = value[:_SNS_FIELD_MAXLEN] + "…"
             # 생 URL 자동 링크·미리보기 차단 — `://` 사이에 폭0 공백(U+200B)을 넣는다. 보이는 글자는
             # 같다. 정화(strip_control_line)가 폭0 문자를 지우므로 반드시 그 **뒤**에 넣는다.
             clean[f] = _URL_SCHEME_RE.sub("\\1:\u200b//", value)
+        if clean.get("적용") == "":
+            del clean["적용"]
         out[item["판정"]].append(clean)
     if bad:
         log.warning("완료 신호 항목 %d건 형식 오류 — 그 항목만 버림", bad)

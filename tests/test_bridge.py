@@ -3756,10 +3756,29 @@ def test_sns_extract_reels_and_p_and_tv():
         "https://x.com/someuser",
         "https://youtube.com/watch?v=abc",
         "ftp://instagram.com/p/abc/",
+        "https://github.com.evil.com/a/b",  # GitHub 가짜 도메인
+        "https://gist.github.com/a/b",  # 정확 일치 밖 서브도메인
+        "https://github.com/someuser",  # 프로필(저장소 아님)
+        "https://github.com/topics/ai",  # 예약어 페이지
+        "https://github.com/orgs/acme/repositories",
+        "https://github.com/a/../b",  # 경로 문자
+        "https://github.com/a_b/c",  # owner 에 `_` 없음(GitHub 규칙)
     ],
 )
 def test_sns_extract_rejects_fake_domains_and_path_chars(url):
     assert sns_inbox.extract_links(url) == []
+
+
+def test_sns_extract_github_repo_normalizes_subpaths():
+    a = sns_inbox.extract_links("https://github.com/Morluto/REA/tree/main/docs?tab=1")[0]
+    b = sns_inbox.extract_links("https://www.github.com/morluto/rea.git")[0]
+    c = sns_inbox.extract_links("https://github.com/morluto/rea/issues/12")[0]
+    assert a.url == "https://github.com/morluto/rea"
+    assert a.key == b.key == c.key == ("gh", "morluto_rea")
+    d = sns_inbox.extract_links("https://github.com/vercel-labs/next.js")[0]
+    assert (d.post_id, d.url) == ("vercel-labs_next-js", "https://github.com/vercel-labs/next.js")
+    assert sns_inbox.note_name(d, _NOON) == "20261010_gh_vercel-labs_next-js.md"
+    assert sns_inbox.source_key(d.url) == d.key  # 출처 → 중복 키 왕복
 
 
 def test_sns_note_name_only_safe_id():
@@ -3847,29 +3866,32 @@ def test_sns_dedup_key_ignores_url_shape():
 # ── 메시지 문구(계획 §2) ──
 def test_sns_card_daily_omits_zero_lines_and_tail():
     today = _NOON.date()
-    assert sns_inbox.card_text(2, 0, 0, 0, [today], False) == (
+    assert sns_inbox.card_text(2, 0, 0, 0, 0, [today], False) == (
         "📥 SNS 2건 수집함 저장\n➡️ 인스타그램 2건"
     )
-    assert sns_inbox.card_text(0, 1, 0, 3, [today], False) == (
+    assert sns_inbox.card_text(0, 1, 0, 0, 3, [today], False) == (
         "📥 SNS 1건 수집함 저장\n➡️ X 1건\n⛔ 링크X 3건 Pass"
     )
-    assert sns_inbox.card_text(1, 2, 4, 0, [today], False) == (
+    assert sns_inbox.card_text(1, 2, 0, 4, 0, [today], False) == (
         "📥 SNS 3건 수집함 저장\n➡️ 인스타그램 1건\n➡️ X 2건\n⛔ 중복 4건 Pass"
+    )
+    assert sns_inbox.card_text(1, 0, 2, 0, 0, [today], False) == (
+        "📥 SNS 3건 수집함 저장\n➡️ 인스타그램 1건\n➡️ GitHub 2건"
     )
 
 
 def test_sns_card_none_when_nothing_saved():
-    assert sns_inbox.card_text(0, 0, 5, 2, [], True) is None
+    assert sns_inbox.card_text(0, 0, 0, 5, 2, [], True) is None
 
 
 def test_sns_card_catchup_text():
     today = _NOON.date()
     dates = [today - timedelta(days=2), today]
-    assert sns_inbox.card_text(2, 1, 1, 0, dates, True) == (
+    assert sns_inbox.card_text(2, 1, 0, 1, 0, dates, True) == (
         "📥 미처리 3건 수집함 저장\n➡️ 10/8 ~ 10/10 공유분\n⛔ 중복 1건 Pass"
     )
     # 공유일이 오래됐어도 밀린 실행이 아니면 평소 카드(판정 기준은 지난 실행일)
-    assert sns_inbox.card_text(2, 1, 0, 0, dates, False).startswith("📥 SNS 3건")
+    assert sns_inbox.card_text(2, 1, 0, 0, 0, dates, False).startswith("📥 SNS 3건")
 
 
 # ── 정오 러너 ──
@@ -4279,6 +4301,53 @@ def test_sns_done_signal_without_pending_cards_just_cleans_file():
     assert not bridge.SNS_DONE_FILE.exists()
 
 
+def test_sns_done_signal_deletes_only_fully_judged_link_messages(sns):
+    # 판정완료 → 링크가 전부 사용·폐기로 옮겨진 메시지만 지운다. 미판정·대상 밖 링크·섞인 것·
+    # 잡담·카드·범위 밖은 남는다.
+    adapter, root = sns
+    base = _sf(_NOON - timedelta(days=1))
+    for sub, url in [
+        ("사용/적용예정", "https://www.instagram.com/reel/Used1/"),
+        ("폐기", "https://x.com/a/status/111"),
+        ("미판정", "https://www.instagram.com/p/Wait1/"),
+    ]:
+        link = sns_inbox.extract_links(url)[0]
+        (root / sub / f"{link.post_id}.md").write_text(
+            sns_inbox.note_body(link, _NOON, 1), encoding="utf-8"
+        )
+    bridge._sns_update(baseline_id=base, last_message_id=_sf(_NOON))
+    msgs = {
+        "used": _sns_msg("https://instagram.com/user/reel/Used1/?igsh=z", _NOON, bump=-6),
+        "drop": _sns_msg("https://twitter.com/A/status/111", _NOON, bump=-5),
+        "wait": _sns_msg("https://www.instagram.com/p/Wait1/", _NOON, bump=-4),
+        "mixed": _sns_msg(
+            "https://x.com/a/status/111 https://www.instagram.com/p/Wait1/", _NOON, bump=-3
+        ),
+        "other": _sns_msg("https://youtu.be/abc", _NOON, bump=-2),
+        "chat": _sns_msg("이거 좋다", _NOON, bump=-1),
+        "late": _sns_msg("https://x.com/a/status/111", _NOON, bump=5),  # 수집 범위 밖
+    }
+    adapter.history = list(msgs.values())
+    _write_done({"사용": 1, "폐기": 1, "시각": "t"})
+    bridge.check_sns_judge_done(adapter)
+    left = {k for k, ev in msgs.items() if ev in adapter.history}
+    assert left == {"wait", "mixed", "other", "chat", "late"}
+    assert adapter.clear_bounds == [(base, _sf(_NOON))]
+    assert not bridge._sns_clean_lock.locked()
+
+
+def test_sns_done_signal_skips_auto_clean_while_cleaning(sns):
+    adapter, _root = sns
+    bridge._sns_update(baseline_id=1, last_message_id=_sf(_NOON))
+    _write_done({"사용": 0, "폐기": 0, "시각": "t"})
+    assert bridge._sns_clean_lock.acquire(blocking=False)
+    try:
+        bridge.check_sns_judge_done(adapter)
+    finally:
+        bridge._sns_clean_lock.release()
+    assert adapter.cleared == []
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -4409,6 +4478,35 @@ def _done_with_items(items, a=None):
     # 카드마다 끝 빈 줄(보이지 않는 글자) — 디스코드가 연속 메시지를 붙여 그린다
     assert all(t.endswith(bridge.sns_inbox.CARD_GAP) for t in sent)
     return a, [t.removesuffix(bridge.sns_inbox.CARD_GAP) for t in sent]
+
+
+def test_judge_apply_absent_card_unchanged():
+    _a, [card] = _done_with_items([_21ST])
+    assert card.endswith(_use_text(_21ST)) and "⚙️" not in card
+    items, _drop = bridge._judge_items([_21ST, dict(_21ST, 적용="   ")])
+    assert "적용" not in items[0] and "적용" not in items[1]  # 빈 값 = 없음
+
+
+def test_judge_apply_appended_escaped_and_url_blocked():
+    _a, [card] = _done_with_items([dict(_21ST, 적용="[x](https://a)\n*굵게*")])
+    assert card.endswith(_use_text(_21ST) + "\n**⚙️ 적용**\n> \\[x](https:\u200b//a) \\*굵게\\*")
+
+
+def test_judge_apply_non_string_drops_only_that_field():
+    items, _drop = bridge._judge_items([dict(_21ST, 적용=123)])
+    assert items == [{k: _21ST[k] for k in ("제목", "무엇", "추가", "쓰는법")}]
+
+
+def test_judge_apply_truncated_and_ignored_on_drop():
+    items, drops = bridge._judge_items([dict(_21ST, 적용="가" * 201), dict(_TERSE, 적용="x")])
+    assert items[0]["적용"] == "가" * 200 + "…"
+    assert "적용" not in drops[0]
+
+
+def test_judge_apply_on_each_use_card_in_multi_path():
+    _a, cards = _done_with_items([dict(_21ST, 적용="A"), _LAST30, dict(_TERSE)])
+    assert cards[1].endswith("\n**⚙️ 적용**\n> A")
+    assert cards[2] == _use_text(_LAST30)
 
 
 def test_judge_cards_spec_example_use2_drop1():

@@ -117,7 +117,7 @@ if ($sup -le 0) {
 # outcomes and take whichever lands first:
 #   logs\bridge.ready appears -> bridge reached Gateway on_ready (written by bridge.py)
 #   bot dies / supervisor exits -> startup failed; exit code and log say why
-$deadline = 300   # 200ms ticks (60s); generous because a cold start pulls the project list first
+$deadline = 300   # 200ms ticks (60s); generous because a cold start is slow (imports, Gateway connect)
 $failed = $null
 for ($i = 0; $i -lt $deadline; $i++) {
     if (Test-Path $ready) { break }

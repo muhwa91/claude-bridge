@@ -83,10 +83,6 @@ MUSIC_DEL_WORDS = frozenset({"ㅁ삭제"})
 MUSIC_PLAY_ONE_WORDS = frozenset({"ㅁ재생"})
 # 'ㅁ목록' — 재생목록 전곡 조회(읽기 전용·인자 없음). music_action 과 같은 공백접기 정확매칭.
 MUSIC_LIST_WORDS = frozenset({"ㅁ목록"})
-# 'ㅁ스포티파이' — kworb 미러의 스포티파이 주간차트 3개(글로벌·일본·한국) 상위 30곡씩을 한 번에
-# 재생목록에 담는다. ㅁ목록과 같은 단독 정확매칭(인자 없음). ⚠️ 90곡을 밀어넣는 명령이라
-# _playlist_bypass 우회에서 **뺀다**(ㅁ삭제·ㅁ목록과 같은 취급 — 허용목록 user 전용).
-MUSIC_SPOTIFY_WORDS = frozenset({"ㅁ스포티파이"})
 
 
 def music_action(text: str) -> str | None:
@@ -147,11 +143,6 @@ def is_music_play_one(text: str) -> bool:
 def is_music_list(text: str) -> bool:
     """'ㅁ목록' 여부(공백접기 정확매칭 — 인자 없는 명령). 재생목록 전곡을 번호·제목으로 회신."""
     return "".join(text.split()).casefold() in MUSIC_LIST_WORDS
-
-
-def is_music_spotify(text: str) -> bool:
-    """'ㅁ스포티파이' 여부(공백접기 정확매칭 — 인자 없는 명령). 'ㅁ스포티파이곡'은 미발동."""
-    return "".join(text.split()).casefold() in MUSIC_SPOTIFY_WORDS
 
 
 # ── 'ㅁ추가 <검색어>' 검색 결과 선택(순수 — 네트워크는 어댑터 몫) ─────────────────
@@ -453,16 +444,12 @@ def is_allowed(chat_id: int, allowed: frozenset[int]) -> bool:
     return chat_id in allowed
 
 
-_warned_session_ids: set[str] = set()  # on:"session" 경고를 id 당 1회로 줄이는 기록
-
-
 def load_schedules(path: Path) -> list[dict[str, Any]]:
     """notify.json → items 리스트. 파일 없음·손상은 빈 리스트(load_env 로더처럼 방어적).
 
     timezone 필드는 향후 확장용 예약 — 현재는 _KST(Asia/Seoul) 고정이라 읽지 않는다(YAGNI).
-    id 가 안전 규칙(_valid_id) 위반인 항목은 조용히 skip(로더 방어 스타일 — callback 계약 보호).
-    `on:"session"` 항목(세션 핑 경로는 2026-10-09 삭제)은 **버리되 id 당 한 번 경고**한다 —
-    이 로더는 매 틱 불려서 매번 찍으면 도배가 되고, 조용히 버리면 «왜 안 오지» 가 된다.
+    id 가 안전 규칙(_valid_id) 위반인 항목은 조용히 skip(로더 방어 스타일 — 이상한 id 가
+    로그·상태 파일로 흘러드는 것을 막는다).
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -471,16 +458,7 @@ def load_schedules(path: Path) -> list[dict[str, Any]]:
     items = raw.get("items") if isinstance(raw, dict) else None
     if not isinstance(items, list):
         return []
-    valid = [it for it in items if isinstance(it, dict) and _valid_id(it.get("id"))]
-    kept = []
-    for it in valid:
-        if it.get("on") == "session":
-            if it["id"] not in _warned_session_ids:
-                _warned_session_ids.add(it["id"])
-                log.warning("notify.json %s: on='session' 지원 종료 — 무시한다", it["id"])
-            continue
-        kept.append(it)
-    return kept
+    return [it for it in items if isinstance(it, dict) and _valid_id(it.get("id"))]
 
 
 def due_notifications(
@@ -554,11 +532,11 @@ def notify_text(it: dict[str, Any], now: datetime | None = None) -> str:
 # ══════════════════════════════════════════════════════════════════════════
 _SECRET_MIN_LEN = 12  # 마스킹 대상 .env 값의 최소 길이(짧은 값이 정상 텍스트를 갈아엎지 않게)
 # 길이가 길지만 **비밀이 아닌** 설정 키 — 값이 회신 본문에 정상적으로 등장한다(경로·URL·초).
-# 예: TARGET_ROOT="Hachiware/_Project" 를 마스킹하면 `M ***/etf-info/app.py` 처럼 모든 원격
-# 작업 회신의 파일 경로가 깨진다. **제외 목록(블랙리스트가 아닌 예외)** 방식인 이유: 키 화이트
-# 리스트(*TOKEN|SECRET|KEY 만 마스킹)로 뒤집으면 새 비밀 키가 추가될 때 **조용히 마스킹에서
-# 빠진다**. 여기 안 적힌 값은 전부 마스킹되므로 누락 시 최악이 "과잉 마스킹"에 그친다(fail-safe).
-_SECRET_SKIP_KEYS = frozenset({"TARGET_ROOT", "CLAUDE_TIMEOUT_SEC", "MUSIC_PLAYLIST_ID"})
+# 예: MUSIC_PLAYLIST_ID 를 마스킹하면 플레이리스트 URL 이 `***` 로 깨진다.
+# **제외 목록(블랙리스트가 아닌 예외)** 방식인 이유: 키 화이트리스트(*TOKEN|SECRET|KEY 만
+# 마스킹)로 뒤집으면 새 비밀 키가 추가될 때 **조용히 마스킹에서 빠진다**. 여기 안 적힌 값은
+# 전부 마스킹되므로 누락 시 최악이 "과잉 마스킹"에 그친다(fail-safe).
+_SECRET_SKIP_KEYS = frozenset({"MUSIC_PLAYLIST_ID"})
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -582,7 +560,7 @@ def build_secrets(token: str, repo_root: Path, env: dict[str, str]) -> list[str]
     `.oauth_token.json` 이 있다. 외부 텍스트 인젝션이 성공하면 회신 본문으로
     비밀값이 새어 나올 수 있으므로 토큰 하나가 아니라 **.env 값 전부**를 마스킹 대상에 넣는다.
     12자 미만은 제외 — 포트·플래그 같은 짧은 값이 정상 텍스트를 `***` 로 갈아 회신을 파괴한다.
-    길지만 비밀이 아닌 설정 키(`_SECRET_SKIP_KEYS`)도 제외 — 같은 이유(회신 경로 훼손).
+    길지만 비밀이 아닌 설정 키(`_SECRET_SKIP_KEYS`)도 제외 — 같은 이유(회신 URL 훼손).
     빈 값은 버리고 중복은 제거한다(mask_secrets 는 빈 문자열을 무시하지만 목록을 깨끗이 유지).
     """
     values = [token, str(repo_root), str(Path.home())]
@@ -765,7 +743,7 @@ US_DIGEST_TOOLS: list[str] = ["Skill"]
 # 미국주식 전용 샌드박스 — 레포 밖 임시 폴더. 레포 루트를 cwd 로 쓰면 루트 CLAUDE.md 가 자동
 # 로드되고 SessionStart 훅이 발동해 개발자의 2차 인증 잠금해제 마커를 지운다.
 US_DIGEST_SANDBOX_DIR = Path(tempfile.gettempdir()) / "claude_bridge_us_digest_sandbox"
-# 외부 조회는 **고정 host(kworb.net = 'ㅁ스포티파이' 의 차트 미러) + 경로**만 받아 조립한다
+# 외부 조회는 **고정 host(kworb.net = 스포티파이 자동 담기의 차트 미러) + 경로**만 받아 조립한다
 # (전체 URL 인자 금지 — SSRF 차단). GET 고정·타임아웃·실패는 조용히 스킵.
 KWORB_HOST = "kworb.net"
 _DIGEST_TIMEOUT = 8  # 초
@@ -1446,6 +1424,9 @@ HELP_TEXT = (
     "#SNS정보 에서는 🔗 링크청소(저장된 링크·명령·카드만) · 🧹 전체청소(링크 수집 뒤 전부)"
     " 버튼이 뜹니다.\n"
     "\n"
+    "### SNS 판정 — ㅁ판정\n"
+    "#SNS정보 에서 정오를 기다리지 않고 지금 링크를 수집해 판정 세션까지 띄웁니다.\n"
+    "\n"
     "### 재시작 — ㅁ재시작\n"
     "브리지(봇)를 다시 켭니다. 코드 수정을 반영하거나 봇이 멈췄을 때 씁니다.\n"
     "\n"
@@ -1454,8 +1435,6 @@ HELP_TEXT = (
     "ㅁ재생 <제목> 은 그 곡을 지금 틀고(목록에 없으면 유튜브에서 찾아 한 번 재생), "
     "ㅁ삭제 <제목> 은 재생목록에서 그 곡을 뺍니다.\n"
     "ㅁ목록 은 재생목록 전곡을 번호·제목으로 보여줍니다.\n"
-    "ㅁ스포티파이 는 스포티파이 월간차트(글로벌·일본·한국) 상위 30곡씩을 한 번에 담습니다"
-    "(약 7분 소요 — 끝나면 추가·중복·실패 곡수를 알려줍니다).\n"
     "ㅁ추가 <검색어> #N 은 검색 결과 N번째를 넣습니다(번호는 검색 순번). "
     "번호를 안 주면 방송무대·교차편집·직캠을 걸러 고릅니다."
 )
@@ -1508,9 +1487,9 @@ def _handle_button(adapter: Adapter, event: Event) -> None:
 
 
 def _is_playlist_command(text: str) -> bool:
-    """플레이리스트 채널 화이트리스트: ㅁ노래·정지·다음·청소·추가·삭제·재생·목록·스포티파이(순수).
+    """플레이리스트 채널 화이트리스트: ㅁ노래·정지·다음·청소·추가·삭제·재생·목록(순수).
 
-    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one/list/spotify)와 같은 조건이어야 —
+    실제 처리 분기(music_action·'ㅁ청소'·is_music_add/del/play_one/list)와 같은 조건이어야 —
     게이트만 통과하고 아래 분기에 안 걸리면 HELP 폴백이 새어 채널에 안내가 뜬다(§ 무반응 계약).
     ⚠️ 이건 **라우팅**(그 채널에서 처리되는가)이지 인가가 아니다 — ㅁ삭제도 여기선 True 여야 개발자가
     그 채널에서 쓸 수 있다. 비인가 멤버 차단은 _playlist_bypass 가 따로 한다.
@@ -1523,7 +1502,6 @@ def _is_playlist_command(text: str) -> bool:
         or is_music_del(stripped)
         or is_music_play_one(stripped)
         or is_music_list(stripped)
-        or is_music_spotify(stripped)
     )
 
 
@@ -1533,7 +1511,7 @@ def _playlist_bypass(event: Event) -> bool:
     True 를 반환할 때만 handle_event 가 비인가 user_id 를 통과시킨다(서버 멤버 누구나 음악 제어,
     개발자 결정). 조건을 의도적으로 좁게 유지한다:
       · (channel_role == "playlist")  AND
-      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제·ㅁ목록·ㅁ스포티파이는 뺀다**
+      · text  → 화이트리스트 명령(_is_playlist_command) **에서 ㅁ삭제·ㅁ목록은 뺀다**
         button → clean:ok/clean:x (ㅁ청소 확인·취소 — 봇이 이 채널서 내는 유일 버튼)
 
     🔴 **우회 판정 3조건** — 셋을 모두 지키는 명령만 넣는다(하나라도 어기면 뺀다):
@@ -1541,16 +1519,13 @@ def _playlist_bypass(event: Event) -> bool:
       2. **비용 유계** — 공격자가 반복해도 처리량이 그 명령의 상수배를 넘지 않는다
       3. **회신 유계** — 회신 건수·크기가 공격자 조종 하에 있지 않다
 
-    ⚠️ 빠져 있는 셋:
+    ⚠️ 빠져 있는 둘:
       · **ㅁ삭제** — 1 위반(파괴적). 허용목록 유저(is_allowed)만 쓴다.
-      · **ㅁ스포티파이** — 1·2 위반. 한 번에 **90곡**을 재생목록에 밀어넣고(되돌리려면 ㅁ삭제를
-        90번 쳐야 한다), 명령 1건이 유튜브 검색 90회 + Data API 왕복 90회를 태워 단일 스레드
-        코어를 수 분간 점유한다. 아무나 반복할 수 있으면 안 된다(2026-08-25 신설).
       · **ㅁ목록** — 2·3 위반(2026-08-18 운영자 결정). 비인가 멤버가 ㅁ추가로 목록을 불린 뒤
         ㅁ목록을 반복하면 **회신 크기와 내용이 둘 다 공격자 손 안에** 있고, 단일 스레드 코어가
         다중 페이지 API + 다중 메시지를 동기로 처리해 브리지 전체가 막힌다. 상한·캐시를 다는
         대신 우회에서 빼는 것이 최소 수정이다.
-    셋 다 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
+    둘 다 라우팅(_is_playlist_command)은 True 라 개발자는 그 채널에서 그대로 쓰고, 비인가 멤버에겐
     무반응이다. ㅁ재생은 ㅁ노래·ㅁ다음과 같은 급(재생 제어)이고 회신이 한 줄이라 3조건을 지킨다.
     그 외(다른 채널·비화이트리스트 텍스트·위험명령 ㅁ재시작)는
     False → 기존 is_allowed 인가 그대로. 위험명령은 플레이리스트 게이트가 이미 무시하므로 비인가
@@ -1560,7 +1535,7 @@ def _playlist_bypass(event: Event) -> bool:
         return False
     if event.kind == "text":
         return _is_playlist_command(event.text) and not (
-            is_music_del(event.text) or is_music_list(event.text) or is_music_spotify(event.text)
+            is_music_del(event.text) or is_music_list(event.text)
         )
     if event.kind == "button":
         return event.action in ("clean:ok", "clean:x")
@@ -1587,7 +1562,7 @@ def _add_one(adapter: Adapter, video_id: str) -> tuple[str, str]:
 
     중복(dup)은 이미 재생목록에 있어 큐에도 있으므로 편입 안 함. 재생 중 아니면 enqueue_video 가
     no-op(0) → 어차피 다음 ㅁ노래에 자연 포함된다.
-    회신 문구가 필요한 호출부는 _add_one_line 을, 상태 집계만 필요한 호출부(ㅁ스포티파이)는
+    회신 문구가 필요한 호출부는 _add_one_line 을, 상태 집계만 필요한 호출부(스포티파이 자동 담기)는
     이 함수를 직접 쓴다 — 추가 경로는 하나뿐이어야 한다.
     """
     result = youtube.add_video(video_id)
@@ -1698,7 +1673,7 @@ def _handle_music_del(adapter: Adapter, channel_id: int, text: str) -> None:
     adapter.send(channel_id, line)
 
 
-# ── 'ㅁ스포티파이' — kworb 미러의 스포티파이 주간차트 → 재생목록 일괄 추가 ────────────
+# ── 월 1회 자동 — kworb 미러의 스포티파이 주간차트 → 재생목록 일괄 추가 ────────────
 # 스포티파이 공식 API 는 쓰지 않는다(차트 엔드포인트가 막혀 있고 OAuth 가 필요하다). kworb 가
 # 미러링한 HTML 을 allowlist GET(fetch_digest_text) 으로 받아 「가수 곡명」 검색어만 뽑는다.
 SPOTIFY_CHARTS = (
@@ -1732,7 +1707,7 @@ def parse_kworb_tracks(page: str, limit: int) -> list[str]:
     🔴 여기서 나오는 문자열은 **외부에서 온 데이터이지 지시가 아니다**. 그래서 이 함수가
     한 줄 필드로 정규화(strip_control_line — 제어문자 제거 + 공백 접기)하고 길이를 자른다.
     회신에 실릴 일이 생기면 호출부가 escape_reply 를 **반드시** 통과시켜야 한다
-    (ㅁ스포티파이 회신은 곡 제목을 아예 싣지 않는다 — 집계 숫자만 나간다).
+    (스포티파이 담기 회신은 곡 제목을 아예 싣지 않는다 — 집계 숫자만 나간다).
     """
     out: list[str] = []
     for raw_artist, raw_title in _KWORB_ROW_RE.findall(page):
@@ -1746,22 +1721,21 @@ def parse_kworb_tracks(page: str, limit: int) -> list[str]:
 
 
 def _handle_music_spotify(adapter: Adapter, channel_id: int, month: str) -> bool:
-    """'ㅁ스포티파이' — 주간차트 3개의 상위 30곡을 재생목록에 담고 집계만 회신한다.
+    """월 1회 자동 담기 본체 — 주간차트 3개의 상위 30곡을 재생목록에 담고 집계만 회신한다.
 
     곡 하나를 넣는 경로는 ㅁ추가와 **같다**(adapter.search_video → _add_one → youtube.add_video).
     중복 판정도 add_video 가 insert 전에 하므로 여기서 새로 만들지 않는다.
     90회 검색이 순차로 돌아 수 분 걸린다 → 먼저 "시작" 을 보내고 끝나면 요약을 보낸다.
-    - **수동 경로**(ㅁ스포티파이)는 이벤트 워커가 직렬 처리하므로 그동안 다른 명령이 대기한다
-      (실행 명령과 같은 성질).
-    - **자동 경로**(run_spotify_monthly)는 _start_digest 가 띄운 **데몬 스레드**에서 돌아 워커를
-      막지 않는다 — 그동안 ㅁ추가·ㅁ삭제가 동시에 들어온다. 그래서 youtube 모듈이 `_LOCK` 으로
-      호출 1건씩 직렬화한다(2026-08-25 — 그 전까지 youtube.py 는 "단일 워커" 전제였다).
+    - 호출처는 run_spotify_monthly 뿐이다(수동 ㅁ스포티파이 명령은 2026-10-14 에 없앴다). 이 함수는
+      _start_digest 가 띄운 **데몬 스레드**에서 돌아 워커를 막지 않는다 — 그동안 ㅁ추가·ㅁ삭제가
+      동시에 들어온다. 그래서 youtube 모듈이 `_LOCK` 으로 호출 1건씩 직렬화한다
+      (2026-08-25 — 그 전까지 youtube.py 는 "단일 워커" 전제였다).
     한 곡의 실패(검색 무결과·네트워크·API 오류)에 여기서 try/except 를 걸지 않는 이유 —
     **호출부가 계약상 예외를 던지지 않는다**: search_video·youtube.add_video·fetch_digest_text 가
     각자 삼켜 None·("fail",…)·"" 로 돌려주므로, 여기서는 그 반환을 실패 카운트로 세기만 한다.
 
-    month = 스탬프에 찍을 `YYYY-MM` — **호출부가 확정해 넘긴다**(수동 = 명령을 받은 시각의 달,
-    자동 = 러너가 판정에 쓴 달). 🔴 기본값을 두지 않는 것이 계약이다 — 왜는 _mark_spotify_month.
+    month = 스탬프에 찍을 `YYYY-MM` — **호출부가 확정해 넘긴다**(러너가 판정에 쓴 달).
+    🔴 기본값을 두지 않는 것이 계약이다 — 왜는 _mark_spotify_month.
 
     반환 = **담기를 시도했는지**(False = 시작 안내조차 못 보내 아무 일도 안 함).
     월 1회 자동 실행(run_spotify_monthly)이 이 값으로 "그 달 몫을 썼는지"를 판단한다.
@@ -1808,10 +1782,8 @@ def _handle_music_spotify(adapter: Adapter, channel_id: int, month: str) -> bool
         fail,
         len(missing),
     )
-    # 🔴 **수동 'ㅁ스포티파이' 도 스탬프를 갱신한다**(그래서 러너가 아니라 여기서 찍는다).
-    # 스탬프의 목적이 "한 달에 한 번만 90회 왕복" 인데, 관리자가 손으로 담은 직후 다음 세션의
-    # 자동 실행이 같은 주간차트를 한 번 더 훑으면 그 목적이 그대로 깨진다(추가는 거의 0곡,
-    # 왕복만 90회). 반대 방향은 막지 않는다 — 수동은 스탬프를 **읽지 않아** 언제든 다시 돈다.
+    # 스탬프의 목적은 "한 달에 한 번만 90회 왕복" — 담았으면 여기서 찍는다. 수동 재실행 경로가
+    # 없으므로(2026-10-14) 스탬프가 안 찍힌 달은 다음 날 자동 러너가 다시 잡는 것이 유일한 복구다.
     # ⚠️ **전 차트 실패(missing 3개)면 찍지 않는다** — 재시도가 비싸다는 종전 근거가 사실과
     # 달랐다: 차트를 하나도 못 읽으면 queries 가 비어 90회 왕복을 **아예 안 하고** HTTP 3회로
     # 끝난다(거의 공짜다). 일시적 네트워크 오류 한 번에 그 달 90곡을 통째로 날릴 이유가 없다.
@@ -1857,7 +1829,7 @@ def run_spotify_monthly(adapter: Adapter, channel_id: int, today: str) -> bool:
     """월 1회 스포티파이 주간차트 담기. 반환 = 이 항목을 처리 완료로 볼지.
 
     달이 바뀐 뒤 PC 를 **처음 켠 날** 한 번 돈다(1일에 꺼져 있어도 놓치지 않는다).
-    곡 수집·추가는 전부 수동 'ㅁ스포티파이' 와 **같은 핸들러**가 한다 — 여기는 껍데기다.
+    곡 수집·추가는 전부 _handle_music_spotify 가 한다 — 여기는 껍데기다.
 
     이미 이번 달에 담았으면 **True**(조용히 끝). "할 일이 없다"는 실패가 아니다 — False 로
     돌리면 _revert_digest_fired 가 fired 를 풀어 25초마다 같은 판정을 DIGEST_MAX_ATTEMPTS 회
@@ -2366,6 +2338,44 @@ def _launch_judge_for_card(adapter: Adapter, channel_id: int, mid: int, card: st
     adapter.send(channel_id, sns_inbox.LAUNCH_FAIL_TEXT)
 
 
+def _judge_now(adapter: Adapter, channel_id: int) -> None:
+    """`ㅁ판정` 본체 — 정오를 기다리지 않고 수집 → «판정 중» 카드 → 판정 세션(락은 호출부)."""
+    status, counts = _collect_sns(adapter, channel_id, None)  # last_run_date 는 건드리지 않는다
+    if status == "fail":
+        return  # 안내를 이미 냈다
+    if status != "ok":
+        # init(안 읽음)·retry(읽기 실패)·more(상한) — 청소와 같은 안내. more 는 저장된 노트가
+        # 있으니 판정은 그대로 진행한다(나머지는 다음 수집이 이어 읽는다).
+        post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+        if status != "more":
+            return
+    n = sum(1 for _ in (SNS_INBOX_DIR / "미판정").glob("*.md"))  # 판정 세션은 미판정 전부를 본다
+    if n == 0:
+        adapter.send(channel_id, sns_inbox.JUDGE_NOW_NONE)
+        return
+    card = sns_inbox.card_text(*counts, False) or sns_inbox.JUDGE_NOW_COUNT.format(N=n)
+    mid = adapter.send(
+        channel_id, f"{card}\n{sns_inbox.JUDGING_LINE}"
+    )  # 처음부터 «판정 중»·버튼 없음
+    if not isinstance(mid, int):
+        log.warning("SNS 판정 카드 게시 실패 — 판정 세션 안 띄움(노트는 저장됨)")
+        post_system_notice(adapter, digest_giveup_text(SNS_NOTIFY_ID))
+        return
+    with _sns_lock:
+        cards = _pending_cards(_load_sns_state())
+        cards[str(mid)] = f"{card}\n{sns_inbox.JUDGING_LINE}"
+        _set_pending_cards(cards, {str(mid): time.time()})
+    _launch_judge_for_card(adapter, channel_id, mid, card)  # 실패 복구(버튼 되살림) 재사용
+
+
+def _judge_now_locked(adapter: Adapter, channel_id: int) -> None:
+    """스레드 본체 — 클릭 때 잡은 _sns_clean_lock 을 끝나면 반드시 푼다."""
+    try:
+        _judge_now(adapter, channel_id)
+    finally:
+        _sns_clean_lock.release()
+
+
 def _valid_done(raw: object) -> TypeGuard[dict[str, Any]]:
     """완료 신호 스키마 — {"사용": int, "폐기": int, "시각": str(≤64자)}(bool 은 int 가 아니다)."""
     if not isinstance(raw, dict):
@@ -2543,7 +2553,7 @@ def _handle_text(adapter: Adapter, event: Event) -> None:
     channel_id = event.channel_id
     text = event.text
     # 플레이리스트 채널 게이트(최상단): 화이트리스트(ㅁ노래·정지·다음·청소·추가·삭제·재생·
-    # 목록·스포티파이)만 통과.
+    # 목록)만 통과.
     # 그 외(잡담·다른 ㅁ명령·순수 링크·빈 메시지)는 반응·안내 없이 조용히 무시한다.
     if event.channel_role in _MUSIC_ONLY_ROLES and not _is_playlist_command(text):
         return
@@ -2584,15 +2594,6 @@ def _handle_text(adapter: Adapter, event: Event) -> None:
         _handle_music_list(adapter, channel_id)
         return
 
-    # 'ㅁ스포티파이' — 주간차트 3개 상위 30곡씩을 재생목록에 일괄 추가(약 7분 소요).
-    # ㅁ목록·ㅁ삭제와 같이 인가 우회 대상이 **아니다**(_playlist_bypass 3조건 중 1·2 위반) —
-    # 여기 도달하는 비인가 user 는 없다. 이 분기는 허용목록 user 전용.
-    if is_music_spotify(stripped):
-        log.info("chat=%s cmd=music spotify", channel_id)
-        # 찍을 달은 **여기서**(명령을 받은 시각) 확정한다 — 왜는 _mark_spotify_month 주석.
-        _handle_music_spotify(adapter, channel_id, datetime.now(_KST).strftime("%Y-%m"))
-        return
-
     # 'ㅁ추가 <링크|검색어>' — 유튜브 재생목록("코딩")에 추가. 접두 매칭이라 별칭 해석·help 폴백
     # (아래 `cmd.startswith("ㅁ") and cmd not in COMMANDS → HELP`)보다 앞에 둔다.
     if is_music_add(stripped):
@@ -2622,6 +2623,15 @@ def _handle_text(adapter: Adapter, event: Event) -> None:
     # 명령 동의어(ㅁ사용법)를 정규 ㅁ 토큰으로 접어 아래 분기가 한 경로만 알게 한다.
     # 슬래시·평문은 명령이 아니라 접힘 대상도 아니다.
     cmd = COMMAND_ALIASES.get(stripped) or stripped
+    if cmd == "ㅁ판정" and event.channel_role == SNS_ROLE:
+        # COMMANDS 에 일부러 안 넣었다 — 다른 채널에선 알 수 없는 ㅁ명령처럼 아래 HELP 폴백.
+        # 청소와 같은 락 — 청소가 방금 올린 «판정 중» 카드를 지우지 않게. 연타는 무시.
+        if _sns_clean_lock.acquire(blocking=False):
+            log.info("chat=%s cmd=judge-now", channel_id)
+            _sns_spawn("sns-judge-now", _judge_now_locked, adapter, channel_id)
+        else:
+            log.info("chat=%s SNS 청소·판정 진행 중 — ㅁ판정 무시", channel_id)
+        return
     if cmd == "ㅁ도움말" or (cmd.startswith("ㅁ") and cmd not in COMMANDS):
         # ㅁ도움말·ㅁ사용법 + 알 수 없는 ㅁ… 명령의 폴백 = HELP.
         log.info("chat=%s cmd=help", channel_id)
@@ -2670,7 +2680,7 @@ def handle_event(adapter: Adapter, event: Event, *, allowed: frozenset[int]) -> 
     if not is_allowed(event.user_id, allowed) and not _playlist_bypass(event):
         log.warning("미허용 user_id=%s %s 무시", event.user_id, event.kind)
         return
-    # 🔴 이벤트 처리 전체를 «바쁨» 으로 — 워커가 디스코드 코루틴(ㅁ스포티파이 90곡·ㅁ목록 여러
+    # 🔴 이벤트 처리 전체를 «바쁨» 으로 — 워커가 디스코드 코루틴(ㅁ목록 여러
     # 페이지·음악 추가 등)을 기다리는 동안 자동 재시작이 어댑터를 닫으면 그 코루틴이
     # 이벤트 루프와 함께 끊긴다(«Task was destroyed but it is pending»). 핸들러 끝까지 기다린다.
     with _working():
@@ -2679,17 +2689,14 @@ def handle_event(adapter: Adapter, event: Event, *, allowed: frozenset[int]) -> 
 
 def _dispatch_event(adapter: Adapter, event: Event) -> None:
     """인가를 통과한 이벤트의 kind 분기(handle_event 가 «바쁨» 안에서 부른다)."""
-    # 프로젝트 채널(옛 `_Project/*` 자동생성분)은 더 이상 지시를 받지 않는다 — 무회신·로그만.
-    if event.project is not None:
-        log.info("chat=%s 프로젝트 채널 메시지 무시(%s)", event.channel_id, event.kind)
-        return
     # #SNS정보 는 실시간 처리하지 않는다 — 공유 링크는 정오 러너가 히스토리로 읽는다(계획 §3-1).
     # 반응·안내 없이 조용히 무시(플레이리스트 게이트와 같은 태도). 버튼(🔍 판정하기·청소 확인)과
-    # `ㅁ청소` 만 통과 — 청소는 확인 시점에 수집을 먼저 돌린다(_clean_sns_channel).
+    # `ㅁ청소`·`ㅁ판정` 만 통과 — 청소는 확인 시점에 수집을 먼저 돌리고(_clean_sns_channel),
+    # 판정은 정오를 기다리지 않고 수집 → 판정 세션까지 한 번에 진행한다(_judge_now).
     if (
         event.channel_role == SNS_ROLE
         and event.kind != "button"
-        and not (event.kind == "text" and event.text.strip() == "ㅁ청소")
+        and not (event.kind == "text" and event.text.strip() in ("ㅁ청소", "ㅁ판정"))
     ):
         return
     if event.kind == "button":

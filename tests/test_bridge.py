@@ -147,7 +147,7 @@ class FakeAdapter:
 
     def search_candidates(self, query):
         # search 는 고정 후보 리스트 또는 **query → 후보 리스트 함수**(검색어마다 결과가 달라야
-        # 하는 ㅁ스포티파이 테스트용). 둘 다 없으면 무결과.
+        # 하는 스포티파이 핸들러 테스트용). 둘 다 없으면 무결과.
         self.searches.append(query)
         found = self._search(query) if callable(self._search) else self._search
         return list(found or [])
@@ -201,7 +201,6 @@ def _txt(
     message_id=None,
     channel_id=None,
     channel_role=None,
-    project=None,
 ):
     return Event(
         kind="text",
@@ -210,7 +209,6 @@ def _txt(
         text=text,
         message_id=message_id,
         channel_role=channel_role,
-        project=project,
     )
 
 
@@ -384,7 +382,7 @@ def test_retired_project_commands_fall_back_to_help():
 def test_help_text_has_no_project_work_guidance():
     for word in ("프로젝트", "푸시", "새대화", "ㅁ취소", "작업 실행"):
         assert word not in bridge.HELP_TEXT
-    for word in ("ㅁ노래", "ㅁ청소", "ㅁ재시작", "ㅁ스포티파이"):
+    for word in ("ㅁ노래", "ㅁ청소", "ㅁ재시작"):
         assert word in bridge.HELP_TEXT
 
 
@@ -1120,7 +1118,7 @@ def test_youtube_add_video_dedup_skips_insert(monkeypatch):
 def test_youtube_add_video_is_serialized_across_threads(monkeypatch):
     """동시 호출에도 같은 곡이 두 번 insert 되지 않는다(_LOCK — list→insert 는 원자적이 아니다).
 
-    2026-08-25 'ㅁ스포티파이' 월 1회 자동 실행이 _start_digest 의 **데몬 스레드**에서 이 모듈을
+    2026-08-25 스포티파이 월 1회 자동 실행이 _start_digest 의 **데몬 스레드**에서 이 모듈을
     부르면서 「단일 워커가 직렬 처리」 전제가 깨졌다 — 그동안 이벤트 워커의 ㅁ추가가 동시에 온다.
     락이 없으면 두 스레드가 같은 '없음' 을 보고 각자 insert 한다.
     """
@@ -1363,7 +1361,7 @@ def test_music_list_not_help_fallthrough(monkeypatch):
     assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
 
 
-# ── 'ㅁ스포티파이'(kworb 주간차트 → 재생목록 일괄 추가) ────────────────────────────
+# ── 월 1회 자동 스포티파이(kworb 주간차트 → 재생목록 일괄 추가) ────────────────────────────
 # 픽스처 = 실물 kworb 한국 주간차트 앞부분(곡 32행 — 상위 30 절단을 검사할 수 있게 30보다 크다).
 # 마지막 행은 **가수가 링크가 아닌** 실제 행(일본 차트의 `Unknown Artist`)을 붙였다.
 _KWORB_FIXTURE = Path(__file__).parent / "fixtures" / "kworb_weekly.html"
@@ -1427,19 +1425,17 @@ def test_parse_kworb_tracks_drops_row_with_overlong_artist():
     assert bridge.parse_kworb_tracks(page, 10) == ["가 정상A", "가 정상B"]
 
 
-def test_spotify_command_matching_is_standalone():
-    """'ㅁ목록' 과 같은 단독 정확매칭 — 붙여쓰기·인자 붙임은 미발동."""
-    assert bridge.is_music_spotify("ㅁ스포티파이")
-    assert bridge.is_music_spotify("  ㅁ 스포티파이 ")  # 공백접기
-    assert not bridge.is_music_spotify("ㅁ스포티파이곡")
-    assert not bridge.is_music_spotify("ㅁ스포티파이 추가")
-    assert not bridge.is_music_spotify("스포티파이")
-
-
-def test_spotify_is_playlist_command_but_not_bypassed():
-    """라우팅은 열되(개발자가 그 채널서 쓴다) **인가 우회에서는 뺀다** — 90곡을 밀어넣는 명령."""
-    assert bridge._is_playlist_command("ㅁ스포티파이")
-    assert not bridge._playlist_bypass(_txt(999, "ㅁ스포티파이", channel_role=_PL))
+def test_spotify_manual_command_is_gone():
+    """수동 'ㅁ스포티파이' 는 없앴다(2026-10-14) — 일반 채널 HELP 폴백, 플레이리스트 채널 무시."""
+    assert not hasattr(bridge, "is_music_spotify")
+    assert not bridge._is_playlist_command("ㅁ스포티파이")
+    assert "ㅁ스포티파이" not in bridge.HELP_TEXT
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ스포티파이"))
+    assert [(t, b) for _c, t, b in a.sent] == [(bridge.HELP_TEXT, None)]
+    p = FakeAdapter()
+    _fire(p, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    assert p.sent == []
 
 
 def _spotify_env(monkeypatch, page=None, add=None):
@@ -1474,7 +1470,7 @@ def _fake_search(ids=None):
 def test_spotify_adds_top30_from_three_charts(monkeypatch):
     fetched, added = _spotify_env(monkeypatch)
     a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(a, 7, "2026-08")
     # 차트 3개를 각각 한 번씩 조회한다(경로는 상수 그대로 — 전체 URL 인자를 받지 않는다).
     assert fetched == [p for _n, p in bridge.SPOTIFY_CHARTS]
     assert len(a.searches) == 90  # 차트당 30곡, 차트 3개
@@ -1491,7 +1487,7 @@ def test_spotify_replies_start_before_summary(monkeypatch):
     """
     _spotify_env(monkeypatch)
     a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(a, 7, "2026-08")
     assert len(a.sent) == 2
     assert a.sent[0][1] == "🎧 스포티파이 월간차트 추가\n차트를 가져오고 있습니다(7분 예상)"
     assert a.sent[0][1] != a.sent[-1][1]
@@ -1514,7 +1510,7 @@ def test_spotify_counts_dup_and_fail(monkeypatch):
     # 4번째 곡은 유튜브 검색 자체가 무결과 → 실패로만 세고 계속 진행한다.
     quiet = bridge.parse_kworb_tracks(_kworb_page(), 30)[3]
     a = FakeAdapter(search=lambda q: [] if q == quiet else search(q))
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(a, 7, "2026-08")
     assert a.sent[-1][1] == "✅처리완료\n추가 26곡\n중복 2곡\n실패 2곡"
 
 
@@ -1529,7 +1525,7 @@ def test_spotify_chart_fetch_failure_keeps_going(monkeypatch, caplog):
     )
     a = FakeAdapter(search=_fake_search())
     with caplog.at_level(logging.INFO, logger="bridge"):
-        _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+        bridge._handle_music_spotify(a, 7, "2026-08")
     assert len(fetched) == 3 and len(a.searches) == 60 and len(added) == 30
     assert a.sent[-1][1] == "✅처리완료\n추가 30곡\n중복 30곡\n실패 0곡"
     assert any("차트실패=1" in r.getMessage() for r in caplog.records)
@@ -1538,7 +1534,7 @@ def test_spotify_chart_fetch_failure_keeps_going(monkeypatch, caplog):
 def test_spotify_all_charts_down(monkeypatch):
     _spotify_env(monkeypatch, page=lambda _p: "")
     a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(a, 7, "2026-08")
     assert a.searches == []
     assert a.sent[-1][1] == "✅처리완료\n추가 0곡\n중복 0곡\n실패 0곡"
 
@@ -1563,7 +1559,7 @@ def test_spotify_short_chart_and_broken_html(monkeypatch):
         page=lambda path: next((v for k, v in pages.items() if k in path), _kworb_page()),
     )
     a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(a, 7, "2026-08")
     assert len(fetched) == 3  # 파손 차트에서 멈추지 않는다
     assert len(a.searches) == 33 and len(added) == 33  # 3곡(부분) + 30곡(정상)
     assert a.sent[-1][1] == "✅처리완료\n추가 33곡\n중복 0곡\n실패 0곡"
@@ -1589,12 +1585,12 @@ def test_spotify_second_run_inserts_nothing(monkeypatch):
     _spotify_env(monkeypatch, add=add)
     ids = {}  # 두 회차가 같은 검색어 → 같은 videoId 를 받게 공유한다
     first = FakeAdapter(search=_fake_search(ids))
-    _fire(first, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(first, 7, "2026-08")
     assert first.sent[-1][1] == "✅처리완료\n추가 30곡\n중복 0곡\n실패 0곡"
     assert len(inserted) == 30
 
     second = FakeAdapter(search=_fake_search(ids))
-    _fire(second, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(second, 7, "2026-08")
     assert second.sent[-1][1] == "✅처리완료\n추가 0곡\n중복 30곡\n실패 0곡"
     assert len(inserted) == 30  # 2회차는 한 곡도 밀어넣지 않았다
     assert second.enqueued == []  # 큐 편입도 없다(added 가 0곡)
@@ -1606,7 +1602,7 @@ def test_spotify_reply_carries_no_track_text(monkeypatch):
     evil = ["[클릭](http://evil)", "@everyone\x07벨", "```py\npwn()```"]
     _spotify_env(monkeypatch, page=lambda _p: _kworb_page_of(evil, artist="`악성`가수"))
     a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
+    bridge._handle_music_spotify(a, 7, "2026-08")
     # 검색어에는 제어문자·개행이 없다(strip_control_line) — 링크 텍스트 자체는 검색어로 살아 있다.
     assert a.searches == [
         "`악성`가수 [클릭](http://evil)",
@@ -1616,22 +1612,6 @@ def test_spotify_reply_carries_no_track_text(monkeypatch):
     body = "\n".join(t for _c, t, _b in a.sent)
     assert "evil" not in body and "@everyone" not in body and "```" not in body
     assert a.sent[-1][1] == "✅처리완료\n추가 3곡\n중복 0곡\n실패 0곡"
-
-
-def test_spotify_unauthorized_member_gets_nothing(monkeypatch):
-    """비인가 서버 멤버는 무회신 — kworb 조회도 유튜브 검색도 일어나지 않는다."""
-    fetched, added = _spotify_env(monkeypatch)
-    a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(999, "ㅁ스포티파이", channel_role=_PL), allowed=_ALLOWED)
-    assert (fetched, added, a.searches, a.sent) == ([], [], [], [])
-
-
-def test_spotify_not_help_fallthrough(monkeypatch):
-    # 삽입 위치 회귀: 별칭 해석·HELP 폴백보다 앞에 있어야 한다.
-    _spotify_env(monkeypatch, page=lambda _p: "")
-    a = FakeAdapter()
-    _fire(a, _txt(777, "ㅁ스포티파이"))
-    assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
 
 
 # ── 월 1회 자동 실행(run_spotify_monthly) — 스탬프가 주기를 정한다 ────────────────
@@ -1682,27 +1662,6 @@ def test_spotify_monthly_runs_when_no_stamp(monkeypatch):
     assert not bridge.SPOTIFY_MONTH_F.exists()
     assert bridge.run_spotify_monthly(FakeAdapter(), 7, "2026-08-25") is True
     assert calls == [(7, "2026-08")]
-
-
-def test_spotify_manual_run_marks_month_stamp(monkeypatch):
-    """수동 'ㅁ스포티파이' 도 그 달 몫을 쓴다 — 직후 자동 실행은 아무것도 하지 않는다.
-
-    손으로 담은 다음 세션에 자동이 같은 주간차트를 한 번 더 훑으면 스탬프의 목적
-    ("한 달에 한 번만 90회 왕복")이 그대로 깨진다. 반대 방향은 막지 않는다(아래 단언).
-    """
-    _spotify_env(monkeypatch)
-    a = FakeAdapter(search=_fake_search())
-    _fire(a, _txt(777, "ㅁ스포티파이", channel_role=_PL))
-    this_month = datetime.now(bridge._KST).strftime("%Y-%m")
-    assert bridge.SPOTIFY_MONTH_F.read_text(encoding="utf-8").strip() == this_month
-    # 수동은 스탬프를 **읽지 않는다** — 자동이 이미 돈 달에도 언제든 다시 담을 수 있다.
-    b = FakeAdapter(search=_fake_search())
-    _fire(b, _txt(777, "ㅁ스포티파이", channel_role=_PL))
-    assert len(b.searches) == 90
-    # 반대로 자동은 그 달 몫이 이미 쓰였음을 보고 조용히 끝낸다(핸들러 미호출).
-    calls = _spotify_runner_spy(monkeypatch)
-    assert bridge.run_spotify_monthly(FakeAdapter(), 7, f"{this_month}-28") is True
-    assert calls == []
 
 
 def test_spotify_monthly_leaves_no_stamp_when_all_charts_down(monkeypatch):
@@ -2397,23 +2356,6 @@ def test_button_retired_actions_acked_then_ignored(cb_env):
     assert cb_env.acked == ["cq1"] * 4
 
 
-def test_project_channel_messages_are_ignored():
-    # 옛 프로젝트 채널(어댑터가 channel_map kind="project" 로 Event.project 를 채운다)의 메시지는
-    # 인가된 user 라도 **무회신** — 명령(ㅁ노래·ㅁ도움말·ㅁ재시작)도, 평문 작업 지시도 실행 안 한다.
-    for text in ("etf_info 고쳐줘", "ㅁ도움말", "ㅁ노래", "ㅁ청소", "ㅁ푸시해줘", "ㅁ재시작"):
-        a = FakeAdapter()
-        _fire(a, _txt(777, text, project="etf_info"))
-        assert a.sent == [] and a.music == [] and a.cleared == [], text
-
-
-def test_project_channel_button_is_not_routed():
-    # project 가 채워진 Event 는 종류와 무관하게 무시 — 인가 게이트 뒤라도 발송·청소하지 않는다.
-    a = FakeAdapter(clear_count=3)
-    ev = dataclasses.replace(_btn(777, "clean:ok"), project="etf_info")
-    _fire(a, ev)
-    assert a.cleared == [] and a.sent == []
-
-
 def test_project_sync_entry_points_are_gone():
     """새 `_Project/*` 폴더가 생겨도 채널을 만들 길이 없다 — 계약·코어에서 입구를 걷었다."""
     import adapter
@@ -2592,19 +2534,6 @@ def test_notify_text_with_and_without_note():
     assert bridge.notify_text({"label": "L"}, now) == f"{head} L"
     assert bridge.notify_text({"label": "L", "note": "  "}, now) == f"{head} L"
     assert bridge.notify_text({"id": "x"}, now) == head
-
-
-def test_load_schedules_drops_session_items_and_warns_once(tmp_path, caplog):
-    # on:"session" 경로는 삭제됐다 — 옛 항목은 알림으로 새지도, 조용히 사라지지도 않는다
-    # (로더는 매 틱 불리므로 경고는 id 당 1회).
-    f = tmp_path / "notify.json"
-    items = [{"id": "pending-checks", "on": "session", "label": "x"}, _item(id="ok")]
-    f.write_text(json.dumps({"items": items}), encoding="utf-8")
-    bridge._warned_session_ids.clear()
-    with caplog.at_level(logging.WARNING, logger="bridge"):
-        assert [i["id"] for i in load_schedules(f)] == ["ok"]
-        load_schedules(f)
-    assert sum("pending-checks" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_dispatch_prunes_stale_date(monkeypatch, notify_env):
@@ -3422,17 +3351,13 @@ def test_build_secrets_masks_env_value_in_reply(tmp_path):
 def test_build_secrets_skips_non_secret_config_keys(tmp_path):
     # 비밀 아닌 긴 설정값까지 마스킹하면 회신의 경로·URL 이 *** 로 깨진다(과잉 마스킹 방지).
     env = {
-        "TARGET_ROOT": "Hachiware/_Project",
         "MUSIC_PLAYLIST_ID": "PLabcdefghijklmnop",
-        "CLAUDE_TIMEOUT_SEC": "600000000000",
         "DISCORD_BOT_TOKEN": "tok-" + "z" * 40,
     }
     secrets = bridge.build_secrets("tok-" + "z" * 40, tmp_path, env)
-    assert "Hachiware/_Project" not in secrets
     assert "PLabcdefghijklmnop" not in secrets
-    assert "600000000000" not in secrets
     assert "tok-" + "z" * 40 in secrets  # 토큰류는 그대로 마스킹 대상
-    reply = "M  Hachiware/_Project/etf-info/app.py"
+    reply = "list PLabcdefghijklmnop"
     assert mask_secrets(reply, secrets) == reply
 
 
@@ -5506,3 +5431,109 @@ def test_handle_event_restores_busy_on_exception(monkeypatch):
     with pytest.raises(RuntimeError):
         _fire(FakeAdapter(), _txt(777, "아무거나"))
     assert bridge._busy == before
+
+
+# ── #SNS정보 `ㅁ판정` — 정오를 기다리지 않고 수집 → «판정 중» 카드 → 판정 세션 ──
+def _judge_now_event(channel_id=_SNS_CH, role="SNS정보", user=777):
+    return _txt(user, " ㅁ판정 ", channel_id=channel_id, channel_role=role)
+
+
+def _judge_now_setup(sns, monkeypatch, *, launch=True):
+    adapter, root = sns
+    calls = []
+    monkeypatch.setattr(bridge, "launch_judge", lambda: calls.append(1) or launch)
+    adapter.history = [_sns_msg("https://x.com/a/status/11", _NOON)]
+    return adapter, root, calls
+
+
+def test_judge_now_collects_sends_judging_card_registers_and_launches(sns, monkeypatch):
+    a, root, calls = _judge_now_setup(sns, monkeypatch)
+    _fire(a, _judge_now_event())
+    assert len(list((root / "미판정").glob("*.md"))) == 1
+    [(ch, text, buttons)] = a.sent
+    assert ch == _SNS_CH and buttons is None  # 버튼 없음
+    assert text.endswith("\n🖥️ 판정 중") and text.startswith("📥 SNS 1건")
+    assert _pending() == {"1": text}  # FakeAdapter.send 는 id 1
+    assert calls == [1] and a.edited == []
+    assert "last_run_date" not in _state()  # 정오 «밀린 날» 판정에 손대지 않는다
+    assert not bridge._sns_clean_lock.locked()
+
+
+def test_judge_now_counts_old_pending_notes_when_nothing_new(sns, monkeypatch):
+    a, root, calls = _judge_now_setup(sns, monkeypatch)
+    a.history = []
+    (root / "미판정" / "old.md").write_text("x", encoding="utf-8")
+    _fire(a, _judge_now_event())
+    [(_ch, text, _b)] = a.sent
+    assert text == "📥 미판정 1건\n🖥️ 판정 중" and calls == [1]
+
+
+def test_judge_now_zero_notes_sends_notice_without_launch(sns, monkeypatch):
+    a, _root, calls = _judge_now_setup(sns, monkeypatch)
+    a.history = []
+    _fire(a, _judge_now_event())
+    assert a.sent == [(_SNS_CH, "📭 판정할 링크 없음", None)] and calls == [] and _pending() == {}
+
+
+def test_judge_now_launch_failure_restores_card_and_pending(sns, monkeypatch):
+    a, _root, calls = _judge_now_setup(sns, monkeypatch, launch=False)
+    _fire(a, _judge_now_event())
+    assert calls == [1] and _pending() == {}
+    [(_c, card, _b), (_c2, fail, _b2)] = a.sent
+    assert a.edited == [(_SNS_CH, 1, card.removesuffix("\n🖥️ 판정 중"), [bridge.SNS_JUDGE_BUTTON])]
+    assert fail == "⛔ VS Code 실행 실패"
+    assert not bridge._sns_clean_lock.locked()
+
+
+def test_judge_now_card_send_failure_skips_launch(sns, monkeypatch):
+    a, _root, calls = _judge_now_setup(sns, monkeypatch)
+    a._send_ids = iter([])  # send → None
+    _fire(a, _judge_now_event())
+    assert calls == [] and _pending() == {}
+
+
+@pytest.mark.parametrize("status", ["fail", "init", "retry"])
+def test_judge_now_collect_not_ok_never_launches(sns, monkeypatch, status):
+    a, _root, calls = _judge_now_setup(sns, monkeypatch)
+    monkeypatch.setattr(bridge, "_collect_sns", lambda *_a: (status, (0, 0, 0, 0, 0, [])))
+    _fire(a, _judge_now_event())
+    assert calls == [] and _pending() == {}
+    assert all("🖥️ 판정 중" not in t for _c, t, _b in a.sent)
+
+
+def test_judge_now_more_still_judges_with_notice(sns, monkeypatch):
+    a, root, calls = _judge_now_setup(sns, monkeypatch)
+    (root / "미판정" / "old.md").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(bridge, "_collect_sns", lambda *_a: ("more", (0, 0, 0, 0, 0, [])))
+    _fire(a, _judge_now_event())
+    assert calls == [1] and len(a.sent) == 2  # 안내 + 판정 중 카드
+
+
+def test_judge_now_double_press_ignored_while_running(sns, monkeypatch):
+    a, _root, calls = _judge_now_setup(sns, monkeypatch)
+    assert bridge._sns_clean_lock.acquire(blocking=False)  # 청소·판정이 도는 중
+    try:
+        _fire(a, _judge_now_event())
+    finally:
+        bridge._sns_clean_lock.release()
+    assert calls == [] and a.sent == []
+
+
+def test_judge_now_outside_sns_channel_falls_back_to_help(monkeypatch):
+    monkeypatch.setattr(bridge, "launch_judge", lambda: pytest.fail("SNS 밖에서 실행"))
+    a = FakeAdapter()
+    _fire(a, _judge_now_event(channel_id=321, role=None))
+    assert a.sent == [(321, bridge.HELP_TEXT, None)]
+    assert "ㅁ판정" in bridge.HELP_TEXT
+
+
+def test_judge_now_gate_passes_for_allowed_only(monkeypatch):
+    spawned = []
+    monkeypatch.setattr(bridge, "_sns_spawn", lambda name, _fn, *_a: spawned.append(name))
+    a = FakeAdapter()
+    _fire(a, _judge_now_event(user=999))  # 비허용
+    _fire(a, _txt(777, "ㅁ판정 해줘", channel_id=_SNS_CH, channel_role="SNS정보"))  # 다른 문장
+    assert spawned == []
+    _fire(a, _judge_now_event())
+    assert spawned == ["sns-judge-now"]
+    bridge._sns_clean_lock.release()  # 스레드가 없으니 푼다

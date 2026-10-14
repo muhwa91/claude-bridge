@@ -85,19 +85,7 @@ def test_message_event_text_normalization():
     assert ev.kind == "text"
     assert ev.channel_id == 100 and ev.user_id == 777
     assert ev.text == "ㅁ노래" and ev.message_id == 5
-    assert ev.project is None and ev.channel_role is None  # 미매핑 채널
-
-
-def test_message_event_dm_channel_project_none():
-    channel = SimpleNamespace(id=9)  # name 속성 없음(DM)
-    m = SimpleNamespace(
-        author=SimpleNamespace(id=777),
-        channel=channel,
-        content="hi",
-        id=1,
-        attachments=[],
-    )
-    assert _adapter()._message_event(m).project is None
+    assert ev.channel_role is None  # 미매핑 채널
 
 
 def test_on_message_drops_disallowed_enqueues_allowed():
@@ -422,7 +410,7 @@ def test_wait_ready_reflects_on_ready_event():
 
 def test_channel_map_roundtrip(tmp_path):
     p = tmp_path / "cm.json"
-    m = {10: ("role", "데이터분석"), 20: ("project", "etf_info")}
+    m = {10: ("role", "데이터분석"), 20: ("role", "봇상태")}
     discord_adapter.save_channel_map(p, m)
     assert discord_adapter.load_channel_map(p) == m
 
@@ -438,7 +426,7 @@ def test_role_channel_reverse_lookup():
     a = _adapter()
     a._channel_map = {
         10: ("role", "간단처리"),
-        20: ("project", "etf_info"),
+        20: ("role", "SNS정보"),
         30: ("role", "봇상태"),
     }
     assert a.role_channel("간단처리") == 10
@@ -1252,20 +1240,18 @@ def test_enqueue_coro_noop_when_stopping():
     assert len(a._music_entries) == 1
 
 
-def test_message_event_channel_map_project_and_role():
+def test_message_event_channel_map_role():
     a = _adapter()
-    a._channel_map = {100: ("project", "etf_info"), 200: ("role", "데이터분석")}
-    ev_p = a._message_event(_msg(777, "hi", channel_id=100, channel_name="딴이름"))
-    assert ev_p.project == "etf_info" and ev_p.channel_role is None  # 채널ID 매핑 우선
-    ev_r = a._message_event(_msg(777, "hi", channel_id=200))
-    assert ev_r.channel_role == "데이터분석" and ev_r.project is None
+    a._channel_map = {200: ("role", "데이터분석")}
+    ev = a._message_event(_msg(777, "hi", channel_id=200))
+    assert ev.channel_role == "데이터분석"
 
 
-def test_message_event_unmapped_channel_has_no_project_or_role():
+def test_message_event_unmapped_channel_has_no_role():
     # 채널명을 프로젝트 후보로 쓰던 폴백은 프로젝트 원격 작업과 함께 삭제됐다.
     a = _adapter()  # channel_map 비어있음
     ev = a._message_event(_msg(777, "hi", channel_id=100, channel_name="trading_info"))
-    assert ev.project is None and ev.channel_role is None
+    assert ev.channel_role is None
 
 
 def test_message_event_image_attachment_is_still_a_text_event():
@@ -1451,31 +1437,17 @@ def test_ensure_channels_creates_no_project_channels(tmp_path):
     assert not any("프로젝트" in c.name for c in guild.categories)
 
 
-def test_ensure_channels_keeps_old_project_entries_untouched(tmp_path):
-    """옛 프로젝트 채널은 만들지도·고치지도·지우지도 않지만 맵에는 그대로 남긴다.
-
-    맵에서 빠지면 그 채널이 미매핑(역할 없음)이 되어 코어가 «프로젝트 채널 → 무시» 로 알아보지
-    못한다. 서버의 채널 삭제는 사람 몫이고, 그때까지 맵 항목은 읽기만 한다.
-    """
+def test_old_project_map_entry_is_ignored_without_crash(tmp_path):
+    """옛 맵의 모르는 항목(`project`)은 크래시 없이 로드되고 셋업 후 맵에서 사라진다."""
     cm = tmp_path / "channel_map.json"
     old = _FakeChannel(500, "주식모니터링", position=3)
-    cm.write_text('{"500": ["project", "trading_info"]}', encoding="utf-8")
+    cm.write_text('{"500": ["project", "trading_info"], "2": ["role", "봇상태"]}', encoding="utf-8")
     a = DiscordAdapter("tok", [], _ALLOWED, channel_map_file=cm)
-    guild = _guild_for(a, text_channels=[old])
+    assert a.role_channel("봇상태") == 2
+    _guild_for(a, text_channels=[old])
     asyncio.run(a._ensure_channels())
-    assert a._channel_map[500] == ("project", "trading_info")
-    assert old.renames == [] and old.deleted is False and old.position == 3
-    assert "trading_info" not in {n for n, _ in guild.created}
-    assert discord_adapter.load_channel_map(cm)[500] == ("project", "trading_info")
-    ev = a._message_event(_msg(777, "고쳐줘", channel_id=500))
-    assert ev.project == "trading_info" and ev.channel_role is None
-
-
-def test_loading_old_channel_map_with_project_entries_does_not_crash(tmp_path):
-    cm = tmp_path / "channel_map.json"
-    cm.write_text('{"1": ["project", "etf_info"], "2": ["role", "봇상태"]}', encoding="utf-8")
-    a = DiscordAdapter("tok", [], _ALLOWED, channel_map_file=cm)
-    assert a.role_channel("봇상태") == 2 and a._channel_map[1] == ("project", "etf_info")
+    assert 500 not in a._channel_map and old.renames == [] and old.deleted is False
+    assert a._message_event(_msg(777, "x", channel_id=500)).channel_role is None
 
 
 def test_concurrent_on_ready_no_duplicate():
@@ -1921,7 +1893,7 @@ def test_default_general_text_deleted():
 def test_default_general_kept_if_bot_channel():
     # 안전장치: 이름이 '일반'이어도 봇이 만든(new_map 등록) 채널이면 삭제 안 함.
     a = DiscordAdapter("tok", [], _ALLOWED)
-    a._channel_map = {950: ("project", "weird")}
+    a._channel_map = {950: ("role", "봇상태")}
     botch = _FakeChannel(950, "일반")  # 봇이 라벨 '일반'으로 만든 채널(맵에 있음)
     _guild_for(a, text_channels=[botch])
     asyncio.run(a._ensure_channels())

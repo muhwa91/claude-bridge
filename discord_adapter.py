@@ -99,7 +99,7 @@ def reconnect_notice_texts(since: float, now: float) -> list[str]:
 # 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag).
 # 텍스트 채널명 = 라벨의 공백·하이픈 제거 붙여쓰기(디스코드 ASCII 소문자화).
 # 프로젝트(`_Project/*`)마다 채널을 만들던 동기화는 폐지했다 — 새 프로젝트가 생겨도 채널을 만들지
-# 않는다. 옛 프로젝트 채널은 서버에 남아 있어도 코어가 무시한다(channel_map 의 kind="project").
+# 않는다. 서버에 남은 옛 프로젝트 채널은 맵에 없는 미매핑 채널이라 코어가 무시한다.
 # 재사용=channelID(맵) 1차·_canon 2차, 리네임 판단=**정확 이름 비교**(_canon collapse 함정 회피).
 # 봇 서버 닉네임(on_ready 마다 멱등 고정 — 강퇴/재초대 시 수동 닉이 풀려서). 여기만 바꾸면 끝.
 _BOT_NICKNAME = "치이카와 봇"
@@ -831,9 +831,8 @@ class DiscordAdapter:
         (_canon collapse 함정 회피 — `주식-모니터링`↔`주식모니터링`을 다르게 봄).
         재기동해도 중복 생성·리네임 없음(정확 일치면 skip). 권한/실패는 로그+계속. name 로그.
 
-        프로젝트 채널은 만들지도 정렬하지도 않는다. 다만 옛 맵의 `project` 항목은 새 맵에 그대로
-        옮겨 적는다 — 그래야 서버에 남은 옛 프로젝트 채널의 메시지를 코어가 계속 «프로젝트
-        채널» 로 알아보고 무시한다(맵에서 빠지면 미매핑 채널이 된다).
+        프로젝트 채널은 만들지도 정렬하지도 않는다. 옛 맵의 `project` 등 모르는 항목은 새 맵에
+        옮기지 않고 버린다(미매핑 채널 = 코어가 무시).
         """
         guild = self._client.guilds[0] if self._client.guilds else None
         if guild is None:
@@ -854,9 +853,7 @@ class DiscordAdapter:
         old_by_keytag = {(k, t): cid for cid, (k, t) in self._channel_map.items()}
         by_id = {c.id: c for c in guild.channels}
         by_canon = {_canon(c.name): c for c in guild.text_channels}
-        new_map: dict[int, tuple[str, str]] = {
-            cid: entry for cid, entry in self._channel_map.items() if entry[0] == "project"
-        }
+        new_map: dict[int, tuple[str, str]] = {}
         for cat_name, chans in plan:
             category = cats.get(cat_name)
             for display, kind, tag in chans:
@@ -1147,10 +1144,8 @@ class DiscordAdapter:
     def _message_event(self, message: discord.Message) -> Event:
         """discord.Message → Event(§1.4). 첨부는 보지 않고 본문만 text 로 정규화한다."""
         channel = message.channel
-        # 채널→라우팅: channel_map(channelID) — 옛 프로젝트 채널=project(폴더명 원문), 특수 채널=
-        # 역할. 매핑 없으면(자동생성 실패·DM) 둘 다 None.
+        # 채널→라우팅: channel_map(channelID) — 특수 채널=역할. 매핑 없으면(자동생성 실패·DM) None.
         entry = self._channel_map.get(channel.id)
-        project = entry[1] if entry is not None and entry[0] == "project" else None
         channel_role = entry[1] if entry is not None and entry[0] == "role" else None
         return Event(
             kind="text",
@@ -1158,7 +1153,6 @@ class DiscordAdapter:
             user_id=message.author.id,
             text=message.content or "",
             message_id=message.id,
-            project=project,
             channel_role=channel_role,
         )
 

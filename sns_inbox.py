@@ -240,6 +240,8 @@ JUDGE_LABEL = "🔍 판정하기"
 JUDGING_LINE = "🖥️ 판정 중"
 JUDGED_LINE = "🎉 판정완료"
 LAUNCH_FAIL_TEXT = "⛔ VS Code 실행 실패"
+JUDGE_NOW_NONE = "📭 판정할 링크 없음"  # `ㅁ판정` — 수집 뒤에도 미판정이 0건
+JUDGE_NOW_COUNT = "📥 미판정 {N}건"  # `ㅁ판정` — 이번에 새로 저장한 게 없을 때(card_text 가 None)
 NO_FOLDER_TEXT = "⚠️ 수집함 폴더 없음\n➡️ Hachiware/_Obsidian/수집함/미판정\n➡️ 링크 채널 유지"
 FAIL_TEXT = "⛔ 저장 실패 - 다음 실행 시 재시도\n➡️ 원인 : claude-bridge/logs/bridge.log"
 

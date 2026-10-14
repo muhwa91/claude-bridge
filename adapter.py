@@ -41,9 +41,6 @@ class Event:
     action: str = ""  # 버튼 정규화 액션(kind=="button")
     action_arg: str = ""  # 버튼 인자
     callback_id: str | None = None  # ack 핸들 (interaction 토큰)
-    # 옛 프로젝트 채널(channel_map 의 kind="project")이면 그 폴더명 — 코어는 이 채널의 메시지를
-    # 무시한다(프로젝트 원격 작업 폐지). 새 채널은 만들지 않아 옛 맵 항목에서만 채워진다.
-    project: str | None = None
     # 특수 채널 역할 태그("미국주식"|"SNS정보"|"봇상태"|"playlist"). 어댑터가 channel_map 으로
     # 채운다. 미매핑은 None.
     channel_role: str | None = None
@@ -214,8 +211,8 @@ def _valid_id(s: object) -> bool:
     """알림 id 안전 규칙(방출·수신 계약 대칭): 비어있지 않고 ≤54자, [A-Za-z0-9_-] 만.
 
     예약 알림(notify.json) id 의 안전 규칙이다 — 이상한 id 가 로그·상태 파일로 흘러드는 것을
-    로더(load_schedules)가 방출측에서 막는다. 상한 54 는 callback_data 100B 캡 안에서
-    id 가 왕복하던 시절의 값이며, 실사용 id 는 짧아 그대로 둔다.
+    로더(load_schedules)가 방출측에서 막는다. 상한 54 는 옛 텔레그램 버튼 데이터 한도에서 온
+    값이며, 실사용 id 는 짧아 그대로 둔다.
     """
     return isinstance(s, str) and 0 < len(s) <= 54 and all(c.isalnum() or c in "-_" for c in s)
 
@@ -243,7 +240,7 @@ def parse_callback(data: str) -> tuple[str, str] | None:
     return None
 
 
-# 리다이렉트 차단 opener — 고정 호스트 GET(kworb·유튜브 API)이 3xx 로 내부주소(오라클 메타데이터
+# 리다이렉트 차단 opener — 고정 호스트 GET(kworb·유튜브 API)이 3xx 로 내부주소(클라우드 메타데이터
 # 169.254.169.254 등)를 가리켜도 추종하지 않는다. redirect_request→None 이면 urllib 이 그 3xx 를
 # HTTPError 로 승격해(추종 안 함) 내부주소 재요청을 원천 차단한다.
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):

@@ -1864,8 +1864,8 @@ SNS_ROLE = "SNS정보"  # 채널 tag(discord_adapter._SPECIAL) — notify.json �
 SNS_STATE_FILE = LOG_DIR / "sns_state.json"  # last_message_id·last_run_date·pending_cards
 SNS_DONE_FILE = LOG_DIR / "sns_judge_done.json"  # VS Code 판정 세션이 남기는 완료 신호
 SNS_INBOX_DIR = REPO_ROOT / "Hachiware" / "_Obsidian" / "수집함"  # 레포 상대 고정(계획 §1)
-# 판정 입구(muhwa-dev `python -m core.judge_inbox`) — 고정 argv, 사용자 입력은 싣지 않는다.
-JUDGE_PROJECT_DIR = REPO_ROOT / "Hachiware" / "_Project" / "muhwa-dev"
+# 판정 입구(muhwa-AIsecretary `python -m core.judge_inbox`) — 고정 argv, 사용자 입력은 싣지 않는다.
+JUDGE_PROJECT_DIR = REPO_ROOT / "Hachiware" / "_Project" / "muhwa-AIsecretary"
 JUDGE_TIMEOUT_SEC = 60
 # 한 번에 읽는 히스토리 상한(어댑터가 100건씩 페이지로 받는다) — 넘치면 처리한 데까지 전진하고
 # 나머지는 다음 실행. 통째 실패로 같은 자리에서 영원히 멈추지 않게 한다.

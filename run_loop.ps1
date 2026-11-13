@@ -78,7 +78,9 @@ if ($env:RUN_LOOP_TARGET) {
     if ($onPath) { $py = $onPath.Source }
 } else {
     $pyRoot = Join-Path $env:LOCALAPPDATA 'Programs\Python'
-    $cands = @()
+    # Project venv first (2026-11-13: system Python replaced by uv-managed 3.14 + per-project .venv;
+    # create with `uv venv --python 3.14 .venv` then `uv pip install --python .venv\Scripts\python.exe -r requirements.txt`).
+    $cands = @((Join-Path $PSScriptRoot '.venv\Scripts\python.exe'))
     $onPath = Get-Command python -ErrorAction SilentlyContinue
     if ($onPath) { $cands += $onPath.Source }
     $cands += Get-ChildItem $pyRoot -Filter 'Python3*' -Directory -ErrorAction SilentlyContinue |
@@ -91,7 +93,7 @@ if ($env:RUN_LOOP_TARGET) {
     }
 }
 if (-not $py) {
-    Write-Log 'NO_PYTHON_DEPS (no interpreter with discord.py; run: python -m pip install -r requirements.txt)'
+    Write-Log 'NO_PYTHON_DEPS (no interpreter with discord.py; run: uv venv --python 3.14 .venv; uv pip install --python .venv\Scripts\python.exe -r requirements.txt)'
     Remove-Item -LiteralPath $pidFile -ErrorAction SilentlyContinue
     exit 1
 }

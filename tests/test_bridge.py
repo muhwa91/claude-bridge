@@ -3118,10 +3118,8 @@ _needs_real_schedules = pytest.mark.skipif(
 )
 # 시각(`at`) 알림의 베이스라인 — 배포본에 있는 «러너가 아닌» 시각 항목의 정본 목록. 새 시각 알림이
 # 등재 없이 들어오거나 항목이 졸업(제거)되면 아래 테스트가 빨개지고, 그때 이 딕셔너리만 고친다.
-# `agent-usage-compare`(일 10:17/720)는 10-18 실행 뒤 졸업시키며 이 줄도 함께 지운다.
-_REAL_BASELINE: dict[str, tuple[list[str], str, int]] = {
-    "agent-usage-compare": (["sun"], "10:17", 720),
-}
+# (2026-11-14 `agent-usage-compare` 졸업으로 지금은 비어 있다 — 배포본의 시각 항목이 전부 러너다.)
+_REAL_BASELINE: dict[str, tuple[list[str], str, int]] = {}
 # 러너 항목(다이제스트 2건) — «⏰ 텍스트 시각 알림» 판정 테스트에서 걸러낸다. 시각(`at`)으로
 # 발화해도 러너로 가므로 텍스트 알림이 아니다 — DIGEST_RUNNERS 에 든 id 를 뺀다.
 _REAL_RUNNER_IDS = {it["id"] for it in _REAL_ITEMS if it["id"] in bridge.DIGEST_RUNNERS}

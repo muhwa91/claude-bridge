@@ -812,6 +812,8 @@ def test_search_candidates_returns_five_with_channel(monkeypatch):
     a = _adapter()
     assert a.search_candidates("곡") == [("v1", "무대 직캠", "Mnet"), ("v2", "[가사] 곡", "1theK")]
     assert refs == ["ytsearch5:곡"] and seen["extract_flat"] == "in_playlist"
+    # 디스패치 스레드에서 동기 호출이라 응답 없는 연결이 봇을 붙잡지 않게 소켓 타임아웃이 걸려 있다.
+    assert seen["socket_timeout"] == discord_adapter._SEARCH_SOCKET_TIMEOUT
     # search_video 는 코어 필터(pick_index)를 태운다 — 방송무대 1위를 건너뛴다.
     assert a.search_video("곡") == ("v2", "[가사] 곡")
     assert a.search_video("곡", 1) == ("v1", "무대 직캠")  # '#N' 은 필터 무시

@@ -63,6 +63,7 @@ DISCORD_LIMIT = 2000  # 디스코드 메시지 한도(§2.1) — 초과 장문�
 MUSIC_NOW_EMOJI = "💿"
 MUSIC_NOW_HEADER = f"{MUSIC_NOW_EMOJI} 현재 재생 곡"  # 알림 첫 줄(둘째 줄 = 정리한 곡 제목)
 _SEARCH_MAX = 5  # 'ㅁ추가' 검색 후보 수(ytsearch5) — 필터가 거른 뒤 고를 여지 + 회신에 보여줄 목록.
+_SEARCH_SOCKET_TIMEOUT = 15  # 초 — yt-dlp 검색의 소켓 읽기 상한(search_candidates 주석).
 _CUSTOM_ID_LIMIT = 100  # 디스코드 custom_id 한도(§1.3). 우리 콜백 문자열은 항상 이 안(id·name≤64).
 _CALL_TIMEOUT = 30  # run_coroutine_threadsafe().result() 타임아웃(§3.2).
 _HISTORY_TIMEOUT = 120  # 채널 히스토리(여러 페이지 왕복)는 REST 1회보다 길다
@@ -396,7 +397,15 @@ class DiscordAdapter:
         채널명은 flat 엔트리의 channel/uploader — 없으면 ""(제목 규칙만으로 판정된다).
         """
         try:
-            opts = {"quiet": True, "skip_download": True, "extract_flat": "in_playlist"}
+            # socket_timeout — 디스패치 스레드에서 동기 호출이라 응답 없는 연결이 봇 전체를 붙잡았다
+            # (2026-11-14). ponytail: 소켓 읽기 단위 상한이라 «전체 시간» 상한은 아니다 — 느리게라도
+            # 계속 오는 응답은 못 끊는다. 실제로 그런 일이 보이면 스레드+join(timeout) 으로 올린다.
+            opts = {
+                "quiet": True,
+                "skip_download": True,
+                "extract_flat": "in_playlist",
+                "socket_timeout": _SEARCH_SOCKET_TIMEOUT,
+            }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(f"ytsearch{_SEARCH_MAX}:{query}", download=False)
         except Exception as e:  # yt-dlp 추출 실패(네트워크·차단·무결과 파싱 등) — [] 폴백

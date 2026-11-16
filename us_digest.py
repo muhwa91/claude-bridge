@@ -247,7 +247,13 @@ def plain(text: object) -> str:
     """
     if text is None:
         return ""
-    stripped = "".join(c for c in str(text) if unicodedata.category(c) != "Cf")
+    # Cf(형식, ④) + Cc(C0/C1 제어 — ESC·BEL·NUL)를 걷는다. `\s` 가 \x1b·\x07·\x00 을
+    # 매치하지 않아 아래 ②를 통과하므로, 안 보이는 제어문자로 프롬프트에 지시를 끼우는 길을
+    # 여기서 막는다(bridge.strip_control 과 같은 사상 — 외부 필드의 정본 입구는 이 함수다).
+    # 단 공백인 제어문자(\n·\t·\r)는 남긴다 — ②의 `\s+` 가 한 칸으로 접어야 단어가 안 붙는다.
+    stripped = "".join(
+        c for c in str(text) if c.isspace() or unicodedata.category(c) not in ("Cf", "Cc")
+    )
     return re.sub(
         r"\s+", " ", _MENTION_RE.sub(_mention_dull, stripped.translate(_MD_TRANS))
     ).strip()

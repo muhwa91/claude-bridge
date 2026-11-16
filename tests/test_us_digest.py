@@ -2876,6 +2876,11 @@ def test_plain_strips_invisible_format_characters():
     assert plain("MEHROTRA\u202eSANJAY") == "MEHROTRASANJAY"  # RTL Override
     assert plain("a\u200b\u200bb") == "ab"  # zero-width space
     assert plain("소프트­하이픈") == "소프트하이픈"  # soft hyphen
+    # Cc(C0/C1 제어)도 걷는다 — `\s` 가 안 잡는 ESC·BEL·NUL 로 프롬프트에 지시를 끼우는 길 차단
+    assert plain("a\x00\x07\x1bb") == "ab"  # NUL·BEL·ESC
+    # 단 공백인 제어문자(\n·\t·\r)는 남겨 한 칸으로 접는다 — 단어가 붙으면 안 된다
+    assert plain("Fed cuts\nrates") == "Fed cuts rates"  # 줄바꿈 → 공백
+    assert plain("a\tb") == "a b"  # 탭 → 공백
     # 걷어낸 뒤 카드에 남는 비가시 문자는 **우리가 심는 간격 하나뿐**이라는 불변식
     assert us_digest._FIELD_GAP not in plain(f"x{us_digest._FIELD_GAP}y")
 

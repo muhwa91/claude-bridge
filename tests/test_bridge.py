@@ -3598,7 +3598,7 @@ def test_login_expired_text_is_fixed_copy():
 
 
 # ---------------------------------------------------------------------------
-# 📥 SNS정보 → 옵시디언 수집함 (docs/기능/SNS정보_수집/01_계획.md)
+# 📥 SNS정보 → 수집함 (docs/기능/SNS정보_수집/01_계획.md)
 # ---------------------------------------------------------------------------
 _SNS_CH = 4242
 _BOT = 1  # 봇 자신(허용목록 밖)
@@ -4013,7 +4013,7 @@ def test_sns_runner_missing_folder_notifies_and_keeps_links(sns, tmp_path, monke
     [(ch, text, _b)] = adapter.sent
     assert ch == 55
     assert text.endswith(
-        "⚠️ 수집함 폴더 없음\n➡️ Hachiware/_Obsidian/수집함/미판정\n➡️ 링크 채널 유지"
+        "⚠️ 수집함 폴더 없음\n➡️ Hachiware/_Asset_data/sns-data/미판정\n➡️ 링크 채널 유지"
     )
     assert _state()["last_message_id"] == last
 

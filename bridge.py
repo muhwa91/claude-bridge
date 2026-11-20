@@ -722,7 +722,7 @@ US_DIGEST_NOTIFY_ID = "us-digest"  # 미국주식 다이제스트(#미국주식)
 # 월 1회 스포티파이 주간차트 담기(#playlist). 다이제스트는 아니지만 «세션마다 후보 → 러너가
 # 판정» 이라는 배선이 똑같아 같은 맵을 탄다(스케줄러를 새로 들이지 않는다).
 SPOTIFY_NOTIFY_ID = "spotify-monthly"
-# 매일 정오 #SNS정보 → 옵시디언 수집함(run_sns_inbox). 역시 «시각 창 + 러너» 배선이 같다.
+# 매일 정오 #SNS정보 → 수집함(run_sns_inbox). 역시 «시각 창 + 러너» 배선이 같다.
 SNS_NOTIFY_ID = "sns-inbox"
 DIGEST_RUNNERS: dict[str, str] = {
     US_DIGEST_NOTIFY_ID: "run_us_digest",
@@ -1857,13 +1857,13 @@ def run_spotify_monthly(adapter: Adapter, channel_id: int, today: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 📥 SNS정보 → 옵시디언 수집함 (정오 러너 · 🔍 판정하기 버튼 · 완료 신호)
+# 📥 SNS정보 → 수집함 (정오 러너 · 🔍 판정하기 버튼 · 완료 신호)
 # ══════════════════════════════════════════════════════════════════════════
 # 정본 = docs/기능/SNS정보_수집/01_계획.md. 링크 추출·노트·문구는 sns_inbox(순수), 여기는 배선만.
 SNS_ROLE = "SNS정보"  # 채널 tag(discord_adapter._SPECIAL) — notify.json 의 channel 도 이 값
 SNS_STATE_FILE = LOG_DIR / "sns_state.json"  # last_message_id·last_run_date·pending_cards
 SNS_DONE_FILE = LOG_DIR / "sns_judge_done.json"  # VS Code 판정 세션이 남기는 완료 신호
-SNS_INBOX_DIR = REPO_ROOT / "Hachiware" / "_Obsidian" / "수집함"  # 레포 상대 고정(계획 §1)
+SNS_INBOX_DIR = REPO_ROOT / "Hachiware" / "_Asset_data" / "sns-data"  # 레포 상대 고정(계획 §1)
 # 판정 입구(muhwa-AIsecretary `python -m core.judge_inbox`) — 고정 argv, 사용자 입력은 싣지 않는다.
 JUDGE_PROJECT_DIR = REPO_ROOT / "Hachiware" / "_Project" / "muhwa-AIsecretary"
 JUDGE_TIMEOUT_SEC = 60

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SNS정보 수집 — `#SNS정보` 의 인스타·X·GitHub 링크를 옵시디언 수집함 노트로 만든다(순수 부분).
+"""SNS정보 수집 — `#SNS정보` 의 인스타·X·GitHub 링크를 수집함 노트로 만든다(순수 부분).
 
 설계 정본은 `docs/기능/SNS정보_수집/01_계획.md` 다. 이 모듈은 **디스코드·어댑터 의존 0**·stdlib 전용
 이고, 채널 히스토리 읽기·카드 전송·상태 파일·버튼은 bridge 가 한다(us_digest 와 같은 경계).
@@ -242,7 +242,7 @@ JUDGED_LINE = "🎉 판정완료"
 LAUNCH_FAIL_TEXT = "⛔ VS Code 실행 실패"
 JUDGE_NOW_NONE = "📭 판정할 링크 없음"  # `ㅁ판정` — 수집 뒤에도 미판정이 0건
 JUDGE_NOW_COUNT = "📥 미판정 {N}건"  # `ㅁ판정` — 이번에 새로 저장한 게 없을 때(card_text 가 None)
-NO_FOLDER_TEXT = "⚠️ 수집함 폴더 없음\n➡️ Hachiware/_Obsidian/수집함/미판정\n➡️ 링크 채널 유지"
+NO_FOLDER_TEXT = "⚠️ 수집함 폴더 없음\n➡️ Hachiware/_Asset_data/sns-data/미판정\n➡️ 링크 채널 유지"
 FAIL_TEXT = "⛔ 저장 실패 - 다음 실행 시 재시도\n➡️ 원인 : claude-bridge/logs/bridge.log"
 
 

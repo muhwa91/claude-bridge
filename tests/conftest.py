@@ -16,7 +16,7 @@ import bridge  # sys.path 주입 뒤에만 임포트 가능
 # 하나같이 monkeypatch 해서 실경로를 아무도 안 봤기 때문).
 LIVE_PATHS = {
     "JUDGE_PROJECT_DIR": bridge.JUDGE_PROJECT_DIR,  # launch_judge 의 cwd — 없으면 판정 입구 실패
-    "SNS_INBOX_DIR": bridge.SNS_INBOX_DIR,  # 옵시디언 수집함 — 없으면 노트가 엉뚱한 곳에 쌓인다
+    "SNS_INBOX_DIR": bridge.SNS_INBOX_DIR,  # 수집함 — 없으면 노트가 엉뚱한 곳에 쌓인다
 }
 
 # 위 경로는 **모노레포 안에서만** 실물이 있다. 공개 미러(`muhwa91/claude-bridge`)는 이 프로젝트
@@ -42,7 +42,7 @@ _STATE_ATTRS = (
     # 덮어 **그 달의 자동 실행이 통째로 사라진다**.
     "SPOTIFY_MONTH_F",
     "RELOAD_MARKER",  # 자동 재시작 마커 — 라이브 logs/ 에 남기면 다음 기동이 🟢 를 건너뛴다
-    # SNS 수집 — 상태·완료 신호·**옵시디언 수집함**(빠뜨리면 테스트 노트가 실제 수집함에 쌓인다).
+    # SNS 수집 — 상태·완료 신호·**수집함**(빠뜨리면 테스트 노트가 실제 수집함에 쌓인다).
     "SNS_STATE_FILE",
     "SNS_DONE_FILE",
     "SNS_INBOX_DIR",
